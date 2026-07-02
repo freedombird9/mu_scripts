@@ -1,0 +1,357 @@
+// ==UserScript==
+// @name         MU No Autowalk (Manual + Auto Hunt)
+// @namespace    local.mu.no.autowalk.all
+// @version      1.0.0
+// @description  手动攻击与Z自动挂机都不再自动贴脸移动:目标够得到就打,够不到就站桩,绝不主动走过去。合并自 manual-attack-no-autowalk,单脚本一次性 patch bundle,避免多脚本冲突。
+// @match        *://602.com/game/show/*
+// @match        *://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+  if (!isGameFrame(page.location)) {
+    return;
+  }
+
+  const PATCH_MARKER = '__MU_NO_AUTOWALK_ALL__';
+  const STORAGE_KEY = 'mu_no_autowalk_all_enabled';
+  const DEBUG_KEY = 'mu_no_autowalk_all_debug';
+  const BUNDLE_RE = /\/js\/bundle-[\w-]+\.js(?:$|\?)/;
+
+  // ---------------------------------------------------------------------------
+  // Patch 1: 手动攻击移动节点 btMoveToTargetEx 的 "目标超范围" else 分支。
+  //   原版会移动贴近目标;patch 后,当站桩开启时直接 setStatus(FAILED) 并 return,
+  //   不执行任何移动。保留原 else 分支其余逻辑作为关闭时的回退。
+  // ---------------------------------------------------------------------------
+  const MANUAL_TARGET = `else{_0x26afb8[_0x569830(0x6390)](_0x1c7cbb['IsNearTarget'],_0x2c3851['FAILED']);let _0x5254f7=_0x3ca950[_0x569830(0x2bd3)];if(_0x5254f7&&_0x5254f7[_0x569830(0x74f0)](_0x16461a)){let _0x181bf9=_0x5254f7[_0x569830(0x1a82)](_0x16461a)[_0x569830(0x218c)],_0x9c7460=Laya['Point'][_0x569830(0x34a8)];(_0x9c7460['x']=Math[_0x569830(0x174a)](-_0x181bf9['x']),_0x9c7460['y']=Math[_0x569830(0x174a)](_0x181bf9['z']),_0x5254f7)&&(_0x3ca950[_0x569830(0x5ce8)]=_0x9c7460['x'],_0x3ca950['lastMoveY']=_0x9c7460['y'],_0x5bb43c[_0x569830(0x12e4)](_0x599def,_0x9c7460,_0x3ca950['range'])||_0x599def[_0x569830(0x1a82)](_0x2006c8)['setTarget'](null));}_0x188fb2['setStatus'](_0x2c3851[_0x569830(0x4497)]);}`;
+
+  const MANUAL_PATCHED = `else{_0x26afb8[_0x569830(0x6390)](_0x1c7cbb['IsNearTarget'],_0x2c3851['FAILED']);if(window.${PATCH_MARKER}&&window.${PATCH_MARKER}.shouldBlock&&window.${PATCH_MARKER}.shouldBlock()){window.${PATCH_MARKER}.notify&&window.${PATCH_MARKER}.notify('manual');_0x188fb2['setStatus'](_0x2c3851['FAILED']);return;}let _0x5254f7=_0x3ca950[_0x569830(0x2bd3)];if(_0x5254f7&&_0x5254f7[_0x569830(0x74f0)](_0x16461a)){let _0x181bf9=_0x5254f7[_0x569830(0x1a82)](_0x16461a)[_0x569830(0x218c)],_0x9c7460=Laya['Point'][_0x569830(0x34a8)];(_0x9c7460['x']=Math[_0x569830(0x174a)](-_0x181bf9['x']),_0x9c7460['y']=Math[_0x569830(0x174a)](_0x181bf9['z']),_0x5254f7)&&(_0x3ca950[_0x569830(0x5ce8)]=_0x9c7460['x'],_0x3ca950['lastMoveY']=_0x9c7460['y'],_0x5bb43c[_0x569830(0x12e4)](_0x599def,_0x9c7460,_0x3ca950['range'])||_0x599def[_0x569830(0x1a82)](_0x2006c8)['setTarget'](null));}_0x188fb2['setStatus'](_0x2c3851[_0x569830(0x4497)]);}`;
+
+  // ---------------------------------------------------------------------------
+  // Patch 2: 自动挂机行为树移动节点 MoveToTarget (_0x72ca) 里实际触发移动的赋值。
+  //   原版: _0x2cfbf0 = move(self, point, skillReleaseDistance)  -> 走过去
+  //   patch: 站桩开启时跳过 move(),并把 _0x2cfbf0 置 true 表示"已到位",
+  //          使后续 if(!_0x2cfbf0) 不进入"丢目标"分支,行为树照常做攻击判定,
+  //          人物原地不动。关闭时退回原 move() 调用。
+  //
+  //   关键:MoveToTarget 节点同时被「打怪」和「拾取掉落物」复用。
+  //     - 打怪:  skillReleaseDistance(_0x3f2f1e[0x743b]) = 技能射程 > 0
+  //     - 拾取:  btSelectDropItem 把 target 换成掉落物,并强制 skillReleaseDistance = 0
+  //   getSkillReleaseDistance = summonId>0?999:skill.range,打怪时恒 > 0,绝不为 0。
+  //   因此用 skillReleaseDistance>0 判定「正在打怪」才站桩;==0 时即拾取,放行移动,
+  //   保证掉落物能正常捡取。
+  // ---------------------------------------------------------------------------
+  const AUTO_TARGET = `_0x2cfbf0=_0x5bb43c[_0x1233a6(0x12e4)](_0x2a22b9,_0x48dcf3,_0x3f2f1e[_0x1233a6(0x743b)])`;
+
+  const AUTO_PATCHED = `_0x2cfbf0=(_0x3f2f1e[_0x1233a6(0x743b)]>0&&window.${PATCH_MARKER}&&window.${PATCH_MARKER}.shouldBlock&&window.${PATCH_MARKER}.shouldBlock())?(window.${PATCH_MARKER}.notify&&window.${PATCH_MARKER}.notify('auto'),!0x0):_0x5bb43c[_0x1233a6(0x12e4)](_0x2a22b9,_0x48dcf3,_0x3f2f1e[_0x1233a6(0x743b)])`;
+
+  const state = {
+    enabled: readBool(STORAGE_KEY, true),
+    debug: readBool(DEBUG_KEY, false),
+    lastHintAt: 0,
+    audioContext: null,
+    status: {
+      version: '1.0.0',
+      pageInjectedAt: new Date().toISOString(),
+      injectionMode: typeof unsafeWindow !== 'undefined' ? 'unsafeWindow' : 'window',
+      interceptorInstalled: false,
+      interceptedBundle: false,
+      patchedManual: false,
+      patchedAuto: false,
+      fallbackLoaded: false,
+      lastReason: '',
+      lastBundleUrl: '',
+      manualBlockCount: 0,
+      autoBlockCount: 0,
+    },
+  };
+
+  installHelper();
+  installBundleInterceptor();
+
+  function isGameFrame(locationLike) {
+    return locationLike.hostname === 'cdn.qj2h5.jiuxiaokj.cn'
+      && locationLike.pathname.includes('/mu2h5/h5-data/mu-release/');
+  }
+
+  function installHelper() {
+    page[PATCH_MARKER] = {
+      version: state.status.version,
+      status: state.status,
+      get enabled() {
+        return state.enabled;
+      },
+      setEnabled(value) {
+        state.enabled = Boolean(value);
+        writeBool(STORAGE_KEY, state.enabled);
+        showHint(state.enabled ? '防自动移动:开启' : '防自动移动:关闭', false);
+        log('enabled =', state.enabled);
+      },
+      get debug() {
+        return state.debug;
+      },
+      setDebug(value) {
+        state.debug = Boolean(value);
+        writeBool(DEBUG_KEY, state.debug);
+        log('debug =', state.debug);
+      },
+      // 站桩拦截:开启即生效,手动攻击和自动挂机都拦。
+      shouldBlock() {
+        return state.enabled;
+      },
+      // source: 'manual' | 'auto'
+      notify(source) {
+        const now = Date.now();
+        if (source === 'auto') {
+          state.status.autoBlockCount += 1;
+        } else {
+          state.status.manualBlockCount += 1;
+        }
+        if (now - state.lastHintAt < 1500) {
+          return;
+        }
+        state.lastHintAt = now;
+        showHint('距离过远', false);
+        log('blocked out-of-range move from', source);
+      },
+    };
+  }
+
+  function installBundleInterceptor() {
+    if (page.Node.prototype.appendChild.__muNoAutowalkAllPatched) {
+      state.status.interceptorInstalled = true;
+      state.status.lastReason = 'appendChild already patched';
+      return;
+    }
+
+    const originalAppendChild = page.Node.prototype.appendChild;
+
+    page.Node.prototype.appendChild = function patchedAppendChild(node) {
+      if (isBundleScript(node)) {
+        replaceBundleScript(node, this, originalAppendChild);
+        return node;
+      }
+      return originalAppendChild.call(this, node);
+    };
+
+    Object.defineProperty(page.Node.prototype.appendChild, '__muNoAutowalkAllPatched', {
+      value: true,
+      configurable: false,
+    });
+    state.status.interceptorInstalled = true;
+    log('appendChild interceptor installed');
+  }
+
+  function isBundleScript(node) {
+    return node && node.tagName === 'SCRIPT' && typeof node.src === 'string' && BUNDLE_RE.test(node.src);
+  }
+
+  async function replaceBundleScript(script, parent, append) {
+    const originalSrc = script.src;
+    state.status.interceptedBundle = true;
+    state.status.lastBundleUrl = sanitizeUrl(originalSrc);
+    state.status.lastReason = 'bundle intercepted';
+
+    try {
+      log('fetching bundle', sanitizeUrl(originalSrc));
+      const response = await page.fetch(originalSrc, { credentials: 'include', cache: 'no-cache' });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const source = await response.text();
+      const result = patchBundleSource(source);
+      if (!result.applied) {
+        state.status.lastReason = result.reason;
+        showHint(`补丁未生效:${result.reason}`, false);
+        log('patch skipped:', result.reason);
+        append.call(parent, script);
+        return;
+      }
+
+      const blob = new page.Blob([result.source], { type: 'application/javascript' });
+      const blobUrl = page.URL.createObjectURL(blob);
+      const fallback = makeFallbackScript(originalSrc);
+
+      script.onerror = function onPatchedScriptError() {
+        state.status.fallbackLoaded = true;
+        state.status.lastReason = 'patched blob failed; fallback loaded';
+        showHint('补丁脚本加载失败,已回退原始脚本', false);
+        log('patched blob failed; falling back');
+        append.call(parent, fallback);
+      };
+
+      script.src = blobUrl;
+      script.dataset.muNoAutowalkAll = 'patched';
+      state.status.lastReason = result.reason;
+      append.call(parent, script);
+      showHint('防自动移动:已加载', false);
+      log('patched bundle loaded:', result.reason);
+    } catch (error) {
+      state.status.fallbackLoaded = true;
+      state.status.lastReason = `patch failed: ${error && error.message ? error.message : error}`;
+      showHint('补丁加载失败,已回退原始脚本', false);
+      log('patch failed:', error);
+      append.call(parent, script);
+    }
+  }
+
+  function makeFallbackScript(src) {
+    const fallback = document.createElement('script');
+    fallback.async = false;
+    fallback.src = src;
+    fallback.dataset.muNoAutowalkAll = 'fallback';
+    return fallback;
+  }
+
+  function patchBundleSource(source) {
+    if (source.includes(PATCH_MARKER)) {
+      return { source, applied: false, reason: 'already patched' };
+    }
+
+    let patched = source;
+    let manualOk = false;
+    let autoOk = false;
+
+    if (patched.includes(MANUAL_TARGET)) {
+      patched = patched.replace(MANUAL_TARGET, MANUAL_PATCHED);
+      manualOk = true;
+    }
+    if (patched.includes(AUTO_TARGET)) {
+      patched = patched.replace(AUTO_TARGET, AUTO_PATCHED);
+      autoOk = true;
+    }
+
+    state.status.patchedManual = manualOk;
+    state.status.patchedAuto = autoOk;
+
+    if (!manualOk && !autoOk) {
+      return { source, applied: false, reason: 'no target branch found (bundle changed?)' };
+    }
+
+    const parts = [];
+    parts.push(manualOk ? 'manual✓' : 'manual✗');
+    parts.push(autoOk ? 'auto✓' : 'auto✗');
+
+    return {
+      source: patched,
+      applied: true,
+      reason: `patched ${parts.join(' ')}`,
+    };
+  }
+
+  function showHint(text, withBeep) {
+    const render = () => {
+      const el = getHintElement();
+      el.textContent = text;
+      el.style.opacity = '1';
+      page.clearTimeout(el.__hideTimer);
+      el.__hideTimer = page.setTimeout(() => {
+        el.style.opacity = '0';
+      }, 900);
+      if (withBeep) {
+        beep();
+      }
+    };
+
+    if (document.body) {
+      render();
+    } else {
+      document.addEventListener('DOMContentLoaded', render, { once: true });
+    }
+  }
+
+  function getHintElement() {
+    let el = document.getElementById('mu-no-autowalk-all-hint');
+    if (el) {
+      return el;
+    }
+
+    el = document.createElement('div');
+    el.id = 'mu-no-autowalk-all-hint';
+    el.style.cssText = [
+      'position:fixed',
+      'left:50%',
+      'top:22%',
+      'transform:translateX(-50%)',
+      'z-index:2147483647',
+      'padding:8px 14px',
+      'border-radius:4px',
+      'background:rgba(0,0,0,.72)',
+      'color:#ffd56a',
+      'font:600 18px/1.3 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+      'text-shadow:0 1px 2px #000',
+      'pointer-events:none',
+      'opacity:0',
+      'transition:opacity .12s ease',
+    ].join(';');
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function beep() {
+    try {
+      const AudioContextCtor = page.AudioContext || page.webkitAudioContext;
+      if (!AudioContextCtor) {
+        return;
+      }
+
+      state.audioContext = state.audioContext || new AudioContextCtor();
+      const ctx = state.audioContext;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.035, ctx.currentTime + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.08);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.09);
+    } catch (error) {
+      log('beep failed:', error);
+    }
+  }
+
+  function readBool(key, fallback) {
+    try {
+      const value = page.localStorage.getItem(key);
+      if (value === null) {
+        return fallback;
+      }
+      return value === '1';
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function writeBool(key, value) {
+    try {
+      page.localStorage.setItem(key, value ? '1' : '0');
+    } catch (error) {
+      log('localStorage write failed:', error);
+    }
+  }
+
+  function sanitizeUrl(url) {
+    try {
+      const parsed = new page.URL(url);
+      parsed.search = '';
+      return parsed.toString();
+    } catch (error) {
+      return url.split('?')[0];
+    }
+  }
+
+  function log(...args) {
+    if (state.debug) {
+      console.log('[MU no-autowalk all]', ...args);
+    }
+  }
+})();
