@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 收起菜单仅保留挑战BOSS
 // @namespace    codex.mu.ui
-// @version      0.3.1
+// @version      0.3.3
 // @description  在右上菜单收起后，仅保留“挑战BOSS”按钮，隐藏同组其它顶部按钮。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -24,9 +24,12 @@
       debug: false,
       tickMs: 400,
       topLimitY: 190,
-      foregroundPanelMinY: 80,
+      foregroundPanelMinY: 55,
       foregroundPanelMinWidth: 320,
       foregroundPanelMinHeight: 180,
+      foregroundSideMaxWidth: 170,
+      foregroundSideMaxHeight: 240,
+      foregroundSidePadding: 100,
       minMenuChildren: 3,
       expandedVisibleThreshold: 5,
       bossButtonName: 'btnBigBoss',
@@ -63,6 +66,11 @@
         /shrink/i,
         /arrow/i,
       ],
+      foregroundSideLabels: [
+        '外观',
+        '称号',
+        '幻化',
+      ],
     };
 
     const state = {
@@ -72,7 +80,7 @@
     };
 
     window.__muBossOnlyCollapsed = {
-      version: '0.3.1',
+      version: '0.3.3',
       config: CFG,
       scan,
       debugTreeAroundBoss,
@@ -179,7 +187,12 @@
 
     function shouldKeepAuxiliary(obj) {
       const text = ownText(obj);
-      return CFG.neverHideNamePatterns.some((p) => p.test(text));
+      return CFG.neverHideNamePatterns.some((p) => p.test(text)) || isForegroundSideControl(obj);
+    }
+
+    function isForegroundSideControl(obj) {
+      const text = deepText(obj);
+      return CFG.foregroundSideLabels.some((label) => text.includes(label));
     }
 
     function isDescendantOf(obj, ancestor) {
@@ -213,12 +226,14 @@
 
       const minX = bossRect.x - CFG.topRightAnchorLeftPadding;
       const maxX = bossRect.x + CFG.topRightAnchorRightPadding;
+      const foregroundRects = foregroundPanelRects(root, boss);
       const out = [];
 
       walk(root, (obj) => {
         if (!obj || obj === root) return;
         if (isDescendantOf(obj, boss) && obj !== boss) return;
         if (isInsideForegroundPanel(obj, boss)) return;
+        if (isBesideForegroundPanel(obj, foregroundRects)) return;
 
         const r = getRect(obj);
         if (!r || r.w < 16 || r.h < 16) return;
@@ -255,6 +270,32 @@
       }
 
       return false;
+    }
+
+    function foregroundPanelRects(root, boss) {
+      const out = [];
+      walk(root, (obj) => {
+        if (!obj || obj === root || obj === boss || isDescendantOf(boss, obj)) return;
+        const r = getRect(obj);
+        if (r
+          && r.y >= CFG.foregroundPanelMinY
+          && r.w >= CFG.foregroundPanelMinWidth
+          && r.h >= CFG.foregroundPanelMinHeight) {
+          out.push(r);
+        }
+      });
+      return out;
+    }
+
+    function isBesideForegroundPanel(obj, panelRects) {
+      const r = getRect(obj);
+      if (!r || r.w > CFG.foregroundSideMaxWidth || r.h > CFG.foregroundSideMaxHeight) return false;
+      return panelRects.some((panel) => (
+        r.y >= panel.y - 20
+        && r.y <= panel.y + panel.h
+        && r.x >= panel.x + panel.w - CFG.foregroundSidePadding
+        && r.x <= panel.x + panel.w + CFG.foregroundSidePadding
+      ));
     }
 
     function shouldHideTopRightControl(obj) {
@@ -467,10 +508,39 @@
       return {
         found: true,
         boss: summary([boss])[0],
-        controls: summary(controls),
-        hideTargets: summary(controls.filter(shouldHideTopRightControl)),
-        keepTargets: summary(controls.filter((obj) => isBoss(obj) || shouldKeepAuxiliary(obj))),
+        controls: summaryWithParents(controls),
+        hideTargets: summaryWithParents(controls.filter(shouldHideTopRightControl)),
+        keepTargets: summaryWithParents(controls.filter((obj) => isBoss(obj) || shouldKeepAuxiliary(obj))),
       };
+    }
+
+    function summaryWithParents(items) {
+      return summary(items).map((item, index) => {
+        item.parents = parentSummary(items[index]);
+        return item;
+      });
+    }
+
+    function parentSummary(obj) {
+      const out = [];
+      let node = obj && obj.parent;
+      for (let i = 0; node && i < 8; i += 1) {
+        const r = getRect(node) || {};
+        out.push({
+          name: (() => { try { return node.name || ''; } catch (_) { return ''; } })(),
+          text: ownText(node).slice(0, 80),
+          x: Math.round(r.x || 0),
+          y: Math.round(r.y || 0),
+          w: Math.round(r.w || 0),
+          h: Math.round(r.h || 0),
+        });
+        try {
+          node = node.parent || null;
+        } catch (_) {
+          break;
+        }
+      }
+      return out;
     }
 
     function throttledLog(label, data) {
@@ -511,4 +581,3 @@
     inject(injected);
   }
 })();
-
