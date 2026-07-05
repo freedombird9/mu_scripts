@@ -27,10 +27,23 @@
 
   const PATCHED_BRANCH = `else{_0x26afb8[_0x569830(0x6390)](_0x1c7cbb['IsNearTarget'],_0x2c3851['FAILED']);if(window.${PATCH_MARKER}&&window.${PATCH_MARKER}.shouldBlockMove&&window.${PATCH_MARKER}.shouldBlockMove()){window.${PATCH_MARKER}.blockMove&&window.${PATCH_MARKER}.blockMove();_0x188fb2['setStatus'](_0x2c3851['FAILED']);return;}let _0x5254f7=_0x3ca950[_0x569830(0x2bd3)];if(_0x5254f7&&_0x5254f7[_0x569830(0x74f0)](_0x16461a)){let _0x181bf9=_0x5254f7[_0x569830(0x1a82)](_0x16461a)[_0x569830(0x218c)],_0x9c7460=Laya['Point'][_0x569830(0x34a8)];(_0x9c7460['x']=Math[_0x569830(0x174a)](-_0x181bf9['x']),_0x9c7460['y']=Math[_0x569830(0x174a)](_0x181bf9['z']),_0x5254f7)&&(_0x3ca950[_0x569830(0x5ce8)]=_0x9c7460['x'],_0x3ca950['lastMoveY']=_0x9c7460['y'],_0x5bb43c[_0x569830(0x12e4)](_0x599def,_0x9c7460,_0x3ca950['range'])||_0x599def[_0x569830(0x1a82)](_0x2006c8)['setTarget'](null));}_0x188fb2['setStatus'](_0x2c3851[_0x569830(0x4497)]);}`;
 
+  const SPACE_KEYDOWN_TARGET = `case Laya[_0x37fbd1(0x4f2e)][_0x37fbd1(0x6125)]:_0x39616f['vm'](_0x3f63d8)[_0x37fbd1(0x5491)][_0x37fbd1(0x3007)]();break;`;
+
+  const SPACE_KEYDOWN_PATCHED = `case Laya[_0x37fbd1(0x4f2e)][_0x37fbd1(0x6125)]:if(window.${PATCH_MARKER}&&window.${PATCH_MARKER}.handleSpaceKeyDown&&window.${PATCH_MARKER}.handleSpaceKeyDown(!!(typeof _0x342def!='undefined'&&_0x39616f[_0x37fbd1(0x4502)](_0x342def)&&_0x39616f[_0x37fbd1(0x4502)](_0x342def)['isAutoFight']),()=>_0x39616f['vm'](_0x3f63d8)[_0x37fbd1(0x5491)][_0x37fbd1(0x3007)](),()=>_0x5bb43c['setCommonAutoFight'](!0x1))){}else _0x39616f['vm'](_0x3f63d8)[_0x37fbd1(0x5491)][_0x37fbd1(0x3007)]();break;`;
+
+  const SPACE_KEYUP_TARGET = `case Laya[_0x4cf0d6(0x4f2e)]['D']:case Laya[_0x4cf0d6(0x4f2e)][_0x4cf0d6(0x5fdf)]:this[_0x4cf0d6(0x463e)]['D']=!0x1,this[_0x4cf0d6(0x463e)][_0x4cf0d6(0x583a)]=!0x0;}`;
+
+  const SPACE_KEYUP_PATCHED = `case Laya[_0x4cf0d6(0x4f2e)]['D']:case Laya[_0x4cf0d6(0x4f2e)][_0x4cf0d6(0x5fdf)]:this[_0x4cf0d6(0x463e)]['D']=!0x1,this[_0x4cf0d6(0x463e)][_0x4cf0d6(0x583a)]=!0x0;break;case Laya[_0x4cf0d6(0x4f2e)][_0x4cf0d6(0x6125)]:window.${PATCH_MARKER}&&window.${PATCH_MARKER}.handleSpaceKeyUp&&window.${PATCH_MARKER}.handleSpaceKeyUp(()=>_0x5bb43c['setCommonAutoFight'](!0x1));}`;
+
   const state = {
     enabled: readBool(STORAGE_KEY, true),
     debug: readBool(DEBUG_KEY, false),
     manualBlockActive: false,
+    spaceManualActive: false,
+    spacePausedByDirection: false,
+    spaceStartAttack: null,
+    spaceStopAttack: null,
+    pressedDirections: new Set(),
     lastHintAt: 0,
     beepedForCurrentManualAttack: false,
     audioContext: null,
@@ -42,6 +55,8 @@
       manualKeyCaptureInstalled: false,
       interceptedBundle: false,
       patchedBundle: false,
+      patchedSpaceKeyDown: false,
+      patchedSpaceKeyUp: false,
       fallbackLoaded: false,
       lastReason: '',
       lastBundleUrl: '',
@@ -51,6 +66,13 @@
       manualAttackUntil: 0,
       blockCount: 0,
       beepCount: 0,
+      spaceKeyDownCount: 0,
+      spaceStartCount: 0,
+      spaceStopCount: 0,
+      spaceDirectionPauseCount: 0,
+      spaceDirectionResumeCount: 0,
+      spaceManualActive: false,
+      spacePausedByDirection: false,
     },
   };
 
@@ -107,12 +129,58 @@
         showHint('距离过远', false);
         log('blocked manual out-of-range auto move');
       },
+      handleSpaceKeyDown(isAutoHunt, startAttack, stopAttack) {
+        if (!state.enabled || isAutoHunt) {
+          return false;
+        }
+        if (typeof startAttack !== 'function' || typeof stopAttack !== 'function') {
+          return false;
+        }
+
+        state.status.spaceKeyDownCount += 1;
+        state.spaceStartAttack = startAttack;
+        state.spaceStopAttack = stopAttack;
+
+        if (state.spaceManualActive) {
+          return true;
+        }
+
+        state.spaceManualActive = true;
+        state.spacePausedByDirection = false;
+        state.status.spaceManualActive = true;
+        state.status.lastReason = 'space manual attack started';
+        startSpaceAttack('space keydown');
+        return true;
+      },
+      handleSpaceKeyUp(stopAttack) {
+        if (!state.spaceManualActive) {
+          return false;
+        }
+        if (typeof stopAttack === 'function') {
+          state.spaceStopAttack = stopAttack;
+        }
+
+        stopSpaceAttack('space keyup');
+        state.spaceManualActive = false;
+        state.spacePausedByDirection = false;
+        state.pressedDirections.clear();
+        state.status.spaceManualActive = false;
+        state.status.spacePausedByDirection = false;
+        state.status.lastReason = 'space manual attack stopped';
+        return true;
+      },
     };
   }
 
   function captureManualAttackKey() {
     page.addEventListener('keydown', (event) => {
       if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      if (isMovementKey(event)) {
+        markDirectionKey(event);
+        pauseSpaceAttackForDirection();
         return;
       }
 
@@ -124,6 +192,19 @@
       if ((event.key || '').toLowerCase() === 'z' || event.code === 'KeyZ') {
         clearManualBlock('Z auto-hunt key captured');
       }
+    }, true);
+
+    page.addEventListener('keyup', (event) => {
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      if (!isMovementKey(event)) {
+        return;
+      }
+
+      unmarkDirectionKey(event);
+      resumeSpaceAttackAfterDirection();
     }, true);
     state.status.manualKeyCaptureInstalled = true;
     log('manual attack key capture installed');
@@ -194,6 +275,84 @@
     state.status.manualAttackUntil = 0;
     state.status.lastReason = reason;
     log(reason);
+  }
+
+  function startSpaceAttack(reason) {
+    if (!state.spaceManualActive || state.spacePausedByDirection || state.pressedDirections.size > 0) {
+      return;
+    }
+    try {
+      state.spaceStartAttack();
+      state.status.spaceStartCount += 1;
+      state.status.lastReason = reason;
+      log(reason);
+    } catch (error) {
+      state.status.lastReason = `space attack start failed: ${error && error.message ? error.message : error}`;
+      log('space attack start failed:', error);
+    }
+  }
+
+  function stopSpaceAttack(reason) {
+    if (typeof state.spaceStopAttack !== 'function') {
+      return;
+    }
+    try {
+      state.spaceStopAttack();
+      state.status.spaceStopCount += 1;
+      state.status.lastReason = reason;
+      log(reason);
+    } catch (error) {
+      state.status.lastReason = `space attack stop failed: ${error && error.message ? error.message : error}`;
+      log('space attack stop failed:', error);
+    }
+  }
+
+  function pauseSpaceAttackForDirection() {
+    if (!state.spaceManualActive || state.spacePausedByDirection) {
+      return;
+    }
+    state.spacePausedByDirection = true;
+    state.status.spacePausedByDirection = true;
+    state.status.spaceDirectionPauseCount += 1;
+    stopSpaceAttack('space attack paused by movement key');
+  }
+
+  function resumeSpaceAttackAfterDirection() {
+    if (!state.spaceManualActive || !state.spacePausedByDirection || state.pressedDirections.size > 0) {
+      return;
+    }
+    state.spacePausedByDirection = false;
+    state.status.spacePausedByDirection = false;
+    state.status.spaceDirectionResumeCount += 1;
+    startSpaceAttack('space attack resumed after movement key release');
+  }
+
+  function markDirectionKey(event) {
+    const key = normalizeMovementKey(event);
+    if (key) {
+      state.pressedDirections.add(key);
+    }
+  }
+
+  function unmarkDirectionKey(event) {
+    const key = normalizeMovementKey(event);
+    if (key) {
+      state.pressedDirections.delete(key);
+    }
+  }
+
+  function isMovementKey(event) {
+    return Boolean(normalizeMovementKey(event));
+  }
+
+  function normalizeMovementKey(event) {
+    const code = event && event.code;
+    const key = ((event && event.key) || '').toLowerCase();
+    if (code === 'ArrowUp' || key === 'arrowup' || code === 'KeyW' || key === 'w') return 'up';
+    if (code === 'ArrowDown' || key === 'arrowdown' || code === 'KeyS' || key === 's') return 'down';
+    if (code === 'ArrowLeft' || key === 'arrowleft' || code === 'KeyA' || key === 'a') return 'left';
+    if (code === 'ArrowRight' || key === 'arrowright' || code === 'KeyD' || key === 'd') return 'right';
+    return '';
   }
 
   function isEditableTarget(target) {
@@ -273,14 +432,37 @@
       return { source, applied: false, reason: 'already patched' };
     }
 
-    if (!source.includes(TARGET_BRANCH)) {
-      return { source, applied: false, reason: 'target branch not found' };
+    let patched = source;
+    const manualOk = patched.includes(TARGET_BRANCH);
+    const spaceDownOk = patched.includes(SPACE_KEYDOWN_TARGET);
+    const spaceUpOk = patched.includes(SPACE_KEYUP_TARGET);
+
+    if (manualOk) {
+      patched = patched.replace(TARGET_BRANCH, PATCHED_BRANCH);
+    }
+    if (spaceDownOk) {
+      patched = patched.replace(SPACE_KEYDOWN_TARGET, SPACE_KEYDOWN_PATCHED);
+    }
+    if (spaceUpOk) {
+      patched = patched.replace(SPACE_KEYUP_TARGET, SPACE_KEYUP_PATCHED);
+    }
+
+    state.status.patchedBundle = manualOk || spaceDownOk || spaceUpOk;
+    state.status.patchedSpaceKeyDown = spaceDownOk;
+    state.status.patchedSpaceKeyUp = spaceUpOk;
+
+    if (!state.status.patchedBundle) {
+      return { source, applied: false, reason: 'target branches not found' };
     }
 
     return {
-      source: source.replace(TARGET_BRANCH, PATCHED_BRANCH),
+      source: patched,
       applied: true,
-      reason: 'patched btMoveToTargetEx out-of-range move branch',
+      reason: [
+        manualOk ? 'manual-move✓' : 'manual-move✗',
+        spaceDownOk ? 'space-down✓' : 'space-down✗',
+        spaceUpOk ? 'space-up✓' : 'space-up✗',
+      ].join(' '),
     };
   }
 
@@ -394,4 +576,3 @@
     }
   }
 })();
-
