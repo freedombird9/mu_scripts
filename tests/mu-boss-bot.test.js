@@ -473,6 +473,34 @@ function testPlannerUsesValidFarmFallback() {
   assert.strictEqual(plan.intent.farmSpot.name, 'farm');
 }
 
+function testDailyKeysUseUtc8() {
+  const beforeReset = global.Date.parse('2026-07-05T15:59:00.000Z');
+  const afterReset = global.Date.parse('2026-07-05T16:01:00.000Z');
+
+  const first = loadUserscript(buildEmptyRoot(), makeStorage(), beforeReset).api;
+  assert.strictEqual(first.getStatus().dayKey, '2026-07-05');
+
+  const second = loadUserscript(buildEmptyRoot(), makeStorage(), afterReset).api;
+  assert.strictEqual(second.getStatus().dayKey, '2026-07-06');
+}
+
+function testManualResultRecordsKillCount() {
+  const { api } = loadUserscript();
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '福利BOSS', name: '愤怒闪电巨人', priority: 10, dailyLimit: 1 }],
+  });
+  api.markManualResult({ type: 'boss_killed', target: { type: '福利BOSS', name: '愤怒闪电巨人' } });
+  const status = api.getStatus();
+  assert.strictEqual(status.daily.counts['福利BOSS::愤怒闪电巨人'], 1);
+
+  const snapshot = api.scan();
+  snapshot.leftPanel.bossEntries = [{ name: '愤怒闪电巨人', state: 'ready', refreshInSeconds: null }];
+  const plan = api.plan(snapshot);
+  assert.strictEqual(plan.intent.type, 'disabled');
+  assert.strictEqual(plan.intent.reason, 'daily limit reached');
+}
+
 function run() {
   testPublicApiExists();
   testConfigNormalizationAndLogs();
@@ -482,6 +510,8 @@ function run() {
   testPlannerPreWaitsConfiguredCooldownBoss();
   testPlannerDoesNotFarmWithoutConfiguredSpot();
   testPlannerUsesValidFarmFallback();
+  testDailyKeysUseUtc8();
+  testManualResultRecordsKillCount();
   console.log('mu-boss-bot tests passed');
 }
 

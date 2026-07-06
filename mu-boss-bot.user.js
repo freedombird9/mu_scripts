@@ -21,6 +21,7 @@
     const VERSION = '0.1.0';
     const CONFIG_KEY = 'mu_boss_bot_config_v1';
     const LOG_KEY = 'mu_boss_bot_logs_v1';
+    const DAILY_KEY = 'mu_boss_bot_daily_v1';
     const MAX_LOGS = 500;
 
     const state = {
@@ -40,6 +41,7 @@
         currentIntent: null,
       },
       config: normalizeConfig(readJson(CONFIG_KEY, defaultConfig())),
+      daily: normalizeDaily(readJson(DAILY_KEY, null)),
       lastSnapshot: null,
       lastPlan: null,
       logs: normalizeLogs(readJson(LOG_KEY, [])),
@@ -88,7 +90,8 @@
     }
 
     function getStatus() {
-      return clone(state.status);
+      ensureDailyState();
+      return clone({ ...state.status, dayKey: state.daily.dayKey, daily: state.daily });
     }
 
     function getConfig() {
@@ -185,13 +188,22 @@
       const entries = snapshot.leftPanel && snapshot.leftPanel.bossEntries ? snapshot.leftPanel.bossEntries : [];
       const targets = config.targets.filter((target) => target.enabled);
       const matches = [];
+      const limitedMatches = [];
       targets.forEach((target) => {
         entries.forEach((entry) => {
           if (namesMatch(entry.name, target.name)) {
-            matches.push({ target, entry, score: target.priority });
+            if (dailyLimitReached(target)) {
+              limitedMatches.push({ target, entry, score: target.priority });
+            } else {
+              matches.push({ target, entry, score: target.priority });
+            }
           }
         });
       });
+      if (!matches.length && limitedMatches.length) {
+        limitedMatches.sort((a, b) => b.score - a.score);
+        return intent('disabled', 'daily limit reached', limitedMatches[0].target, 1);
+      }
       if (!matches.length) return null;
       matches.sort((a, b) => b.score - a.score);
       const ready = matches.find((match) => match.entry.state === 'ready');
@@ -283,7 +295,11 @@
     }
 
     function markManualResult(event) {
-      appendLog('manual_result', { event: clone(event || {}) });
+      const payload = clone(event || {});
+      if (payload.type === 'boss_killed' && payload.target) {
+        recordDailyKill(payload.target);
+      }
+      appendLog('manual_result', { event: payload });
       return exportLogs();
     }
 
@@ -558,6 +574,44 @@
 
     function normalizeLogs(value) {
       return Array.isArray(value) ? value.slice(-MAX_LOGS) : [];
+    }
+
+    function normalizeDaily(value) {
+      const current = utc8DateKey(Date.now());
+      if (!value || typeof value !== 'object' || value.dayKey !== current) {
+        return { dayKey: current, counts: {}, contestedLosses: [] };
+      }
+      return {
+        dayKey: current,
+        counts: value.counts && typeof value.counts === 'object' ? value.counts : {},
+        contestedLosses: Array.isArray(value.contestedLosses) ? value.contestedLosses : [],
+      };
+    }
+
+    function ensureDailyState() {
+      const current = utc8DateKey(Date.now());
+      if (!state.daily || state.daily.dayKey !== current) {
+        state.daily = { dayKey: current, counts: {}, contestedLosses: [] };
+        writeJson(DAILY_KEY, state.daily);
+        appendLog('state_transition', { to: state.status.state, reason: 'utc8 daily reset' });
+      }
+    }
+
+    function recordDailyKill(target) {
+      ensureDailyState();
+      const key = targetKey(target);
+      state.daily.counts[key] = (Number(state.daily.counts[key]) || 0) + 1;
+      writeJson(DAILY_KEY, state.daily);
+    }
+
+    function targetKey(target) {
+      return `${cleanText(target.type) || '未分类'}::${cleanText(target.name)}`;
+    }
+
+    function dailyLimitReached(target) {
+      ensureDailyState();
+      const count = Number(state.daily.counts[targetKey(target)]) || 0;
+      return target.dailyLimit >= 0 && count >= target.dailyLimit;
     }
 
     function readJson(key, fallback) {
