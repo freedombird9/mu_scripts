@@ -328,8 +328,54 @@ function testPublicApiExists() {
   assert.strictEqual(status.mode, 'dry-run');
 }
 
+function testConfigNormalizationAndLogs() {
+  const { api, storage } = loadUserscript();
+  const config = api.setConfig({
+    enabled: true,
+    dryRun: false,
+    defaults: { preWaitSeconds: 9999 },
+    targets: [
+      { type: '福利BOSS', name: '愤怒闪电巨人', priority: 2000, dailyLimit: 2 },
+      { type: '福利BOSS', name: '', priority: 1 },
+    ],
+    fallbackFarmSpots: [
+      { name: '挂机点A', map: '', coordinate: '', priority: 5 },
+      { name: '挂机点B', map: '四风平原', coordinate: '100,120', priority: 10 },
+    ],
+  });
+
+  assert.strictEqual(config.enabled, true);
+  assert.strictEqual(config.dryRun, false);
+  assert.strictEqual(config.defaults.preWaitSeconds, 600);
+  assert.strictEqual(config.targets.length, 1);
+  assert.strictEqual(config.targets[0].priority, 999);
+  assert.strictEqual(config.fallbackFarmSpots.length, 2);
+  assert(storage.getItem('mu_boss_bot_config_v1'), 'config should be persisted');
+
+  const logs = api.exportLogs();
+  assert(logs.some((entry) => entry.type === 'config_updated'), 'config update should be logged');
+  assert.strictEqual(api.clearLogs().length, 0);
+}
+
+function testPauseResumeAndManualResult() {
+  const { api } = loadUserscript();
+  api.pause('user playing');
+  assert.strictEqual(api.getStatus().state, 'PAUSED');
+  assert.strictEqual(api.getStatus().paused, true);
+  assert.strictEqual(api.getStatus().pauseReason, 'user playing');
+
+  api.markManualResult({ type: 'user_killed_boss', target: '傲之煞' });
+  assert(api.exportLogs().some((entry) => entry.type === 'manual_result'));
+
+  api.resume();
+  assert.strictEqual(api.getStatus().state, 'SYNC');
+  assert.strictEqual(api.getStatus().paused, false);
+}
+
 function run() {
   testPublicApiExists();
+  testConfigNormalizationAndLogs();
+  testPauseResumeAndManualResult();
   console.log('mu-boss-bot tests passed');
 }
 
