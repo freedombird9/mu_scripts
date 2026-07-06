@@ -501,6 +501,31 @@ function testManualResultRecordsKillCount() {
   assert.strictEqual(plan.intent.reason, 'daily limit reached');
 }
 
+function testTickLogsIntentWithoutExecutingActions() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '试炼之地', name: '邪恶龙虾战士', priority: 10, dailyLimit: 3, preWaitSeconds: 90 }],
+  });
+  const result = api.tick();
+  assert.strictEqual(result.status.currentIntent.type, 'prepare_boss');
+  assert.strictEqual(result.executed.length, 0);
+  assert(api.exportLogs().some((entry) => entry.type === 'intent_planned' && entry.intent.type === 'prepare_boss'));
+}
+
+function testPausedTickDoesNotPlanGameplayIntent() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '试炼之地', name: '邪恶龙虾战士', priority: 10, dailyLimit: 3, preWaitSeconds: 90 }],
+  });
+  api.pause('manual takeover');
+  const result = api.tick();
+  assert.strictEqual(result.status.state, 'PAUSED');
+  assert.strictEqual(result.status.currentIntent.type, 'pause');
+  assert.strictEqual(result.executed.length, 0);
+}
+
 function run() {
   testPublicApiExists();
   testConfigNormalizationAndLogs();
@@ -512,6 +537,8 @@ function run() {
   testPlannerUsesValidFarmFallback();
   testDailyKeysUseUtc8();
   testManualResultRecordsKillCount();
+  testTickLogsIntentWithoutExecutingActions();
+  testPausedTickDoesNotPlanGameplayIntent();
   console.log('mu-boss-bot tests passed');
 }
 

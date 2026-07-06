@@ -272,16 +272,35 @@
     }
 
     function tick() {
+      ensureDailyState();
       state.status.tickCount += 1;
       state.status.lastTickAt = Date.now();
+      const previous = state.status.state;
       const snapshot = scan();
       const nextPlan = plan(snapshot);
+      const nextState = stateForIntent(nextPlan.intent.type);
+      state.status.state = state.status.paused ? 'PAUSED' : nextState;
+      if (previous !== state.status.state) {
+        appendLog('state_transition', { from: previous, to: state.status.state, reason: nextPlan.intent.reason });
+      }
       appendLog('intent_planned', { intent: nextPlan.intent });
       return {
         status: getStatus(),
         snapshot,
         plan: nextPlan,
+        executed: [],
       };
+    }
+
+    function stateForIntent(type) {
+      if (type === 'prepare_boss' || type === 'auto_candidate') return 'PREPARE_BOSS';
+      if (type === 'travel_to_boss') return 'TRAVEL_TO_BOSS';
+      if (type === 'wait_spawn') return 'WAIT_SPAWN';
+      if (type === 'warrior_task') return 'WARRIOR_TASK';
+      if (type === 'farm_fallback') return 'FARM_FALLBACK';
+      if (type === 'pause') return 'PAUSED';
+      if (type === 'disabled') return 'PLAN';
+      return 'PLAN';
     }
 
     function exportLogs() {
