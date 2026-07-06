@@ -76,10 +76,27 @@ function makeStorage(seed = {}) {
   };
 }
 
+function serializeNode(node) {
+  return {
+    name: node.name,
+    text: node.text,
+    title: node.title,
+    icon: node.icon,
+    packageItem: node.packageItem,
+    x: node.x,
+    y: node.y,
+    width: node.width,
+    height: node.height,
+    visible: node.visible,
+    internalVisible: node.internalVisible,
+    children: node.children.map(serializeNode),
+  };
+}
+
 function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 1783339200000) {
   const storageSeed = storage && storage.data ? storage.data : {};
   const sandbox = {
-    __root: root,
+    __rootJson: JSON.stringify(serializeNode(root)),
     __now: now,
     __storageSeed: JSON.stringify(storageSeed),
     location: { href: 'https://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/index.html' },
@@ -87,6 +104,7 @@ function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 
   vm.createContext(sandbox);
   vm.runInContext(`
     const NativeDate = Date;
+    const rootData = JSON.parse(__rootJson);
     const storageData = JSON.parse(__storageSeed);
 
     function noop() {}
@@ -181,6 +199,42 @@ function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 
       };
     }
 
+    function hydrateNode(data, parent) {
+      const node = {
+        name: data.name || '',
+        text: data.text || '',
+        title: data.title || '',
+        icon: data.icon || '',
+        packageItem: data.packageItem || null,
+        x: data.x || 0,
+        y: data.y || 0,
+        width: data.width || 0,
+        height: data.height || 0,
+        visible: data.visible !== false,
+        internalVisible: data.internalVisible !== false,
+        parent: parent || null,
+        children: [],
+        getChildAt(index) {
+          return this.children[index];
+        },
+        localToGlobalRect() {
+          return {
+            x: this.x,
+            y: this.y,
+            width: this.width,
+            height: this.height,
+          };
+        },
+      };
+      Object.defineProperty(node, 'numChildren', {
+        get() {
+          return this.children.length;
+        },
+      });
+      node.children = (data.children || []).map((child) => hydrateNode(child, node));
+      return node;
+    }
+
     const documentElement = makeElement('html');
     documentElement.appendChild = function appendChild(node) {
       if (node && node.tagName === 'SCRIPT') {
@@ -227,7 +281,7 @@ function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 
       body: documentElement,
     };
     window = {
-      fgui: { GRoot: { inst: __root } },
+      fgui: { GRoot: { inst: hydrateNode(rootData) } },
       localStorage,
     };
     window.window = window;
