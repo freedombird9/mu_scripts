@@ -530,6 +530,26 @@ function testAutoCandidateRequiresEnterEvidence() {
   assert.strictEqual(plan.intent.farmSpot.name, 'farm');
 }
 
+function testAutoCandidateRequiresFiniteConfidence() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [],
+    fallbackFarmSpots: [{ name: 'farm', map: '四风平原', coordinate: '100,120', priority: 1 }],
+    warriorTask: { enabled: false },
+  });
+
+  const missingConfidence = api.scan();
+  delete missingConfidence.confidence;
+  let plan = api.plan(missingConfidence);
+  assert.strictEqual(plan.intent.type, 'farm_fallback');
+
+  const nanConfidence = api.scan();
+  nanConfidence.confidence.bossPanel = 'not-a-number';
+  plan = api.plan(nanConfidence);
+  assert.strictEqual(plan.intent.type, 'farm_fallback');
+}
+
 function testAutoCandidateIncludesEnterEvidence() {
   const { api } = loadUserscript(buildSensorScene());
   api.setConfig({
@@ -610,6 +630,7 @@ function run() {
   testPlannerUsesValidFarmFallback();
   testWarriorTaskDailyLimitBlocksPlanning();
   testAutoCandidateRequiresEnterEvidence();
+  testAutoCandidateRequiresFiniteConfidence();
   testAutoCandidateIncludesEnterEvidence();
   testDailyKeysUseUtc8();
   testManualResultRecordsKillCount();

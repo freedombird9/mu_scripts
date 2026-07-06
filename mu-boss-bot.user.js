@@ -239,7 +239,7 @@
       const rows = snapshot.bossPanel && snapshot.bossPanel.rows ? snapshot.bossPanel.rows : [];
       const enterButtons = snapshot.bossPanel && snapshot.bossPanel.enterButtons ? snapshot.bossPanel.enterButtons : [];
       const confidence = snapshot.confidence && Number(snapshot.confidence.bossPanel);
-      if (!snapshot.bossPanel || snapshot.bossPanel.open !== true || confidence < 0.5 || !rows[0] || !enterButtons[0]) return null;
+      if (!snapshot.bossPanel || snapshot.bossPanel.open !== true || !Number.isFinite(confidence) || confidence < 0.5 || !rows[0] || !enterButtons[0]) return null;
       const row = rows[0];
       const enterButton = enterButtons.find((button) => /前往|挑战|进入|\d+只/.test(button.text)) || enterButtons[0];
       return {
