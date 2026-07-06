@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         全民红月 - 左上按钮缩小
+// @name         全民红月 - 左上按钮 + 右下弹窗缩小
 // @namespace    codex.mu.ui.left-top-compact
-// @version      0.3.0
-// @description  缩小左上”升级”/”送大天使”/”限时活动”按钮到原始大小的一半(0.5)，独立于 BOSS 折叠菜单脚本。
+// @version      0.4.0
+// @description  缩小左上”升级”/”送大天使”/”限时活动”按钮(0.5)和右下”立即使用”弹窗(0.7，右下角锚定)。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -33,6 +33,11 @@
         /送大天使/,
         /LimitedTime/, // 命中 btn_LimitedTimeActivity（图标资源 url 含 img_LimitedTimeActivity_new）
       ],
+      // 右下"立即使用"弹窗（TipsViewWnd）缩小配置
+      tipsView: {
+        packageItemName: 'TipsViewWnd',
+        scale: 0.7, // 比 0.5 大一点，避免文字看不清
+      },
     };
 
     const state = {
@@ -41,7 +46,7 @@
       lastLogAt: 0,
       lastSummary: '',
       status: {
-        version: '0.3.0',
+        version: '0.4.0',
         applyCount: 0,
         lastMatched: [],
         lastReason: 'waiting for fgui',
@@ -236,19 +241,68 @@
 
     function applyOnce() {
       const targets = findTargets();
-      if (!targets.length) {
-        state.status.lastMatched = [];
-        state.status.lastReason = root() ? 'no target matched' : 'waiting for fgui';
-        throttledLog('no target');
-        return false;
+      if (targets.length) {
+        targets.forEach(compact);
+        state.status.applyCount += targets.length;
+        state.status.lastMatched = summary(targets);
+        state.status.lastReason = 'compacted left top buttons';
+        throttledLog('compacted', state.status.lastMatched);
       }
 
-      targets.forEach(compact);
-      state.status.applyCount += targets.length;
-      state.status.lastMatched = summary(targets);
-      state.status.lastReason = 'compacted left top buttons';
-      throttledLog('compacted', state.status.lastMatched);
-      return true;
+      // 右下"立即使用"弹窗：每次都重新检查（弹窗可能动态切换物品/重建）
+      const tips = findTipsView();
+      if (tips) {
+        compactTipsView(tips);
+        state.status.lastReason = targets.length
+          ? 'compacted left top buttons + tips view'
+          : 'compacted tips view';
+      }
+
+      return targets.length > 0 || !!tips;
+    }
+
+    function findTipsView() {
+      const gRoot = root();
+      if (!gRoot) return null;
+      const target = { name: CFG.tipsView.packageItemName };
+      function walk(node, depth) {
+        if (!node || depth > 20) return null;
+        try {
+          if (node.packageItem && node.packageItem.name === target.name) return node;
+        } catch (_) {}
+        const n = Number(node.numChildren) || 0;
+        for (let i = 0; i < n; i += 1) {
+          try {
+            const r = walk(node.getChildAt(i), depth + 1);
+            if (r) return r;
+          } catch (_) {}
+        }
+        return null;
+      }
+      return walk(gRoot, 0);
+    }
+
+    function compactTipsView(node) {
+      if (!node) return;
+      const target = CFG.tipsView.scale;
+      // 已是目标 scale 则跳过（避免重复补偿 x/y 导致漂移）
+      if (Math.abs(Number(node.scaleX) - target) < 0.001 && Math.abs(Number(node.scaleY) - target) < 0.001) return;
+
+      const before = getRect(node);
+      if (!before) return;
+      const anchorBR = { x: before.x + before.w, y: before.y + before.h };
+
+      try { node.scaleX = target; } catch (_) {}
+      try { node.scaleY = target; } catch (_) {}
+
+      const after = getRect(node);
+      if (!after) return;
+      const newBR = { x: after.x + after.w, y: after.y + after.h };
+      // 补偿 x/y 让右下角保持不变
+      try {
+        node.x = node.x + (anchorBR.x - newBR.x);
+        node.y = node.y + (anchorBR.y - newBR.y);
+      } catch (_) {}
     }
 
     function throttledLog(label, data) {
