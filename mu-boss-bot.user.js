@@ -150,20 +150,113 @@
     function plan(snapshot) {
       state.status.planCount += 1;
       state.status.lastPlanAt = Date.now();
+      const source = snapshot || state.lastSnapshot || scan();
+      const nextIntent = chooseIntent(source, state.config);
       state.lastPlan = {
         at: state.status.lastPlanAt,
         state: state.status.paused ? 'PAUSED' : 'PLAN',
-        intent: {
-          type: state.status.paused ? 'pause' : 'observe',
-          reason: state.status.paused ? state.status.pauseReason : 'no actionable signal',
-          target: null,
-          confidence: 1,
-          dryRun: true,
-        },
-        snapshot: clone(snapshot || state.lastSnapshot || emptySnapshot()),
+        intent: nextIntent,
+        snapshot: clone(source),
       };
       state.status.currentIntent = clone(state.lastPlan.intent);
       return clone(state.lastPlan);
+    }
+
+    function chooseIntent(snapshot, config) {
+      if (state.status.paused) return intent('pause', state.status.pauseReason || 'paused');
+      if (!config.enabled) return intent('disabled', 'config disabled');
+
+      const configured = chooseConfiguredBoss(snapshot, config);
+      if (configured) return configured;
+
+      const warrior = chooseWarriorTask(snapshot, config);
+      if (warrior) return warrior;
+
+      const autoCandidate = chooseAutoCandidate(snapshot, config);
+      if (autoCandidate) return autoCandidate;
+
+      const farm = chooseFarmSpot(config);
+      if (farm) return { ...intent('farm_fallback', 'no boss candidate, use farm fallback'), farmSpot: farm };
+
+      return intent('pause', 'no actionable target and no valid farm spot');
+    }
+
+    function chooseConfiguredBoss(snapshot, config) {
+      const entries = snapshot.leftPanel && snapshot.leftPanel.bossEntries ? snapshot.leftPanel.bossEntries : [];
+      const targets = config.targets.filter((target) => target.enabled);
+      const matches = [];
+      targets.forEach((target) => {
+        entries.forEach((entry) => {
+          if (namesMatch(entry.name, target.name)) {
+            matches.push({ target, entry, score: target.priority });
+          }
+        });
+      });
+      if (!matches.length) return null;
+      matches.sort((a, b) => b.score - a.score);
+      const ready = matches.find((match) => match.entry.state === 'ready');
+      if (ready) {
+        return {
+          ...intent('prepare_boss', 'configured boss ready', ready.target, 0.9),
+          entry: ready.entry,
+        };
+      }
+      const preWait = matches.find((match) => match.entry.refreshInSeconds != null && match.entry.refreshInSeconds <= match.target.preWaitSeconds);
+      if (preWait) {
+        return {
+          ...intent('travel_to_boss', 'within pre-wait window', preWait.target, 0.85),
+          entry: preWait.entry,
+        };
+      }
+      const wait = matches[0];
+      return {
+        ...intent('wait_spawn', 'configured boss cooldown', wait.target, 0.8),
+        entry: wait.entry,
+      };
+    }
+
+    function chooseWarriorTask(snapshot, config) {
+      if (!config.warriorTask.enabled) return null;
+      const entries = snapshot.leftPanel && snapshot.leftPanel.warriorTaskEntries ? snapshot.leftPanel.warriorTaskEntries : [];
+      const task = entries.find((entry) => entry.star === config.warriorTask.requiredStar);
+      if (!task) return null;
+      return {
+        ...intent('warrior_task', 'three-star warrior boss task available', null, 0.75),
+        task,
+      };
+    }
+
+    function chooseAutoCandidate(snapshot) {
+      const rows = snapshot.bossPanel && snapshot.bossPanel.rows ? snapshot.bossPanel.rows : [];
+      if (!rows.length) return null;
+      const row = rows[0];
+      return {
+        ...intent('auto_candidate', 'configured targets unavailable, panel candidate found', { type: snapshot.bossPanel.selectedTab || '', name: row.name }, 0.6),
+        row,
+      };
+    }
+
+    function chooseFarmSpot(config) {
+      const spots = config.fallbackFarmSpots
+        .filter((spot) => spot.map && spot.coordinate)
+        .sort((a, b) => b.priority - a.priority);
+      return spots[0] ? clone(spots[0]) : null;
+    }
+
+    function intent(type, reason, target, confidence) {
+      return {
+        type,
+        reason,
+        target: target ? clone(target) : null,
+        confidence: confidence == null ? 1 : confidence,
+        dryRun: true,
+      };
+    }
+
+    function namesMatch(a, b) {
+      const left = cleanText(a);
+      const right = cleanText(b);
+      return left === right || left.includes(right) || right.includes(left);
     }
 
     function tick() {

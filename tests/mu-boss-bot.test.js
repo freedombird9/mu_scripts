@@ -426,11 +426,62 @@ function testSensorSnapshotFromUi() {
   assert(snapshot.confidence.bossPanel > 0.5);
 }
 
+function testPlannerChoosesConfiguredReadyBoss() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [
+      { type: '试炼之地', name: '咆哮龙虾战士', priority: 90, dailyLimit: 3, preWaitSeconds: 90 },
+      { type: '试炼之地', name: '邪恶龙虾战士', priority: 10, dailyLimit: 3, preWaitSeconds: 90 },
+    ],
+  });
+  const snapshot = api.scan();
+  const plan = api.plan(snapshot);
+  assert.strictEqual(plan.intent.type, 'prepare_boss');
+  assert.strictEqual(plan.intent.target.name, '邪恶龙虾战士');
+  assert.strictEqual(plan.intent.reason, 'configured boss ready');
+}
+
+function testPlannerPreWaitsConfiguredCooldownBoss() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [
+      { type: '试炼之地', name: '咆哮龙虾战士', priority: 90, dailyLimit: 3, preWaitSeconds: 90 },
+    ],
+  });
+  const snapshot = api.scan();
+  const plan = api.plan(snapshot);
+  assert.strictEqual(plan.intent.type, 'travel_to_boss');
+  assert.strictEqual(plan.intent.target.name, '咆哮龙虾战士');
+  assert.strictEqual(plan.intent.reason, 'within pre-wait window');
+}
+
+function testPlannerDoesNotFarmWithoutConfiguredSpot() {
+  const { api } = loadUserscript(buildEmptyRoot());
+  api.setConfig({ enabled: true, targets: [], fallbackFarmSpots: [{ name: 'empty', map: '', coordinate: '' }] });
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'pause');
+  assert.strictEqual(plan.intent.reason, 'no actionable target and no valid farm spot');
+}
+
+function testPlannerUsesValidFarmFallback() {
+  const { api } = loadUserscript(buildEmptyRoot());
+  api.setConfig({ enabled: true, targets: [], fallbackFarmSpots: [{ name: 'farm', map: '四风平原', coordinate: '100,120', priority: 1 }] });
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'farm_fallback');
+  assert.strictEqual(plan.intent.farmSpot.name, 'farm');
+}
+
 function run() {
   testPublicApiExists();
   testConfigNormalizationAndLogs();
   testPauseResumeAndManualResult();
   testSensorSnapshotFromUi();
+  testPlannerChoosesConfiguredReadyBoss();
+  testPlannerPreWaitsConfiguredCooldownBoss();
+  testPlannerDoesNotFarmWithoutConfiguredSpot();
+  testPlannerUsesValidFarmFallback();
   console.log('mu-boss-bot tests passed');
 }
 
