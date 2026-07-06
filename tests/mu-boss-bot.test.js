@@ -99,13 +99,18 @@ function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 
     __rootJson: JSON.stringify(serializeNode(root)),
     __now: now,
     __storageSeed: JSON.stringify(storageSeed),
-    location: { href: 'https://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/index.html' },
+    __href: 'https://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/index.html',
   };
   vm.createContext(sandbox);
   vm.runInContext(`
     const NativeDate = Date;
     const rootData = JSON.parse(__rootJson);
     const storageData = JSON.parse(__storageSeed);
+    location = {
+      href: __href,
+      hostname: 'cdn.qj2h5.jiuxiaokj.cn',
+      pathname: '/mu2h5/h5-data/mu-release/index.html',
+    };
 
     function noop() {}
 
