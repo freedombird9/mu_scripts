@@ -76,121 +76,176 @@ function makeStorage(seed = {}) {
   };
 }
 
-function makeConsoleStub() {
-  return {
-    log() {},
-    info() {},
-    warn() {},
-    error() {},
-    debug() {},
+function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 1783339200000) {
+  const storageSeed = storage && storage.data ? storage.data : {};
+  const sandbox = {
+    __root: root,
+    __now: now,
+    __storageSeed: JSON.stringify(storageSeed),
+    location: { href: 'https://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/index.html' },
   };
-}
+  vm.createContext(sandbox);
+  vm.runInContext(`
+    const NativeDate = Date;
+    const storageData = JSON.parse(__storageSeed);
 
-function makeMockDate(now) {
-  function MockDate(...args) {
-    if (!(this instanceof MockDate)) {
-      return new MockDate(...args).toISOString();
+    function noop() {}
+
+    function MockDate(...args) {
+      if (!(this instanceof MockDate)) {
+        return new MockDate(...args).toString();
+      }
+
+      const value = args.length ? new NativeDate(...args).getTime() : __now;
+      Object.defineProperty(this, '_time', {
+        value,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      });
     }
 
-    const value = args.length ? new global.Date(...args).getTime() : now;
-    Object.defineProperty(this, '_time', {
-      value,
-      enumerable: false,
-      configurable: false,
-      writable: false,
-    });
-  }
+    MockDate.now = function nowMock() {
+      return __now;
+    };
 
-  MockDate.now = function nowMock() {
-    return now;
-  };
+    MockDate.parse = function parseMock(value) {
+      return NativeDate.parse(value);
+    };
 
-  MockDate.parse = function parseMock(value) {
-    return global.Date.parse(value);
-  };
+    MockDate.UTC = function utcMock(...args) {
+      return NativeDate.UTC(...args);
+    };
 
-  MockDate.UTC = function utcMock(...args) {
-    return global.Date.UTC(...args);
-  };
+    MockDate.prototype._date = function dateMock() {
+      return new NativeDate(this._time);
+    };
 
-  MockDate.prototype.getUTCFullYear = function getUTCFullYear() {
-    return new global.Date(this._time).getUTCFullYear();
-  };
+    MockDate.prototype.getUTCFullYear = function getUTCFullYear() {
+      return this._date().getUTCFullYear();
+    };
 
-  MockDate.prototype.getUTCMonth = function getUTCMonth() {
-    return new global.Date(this._time).getUTCMonth();
-  };
+    MockDate.prototype.getUTCMonth = function getUTCMonth() {
+      return this._date().getUTCMonth();
+    };
 
-  MockDate.prototype.getUTCDate = function getUTCDate() {
-    return new global.Date(this._time).getUTCDate();
-  };
+    MockDate.prototype.getUTCDate = function getUTCDate() {
+      return this._date().getUTCDate();
+    };
 
-  MockDate.prototype.toISOString = function toISOString() {
-    return new global.Date(this._time).toISOString();
-  };
+    MockDate.prototype.getUTCHours = function getUTCHours() {
+      return this._date().getUTCHours();
+    };
 
-  return MockDate;
-}
+    MockDate.prototype.getUTCMinutes = function getUTCMinutes() {
+      return this._date().getUTCMinutes();
+    };
 
-function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 1783339200000) {
-  const documentElement = new FakeNode({ name: 'documentElement' });
-  const safeConsole = makeConsoleStub();
-  const MockDate = makeMockDate(now);
-  const sandbox = {
-    location: { href: 'https://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/index.html' },
-    console: safeConsole,
-    Date: MockDate,
-    setInterval() { return 1; },
-    clearInterval() {},
-    setTimeout(fn) { return fn(); },
-    clearTimeout() {},
-    window: {
-      fgui: { GRoot: { inst: root } },
-      localStorage: storage,
-    },
-    document: {
-      createElement(tagName) {
-        return {
-          tagName: tagName.toUpperCase(),
-          style: {},
-          dataset: {},
-          textContent: '',
-          appendChild() {},
-          remove() {},
-          addEventListener() {},
-        };
+    MockDate.prototype.getUTCSeconds = function getUTCSeconds() {
+      return this._date().getUTCSeconds();
+    };
+
+    MockDate.prototype.getUTCDay = function getUTCDay() {
+      return this._date().getUTCDay();
+    };
+
+    MockDate.prototype.getTime = function getTime() {
+      return this._time;
+    };
+
+    MockDate.prototype.valueOf = function valueOf() {
+      return this._time;
+    };
+
+    MockDate.prototype.toISOString = function toISOString() {
+      return this._date().toISOString();
+    };
+
+    MockDate.prototype.toJSON = function toJSON() {
+      return this.toISOString();
+    };
+
+    MockDate.prototype.toString = function toString() {
+      return this._date().toString();
+    };
+
+    function makeElement(tagName) {
+      return {
+        tagName: String(tagName || '').toUpperCase(),
+        style: {},
+        dataset: {},
+        textContent: '',
+        appendChild(child) { return child; },
+        remove() {},
+        addEventListener() {},
+      };
+    }
+
+    const documentElement = makeElement('html');
+    documentElement.appendChild = function appendChild(node) {
+      if (node && node.tagName === 'SCRIPT') {
+        (0, eval)(node.textContent);
+      }
+      return node;
+    };
+
+    const localStorage = {
+      getItem(key) {
+        return Object.prototype.hasOwnProperty.call(storageData, key) ? storageData[key] : null;
       },
-      getElementById() {
-        return null;
+      setItem(key, value) {
+        storageData[key] = String(value);
       },
+      removeItem(key) {
+        delete storageData[key];
+      },
+      _dump() {
+        return JSON.parse(JSON.stringify(storageData));
+      },
+    };
+
+    console = {
+      log: noop,
+      info: noop,
+      warn: noop,
+      error: noop,
+      debug: noop,
+    };
+    Date = MockDate;
+    setInterval = function setIntervalMock() { return 1; };
+    clearInterval = noop;
+    setTimeout = function setTimeoutMock(fn) {
+      if (typeof fn === 'function') fn();
+      return 1;
+    };
+    clearTimeout = noop;
+    document = {
+      createElement: makeElement,
+      getElementById() { return null; },
       documentElement,
       head: documentElement,
       body: documentElement,
-    },
-  };
+    };
+    window = {
+      fgui: { GRoot: { inst: __root } },
+      localStorage,
+    };
+    window.window = window;
+    window.document = document;
+    window.location = location;
+    window.console = console;
+    window.Date = Date;
+    window.setInterval = setInterval;
+    window.clearInterval = clearInterval;
+    window.setTimeout = setTimeout;
+    window.clearTimeout = clearTimeout;
+    window.unsafeWindow = window;
+    unsafeWindow = window;
+  `, sandbox, { filename: 'mu-boss-bot-test-sandbox.js' });
 
-  sandbox.window.window = sandbox.window;
-  sandbox.window.document = sandbox.document;
-  sandbox.window.location = sandbox.location;
-  sandbox.window.console = sandbox.console;
-  sandbox.window.Date = sandbox.Date;
-  sandbox.window.setInterval = sandbox.setInterval;
-  sandbox.window.clearInterval = sandbox.clearInterval;
-  sandbox.window.setTimeout = sandbox.setTimeout;
-  sandbox.window.clearTimeout = sandbox.clearTimeout;
-  sandbox.window.unsafeWindow = sandbox.window;
-  sandbox.unsafeWindow = sandbox.window;
-  documentElement.appendChild = (node) => {
-    if (node.tagName === 'SCRIPT') {
-      vm.runInContext(node.textContent, sandbox, { filename: 'injected-mu-boss-bot.js' });
-    }
-    return node;
-  };
-
-  vm.createContext(sandbox);
   // Task 1 intentionally fails with ENOENT until Task 2 adds mu-boss-bot.user.js.
   vm.runInContext(fs.readFileSync(scriptPath, 'utf8'), sandbox, { filename: scriptPath });
-  return { api: sandbox.window.__muBossBot, storage, sandbox };
+  return { api: sandbox.window.__muBossBot, storage: sandbox.window.localStorage, sandbox };
 }
 
 function testPublicApiExists() {
