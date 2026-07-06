@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 左上按钮缩小
 // @namespace    codex.mu.ui.left-top-compact
-// @version      0.1.0
-// @description  缩小左上“升级”和“送大天使”按钮，独立于 BOSS 折叠菜单脚本。
+// @version      0.3.0
+// @description  缩小左上”升级”/”送大天使”/”限时活动”按钮到原始大小的一半(0.5)，独立于 BOSS 折叠菜单脚本。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -21,7 +21,7 @@
     const CFG = {
       debug: false,
       tickMs: 400,
-      scale: 0.7,
+      scale: 0.5,
       leftLimitX: 560,
       topLimitY: 280,
       minWidth: 28,
@@ -31,6 +31,7 @@
       targetPatterns: [
         /升级/,
         /送大天使/,
+        /LimitedTime/, // 命中 btn_LimitedTimeActivity（图标资源 url 含 img_LimitedTimeActivity_new）
       ],
     };
 
@@ -40,7 +41,7 @@
       lastLogAt: 0,
       lastSummary: '',
       status: {
-        version: '0.1.0',
+        version: '0.3.0',
         applyCount: 0,
         lastMatched: [],
         lastReason: 'waiting for fgui',
