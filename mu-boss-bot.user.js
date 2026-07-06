@@ -118,10 +118,32 @@
       return getStatus();
     }
 
+    function root() {
+      return window.fgui && window.fgui.GRoot && window.fgui.GRoot.inst;
+    }
+
     function scan() {
       state.status.scanCount += 1;
       state.status.lastScanAt = Date.now();
-      state.lastSnapshot = emptySnapshot();
+      const gRoot = root();
+      if (!gRoot) {
+        state.lastSnapshot = emptySnapshot();
+        state.lastSnapshot.reason = 'waiting for fgui';
+        return clone(state.lastSnapshot);
+      }
+      const nodes = collectNodes(gRoot);
+      state.lastSnapshot = {
+        at: Date.now(),
+        scene: scanScene(nodes),
+        player: scanPlayer(nodes),
+        bossPanel: scanBossPanel(nodes),
+        leftPanel: scanLeftPanel(nodes),
+        taskPanel: scanTaskPanel(nodes),
+        combat: scanCombat(nodes),
+        timers: { knownRespawns: scanRespawns(nodes), resetTimes: resetTimes() },
+        confidence: {},
+      };
+      state.lastSnapshot.confidence = computeConfidence(state.lastSnapshot);
       return clone(state.lastSnapshot);
     }
 
@@ -184,6 +206,187 @@
         timers: { knownRespawns: [], resetTimes: resetTimes() },
         confidence: { scene: 0, bossPanel: 0, leftPanel: 0, taskPanel: 0, combat: 0 },
       };
+    }
+
+    function collectNodes(gRoot) {
+      const nodes = [];
+      walk(gRoot, (node, depth) => {
+        const item = summarizeNode(node);
+        item.depth = depth;
+        nodes.push(item);
+      });
+      return nodes;
+    }
+
+    function walk(node, visit, depth) {
+      if (!node || depth > 16) return;
+      visit(node, depth || 0);
+      const count = Number(node.numChildren) || 0;
+      for (let index = 0; index < count; index += 1) {
+        walk(node.getChildAt(index), visit, (depth || 0) + 1);
+      }
+    }
+
+    function summarizeNode(node) {
+      const text = cleanText([node.text, node.title, node.name].filter(Boolean).join(' '));
+      const rect = getRect(node);
+      return {
+        name: cleanText(node.name),
+        text,
+        contentText: cleanText(node.text || node.title || ''),
+        visible: node.visible !== false && node.internalVisible !== false,
+        rect,
+      };
+    }
+
+    function getRect(node) {
+      try {
+        if (typeof node.localToGlobalRect === 'function') {
+          const rect = node.localToGlobalRect(0, 0, node.width || 0, node.height || 0);
+          return { x: rect.x || 0, y: rect.y || 0, w: rect.width || 0, h: rect.height || 0 };
+        }
+      } catch (error) {
+        return { x: node.x || 0, y: node.y || 0, w: node.width || 0, h: node.height || 0 };
+      }
+      return { x: node.x || 0, y: node.y || 0, w: node.width || 0, h: node.height || 0 };
+    }
+
+    function scanScene(nodes) {
+      const map = nodes
+        .filter((item) => item.visible && /^[\u4e00-\u9fa5A-Za-z0-9]+$/.test(item.contentText) && /试炼|福利|野外|平原|大陆|炼狱|秘境/.test(item.contentText))
+        .sort((a, b) => scoreMap(b) - scoreMap(a))[0];
+      const coord = nodes.find((item) => /\(?\d{1,3},\d{1,3}\)?/.test(item.contentText));
+      const auto = nodes.find((item) => /自动攻击|自动寻路|手动攻击/.test(item.contentText));
+      return {
+        mapName: map ? map.contentText : '',
+        coordinates: coord ? normalizeCoordinate(coord.contentText) : '',
+        isMoving: Boolean(auto && /自动寻路/.test(auto.contentText)),
+        autoBattleState: auto && /自动攻击/.test(auto.contentText) ? 'auto' : 'unknown',
+      };
+    }
+
+    function scoreMap(item) {
+      let score = 0;
+      if (item.rect.x >= 900 && item.rect.y <= 130) score += 100;
+      if (/试炼|福利|野外|秘境|平原/.test(item.contentText)) score += 20;
+      return score;
+    }
+
+    function scanPlayer(nodes) {
+      const level = nodes.find((item) => /\d+转\d+级|\d+级/.test(item.contentText));
+      return { name: '', levelText: level ? level.contentText : '', rebirth: null, combatPower: null, inventoryHints: {} };
+    }
+
+    function scanBossPanel(nodes) {
+      const open = nodes.some((item) => /挑战\s*BOSS|当前爆率/.test(item.text));
+      const tabs = nodes
+        .filter((item) => /野外BOSS|福利BOSS|首饰BOSS|试炼之地|苦难炼狱/.test(item.contentText))
+        .map((item) => ({ text: item.contentText, rect: item.rect }));
+      const rows = nodes
+        .filter((item) => /推荐防御|推荐攻击|特殊掉落/.test(item.text))
+        .map((item) => ({ name: extractBossName(item.text), text: item.text, rect: item.rect }))
+        .filter((row) => row.name);
+      const requirements = nodes
+        .filter((item) => /开启等级|推荐防御|推荐攻击|翅膀|套装|需要/.test(item.contentText))
+        .map((item) => ({ text: item.contentText, rect: item.rect }));
+      const enterButtons = nodes
+        .filter((item) => /前往|挑战|进入|\(\d+,\d+\)|\d+只/.test(item.contentText))
+        .map((item) => ({ text: item.contentText, rect: item.rect }));
+      return { open, selectedTab: tabs[0] ? tabs[0].text : '', tabs, rows, requirements, enterButtons };
+    }
+
+    function scanLeftPanel(nodes) {
+      const bossEntries = nodes
+        .filter((item) => /(坐标|剩余刷新时间|待击杀)/.test(item.text) && extractBossName(item.text))
+        .map((item) => {
+          const seconds = parseRefreshSeconds(item.text);
+          return {
+            name: extractBossName(item.text),
+            text: item.text,
+            coordinate: normalizeCoordinate(item.text),
+            state: /待击杀|已刷新/.test(item.text) ? 'ready' : seconds != null ? 'cooldown' : 'unknown',
+            refreshInSeconds: seconds,
+            rect: item.rect,
+          };
+        });
+      const warriorTaskEntries = nodes
+        .filter((item) => /勇士任务|BOSS悬赏|完成次数/.test(item.text))
+        .map((item) => ({ text: item.text, star: parseStar(item.text), progressText: parseProgressText(item.text), rect: item.rect }));
+      return { bossEntries, warriorTaskEntries };
+    }
+
+    function scanTaskPanel(nodes) {
+      const panelOpen = nodes.some((item) => /任务面板|BOSS悬赏|领取|提交/.test(item.text));
+      const taskItems = nodes.filter((item) => /(\d+)星.*BOSS|BOSS.*(\d+)星/.test(item.text));
+      const selectedTask = taskItems.length ? { text: taskItems[0].text, star: parseStar(taskItems[0].text), rect: taskItems[0].rect } : null;
+      const accept = nodes.find((item) => item.contentText === '领取');
+      const submit = nodes.find((item) => item.contentText === '提交');
+      return {
+        open: panelOpen,
+        selectedTask,
+        starFilters: taskItems.map((item) => ({ text: item.text, star: parseStar(item.text), rect: item.rect })),
+        acceptButton: accept ? { text: accept.contentText, rect: accept.rect } : null,
+        submitButton: submit ? { text: submit.contentText, rect: submit.rect } : null,
+      };
+    }
+
+    function scanCombat(nodes) {
+      const target = nodes.find((item) => /Lv\s*\d+/.test(item.text) && extractBossName(item.text));
+      if (!target) return { targetName: '', targetLevel: 0, hpPercent: null, ownerName: '', damageBoard: [], confidence: 0 };
+      const level = target.text.match(/Lv\s*(\d+)/i);
+      const hp = target.text.match(/(\d+)%/);
+      const owner = target.text.match(/归属[:：]?\s*([\u4e00-\u9fa5A-Za-z0-9_]+)/);
+      return {
+        targetName: extractBossName(target.text),
+        targetLevel: level ? Number(level[1]) : 0,
+        hpPercent: hp ? Number(hp[1]) : null,
+        ownerName: owner ? owner[1] : '',
+        damageBoard: [],
+        confidence: 0.8,
+      };
+    }
+
+    function scanRespawns(nodes) {
+      return nodes
+        .filter((item) => /剩余刷新时间/.test(item.text) && extractBossName(item.text))
+        .map((item) => ({ name: extractBossName(item.text), refreshInSeconds: parseRefreshSeconds(item.text), source: 'ui' }));
+    }
+
+    function computeConfidence(snapshot) {
+      return {
+        scene: snapshot.scene.mapName ? 0.8 : 0,
+        bossPanel: snapshot.bossPanel.open ? 0.8 : 0,
+        leftPanel: snapshot.leftPanel.bossEntries.length ? 0.8 : 0,
+        taskPanel: snapshot.taskPanel.open ? 0.8 : 0,
+        combat: snapshot.combat.targetName ? snapshot.combat.confidence : 0,
+      };
+    }
+
+    function extractBossName(text) {
+      const names = ['愤怒闪电巨人', '深渊咒怨魔王', '邪恶龙虾战士', '咆哮龙虾战士', '龙虾战士', '傲之煞', '闪电巨人', '火焰巨人', '幽灵巨人'];
+      return names.find((name) => cleanText(text).includes(name)) || '';
+    }
+
+    function parseRefreshSeconds(text) {
+      const value = cleanText(text);
+      const match = value.match(/剩余刷新时间(?:(\d+)时)?(?:(\d+)分)?(?:(\d+)秒)?/);
+      if (!match) return null;
+      return (Number(match[1]) || 0) * 3600 + (Number(match[2]) || 0) * 60 + (Number(match[3]) || 0);
+    }
+
+    function parseStar(text) {
+      const match = cleanText(text).match(/(\d+)星/);
+      return match ? Number(match[1]) : null;
+    }
+
+    function parseProgressText(text) {
+      const match = cleanText(text).match(/\d+\/\d+/);
+      return match ? match[0] : '';
+    }
+
+    function normalizeCoordinate(text) {
+      const match = cleanText(text).match(/(\d{1,3}),\s*(\d{1,3})/);
+      return match ? `${match[1]},${match[2]}` : '';
     }
 
     function resetTimes() {
