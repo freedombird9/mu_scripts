@@ -220,15 +220,12 @@
           entry: preWait.entry,
         };
       }
-      const wait = matches[0];
-      return {
-        ...intent('wait_spawn', 'configured boss cooldown', wait.target, 0.8),
-        entry: wait.entry,
-      };
+      return null;
     }
 
     function chooseWarriorTask(snapshot, config) {
       if (!config.warriorTask.enabled) return null;
+      if (warriorTaskDailyLimitReached(config.warriorTask)) return null;
       const entries = snapshot.leftPanel && snapshot.leftPanel.warriorTaskEntries ? snapshot.leftPanel.warriorTaskEntries : [];
       const task = entries.find((entry) => entry.star === config.warriorTask.requiredStar);
       if (!task) return null;
@@ -240,11 +237,15 @@
 
     function chooseAutoCandidate(snapshot) {
       const rows = snapshot.bossPanel && snapshot.bossPanel.rows ? snapshot.bossPanel.rows : [];
-      if (!rows.length) return null;
+      const enterButtons = snapshot.bossPanel && snapshot.bossPanel.enterButtons ? snapshot.bossPanel.enterButtons : [];
+      const confidence = snapshot.confidence && Number(snapshot.confidence.bossPanel);
+      if (!snapshot.bossPanel || snapshot.bossPanel.open !== true || confidence < 0.5 || !rows[0] || !enterButtons[0]) return null;
       const row = rows[0];
+      const enterButton = enterButtons.find((button) => /前往|挑战|进入|\d+只/.test(button.text)) || enterButtons[0];
       return {
-        ...intent('auto_candidate', 'configured targets unavailable, panel candidate found', { type: snapshot.bossPanel.selectedTab || '', name: row.name }, 0.6),
+        ...intent('auto_candidate', 'panel candidate with enter evidence', { type: snapshot.bossPanel.selectedTab || '', name: row.name }, 0.6),
         row,
+        enterButton,
       };
     }
 
@@ -317,6 +318,9 @@
       const payload = clone(event || {});
       if (payload.type === 'boss_killed' && payload.target) {
         recordDailyKill(payload.target);
+      }
+      if (payload.type === 'warrior_task_submitted') {
+        recordWarriorTaskSubmitted();
       }
       appendLog('manual_result', { event: payload });
       return exportLogs();
@@ -419,6 +423,7 @@
         .map((item) => ({ text: item.contentText, rect: item.rect }));
       const enterButtons = nodes
         .filter((item) => /前往|挑战|进入|\(\d+,\d+\)|\d+只/.test(item.contentText))
+        .filter((item) => !/挑战\s*BOSS|当前爆率/.test(item.text))
         .map((item) => ({ text: item.contentText, rect: item.rect }));
       return { open, selectedTab: tabs[0] ? tabs[0].text : '', tabs, rows, requirements, enterButtons };
     }
@@ -528,6 +533,8 @@
     function normalizeConfig(input) {
       const base = defaultConfig();
       const cfg = deepMerge(base, input && typeof input === 'object' ? input : {});
+      if (!cfg.defaults || typeof cfg.defaults !== 'object' || Array.isArray(cfg.defaults)) cfg.defaults = clone(base.defaults);
+      if (!cfg.warriorTask || typeof cfg.warriorTask !== 'object' || Array.isArray(cfg.warriorTask)) cfg.warriorTask = clone(base.warriorTask);
       cfg.enabled = Boolean(cfg.enabled);
       cfg.dryRun = cfg.dryRun !== false;
       cfg.timezone = 'Asia/Shanghai';
@@ -623,6 +630,12 @@
       writeJson(DAILY_KEY, state.daily);
     }
 
+    function recordWarriorTaskSubmitted() {
+      ensureDailyState();
+      state.daily.counts.warriorTask = (Number(state.daily.counts.warriorTask) || 0) + 1;
+      writeJson(DAILY_KEY, state.daily);
+    }
+
     function targetKey(target) {
       return `${cleanText(target.type) || '未分类'}::${cleanText(target.name)}`;
     }
@@ -631,6 +644,12 @@
       ensureDailyState();
       const count = Number(state.daily.counts[targetKey(target)]) || 0;
       return target.dailyLimit >= 0 && count >= target.dailyLimit;
+    }
+
+    function warriorTaskDailyLimitReached(warriorTask) {
+      ensureDailyState();
+      const count = Number(state.daily.counts.warriorTask) || 0;
+      return warriorTask.dailyLimit >= 0 && count >= warriorTask.dailyLimit;
     }
 
     function readJson(key, fallback) {

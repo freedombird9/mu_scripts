@@ -382,6 +382,18 @@ function testConfigNormalizationAndLogs() {
   assert.strictEqual(api.clearLogs().length, 0);
 }
 
+function testMalformedConfigPatchesUseDefaults() {
+  const { api } = loadUserscript();
+  let config = api.setConfig({ defaults: null, warriorTask: null });
+  assert.strictEqual(config.defaults.preWaitSeconds, 90);
+  assert.strictEqual(config.warriorTask.dailyLimit, 4);
+
+  config = api.setConfig({ defaults: 'bad', warriorTask: 'bad' });
+  assert.strictEqual(config.defaults.preWaitSeconds, 90);
+  assert.strictEqual(config.warriorTask.dailyLimit, 4);
+  assert.strictEqual(config.warriorTask.requiredStar, 3);
+}
+
 function testPauseResumeAndManualResult() {
   const { api } = loadUserscript();
   api.pause('user playing');
@@ -457,6 +469,21 @@ function testPlannerPreWaitsConfiguredCooldownBoss() {
   assert.strictEqual(plan.intent.reason, 'within pre-wait window');
 }
 
+function testPlannerAllowsWarriorTaskDuringLongBossCooldown() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [
+      { type: '试炼之地', name: '咆哮龙虾战士', priority: 90, dailyLimit: 3, preWaitSeconds: 60 },
+    ],
+  });
+  const snapshot = api.scan();
+  const plan = api.plan(snapshot);
+  assert.strictEqual(plan.intent.type, 'warrior_task');
+  assert.strictEqual(plan.intent.reason, 'three-star warrior boss task available');
+  assert.strictEqual(plan.intent.task.star, 3);
+}
+
 function testPlannerDoesNotFarmWithoutConfiguredSpot() {
   const { api } = loadUserscript(buildEmptyRoot());
   api.setConfig({ enabled: true, targets: [], fallbackFarmSpots: [{ name: 'empty', map: '', coordinate: '' }] });
@@ -471,6 +498,50 @@ function testPlannerUsesValidFarmFallback() {
   const plan = api.plan(api.scan());
   assert.strictEqual(plan.intent.type, 'farm_fallback');
   assert.strictEqual(plan.intent.farmSpot.name, 'farm');
+}
+
+function testWarriorTaskDailyLimitBlocksPlanning() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [],
+    warriorTask: { dailyLimit: 1 },
+  });
+  api.markManualResult({ type: 'warrior_task_submitted' });
+  const status = api.getStatus();
+  assert.strictEqual(status.daily.counts.warriorTask, 1);
+
+  const plan = api.plan(api.scan());
+  assert.notStrictEqual(plan.intent.type, 'warrior_task');
+}
+
+function testAutoCandidateRequiresEnterEvidence() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [],
+    fallbackFarmSpots: [{ name: 'farm', map: '四风平原', coordinate: '100,120', priority: 1 }],
+    warriorTask: { enabled: false },
+  });
+  const snapshot = api.scan();
+  snapshot.bossPanel.enterButtons = [];
+  const plan = api.plan(snapshot);
+  assert.strictEqual(plan.intent.type, 'farm_fallback');
+  assert.strictEqual(plan.intent.farmSpot.name, 'farm');
+}
+
+function testAutoCandidateIncludesEnterEvidence() {
+  const { api } = loadUserscript(buildSensorScene());
+  api.setConfig({
+    enabled: true,
+    targets: [],
+    warriorTask: { enabled: false },
+  });
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'auto_candidate');
+  assert.strictEqual(plan.intent.reason, 'panel candidate with enter evidence');
+  assert.strictEqual(plan.intent.row.name, '邪恶龙虾战士');
+  assert(plan.intent.enterButton.text.includes('试炼之地1'));
 }
 
 function testDailyKeysUseUtc8() {
@@ -529,12 +600,17 @@ function testPausedTickDoesNotPlanGameplayIntent() {
 function run() {
   testPublicApiExists();
   testConfigNormalizationAndLogs();
+  testMalformedConfigPatchesUseDefaults();
   testPauseResumeAndManualResult();
   testSensorSnapshotFromUi();
   testPlannerChoosesConfiguredReadyBoss();
   testPlannerPreWaitsConfiguredCooldownBoss();
+  testPlannerAllowsWarriorTaskDuringLongBossCooldown();
   testPlannerDoesNotFarmWithoutConfiguredSpot();
   testPlannerUsesValidFarmFallback();
+  testWarriorTaskDailyLimitBlocksPlanning();
+  testAutoCandidateRequiresEnterEvidence();
+  testAutoCandidateIncludesEnterEvidence();
   testDailyKeysUseUtc8();
   testManualResultRecordsKillCount();
   testTickLogsIntentWithoutExecutingActions();
