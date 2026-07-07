@@ -17,6 +17,10 @@ class FakeNode {
     w = 80,
     h = 30,
     visible = true,
+    internalVisible = true,
+    enabled = true,
+    touchable = true,
+    grayed,
   } = {}) {
     this.name = name;
     this.text = text;
@@ -28,7 +32,10 @@ class FakeNode {
     this.width = w;
     this.height = h;
     this.visible = visible;
-    this.internalVisible = true;
+    this.internalVisible = internalVisible;
+    this.enabled = enabled;
+    this.touchable = touchable;
+    if (grayed !== undefined) this.grayed = grayed;
     this.children = [];
     this.parent = null;
   }
@@ -86,6 +93,244 @@ function buildSensorScene() {
   return root;
 }
 
+function buildInstanceBossWndScene() {
+  const root = buildEmptyRoot();
+  root.add(new FakeNode({ name: 'mapName', text: '四风平原', x: 1040, y: 64, w: 160, h: 30 }));
+
+  const panel = root.add(new FakeNode({
+    packageItem: { name: 'InstanceBossWnd', id: 'qt7v0', owner: 'InstanceBossWnd' },
+    x: 133,
+    y: 95,
+    w: 1039,
+    h: 560,
+  }));
+
+  panel.add(new FakeNode({ name: 'tabWild', text: '野外BOSS', x: 165, y: 155, w: 133, h: 35 }));
+  panel.add(new FakeNode({ name: 'tabWildShadow', text: '野外BOSS', x: 165, y: 159, w: 133, h: 35 }));
+  panel.add(new FakeNode({ name: 'tabWelfare', text: '福利BOSS', x: 300, y: 155, w: 133, h: 35 }));
+
+  const scroll = panel.add(new FakeNode({ name: 'wildlevelScroll', x: 163, y: 190, w: 266, h: 420 }));
+  const row = scroll.add(new FakeNode({
+    packageItem: { name: 'BtnBoss', id: 'w4lfq9', owner: '_UIComponent' },
+    x: 163,
+    y: 480,
+    w: 266,
+    h: 77,
+  }));
+  row.add(new FakeNode({ name: 'lab_name', text: '愤怒傲之煞', x: 244, y: 489, w: 88, h: 16 }));
+  row.add(new FakeNode({
+    name: 'lab_level',
+    text: '推荐防御：[color=#1Add1F]33366[/color]推荐攻击：[color=#1Add1F]11637[/color]',
+    x: 244,
+    y: 510,
+    w: 167,
+    h: 44,
+  }));
+
+  const locked = scroll.add(new FakeNode({
+    packageItem: { name: 'BtnBoss', id: 'w4lfq9', owner: '_UIComponent' },
+    x: 163,
+    y: 634,
+    w: 266,
+    h: 77,
+  }));
+  locked.add(new FakeNode({ name: 'lab_name', text: '地狱骑士', x: 244, y: 643, w: 72, h: 16 }));
+  locked.add(new FakeNode({ name: 'lab_level', text: '开启等级:[color=#FF2323]4转[/color]', x: 244, y: 674, w: 167, h: 44 }));
+
+  const mapButton = panel.add(new FakeNode({
+    packageItem: { name: 'BtnBossMore', id: 'qt7vq5', owner: '_UIComponent' },
+    x: 455,
+    y: 530,
+    w: 212,
+    h: 40,
+  }));
+  mapButton.add(new FakeNode({ name: 'lab_mapName', text: '[color=#DCE1E5]四风平原 [1线][/color]', x: 464, y: 544, w: 104, h: 15 }));
+  mapButton.add(new FakeNode({ name: 'lab_bossCount', text: '[color=#1Add1F]1只[/color]', x: 578, y: 544, w: 82, h: 26 }));
+
+  const hiddenPanel = panel.add(new FakeNode({ name: 'KunDunBossPanel', x: 0, y: 0, w: 320, h: 500 }));
+  const placeholder = hiddenPanel.add(new FakeNode({
+    packageItem: { name: 'BtnBoss', id: 'w4lfq9', owner: '_UIComponent' },
+    x: 30,
+    y: 103,
+    w: 266,
+    h: 77,
+  }));
+  placeholder.add(new FakeNode({ name: 'lab_name', text: '冰后', x: 80, y: 112, w: 40, h: 16 }));
+
+  root.add(new FakeNode({ name: 'unrelatedTask', text: '前往下层', x: 106, y: 114, w: 170, h: 40 }));
+  return root;
+}
+
+function buildConfiguredBossPanelScene({
+  tab = '野外BOSS',
+  bossName = '傲之煞',
+  detail = '推荐防御：27529推荐攻击：11637',
+  rows = null,
+  hiddenKunDunEntrance = false,
+  mapButtons = ['幻术秘境3 (126,118) 0只', '会员秘境4 (126,118) 1只', '四风平原 [1线] 1只'],
+} = {}) {
+  const root = buildEmptyRoot();
+  const panel = root.add(new FakeNode({
+    packageItem: { name: 'InstanceBossWnd', id: 'qt7v0', owner: 'InstanceBossWnd' },
+    x: 133,
+    y: 95,
+    w: 1039,
+    h: 560,
+  }));
+  panel.add(new FakeNode({ name: 'tab', text: tab, x: 165, y: 155, w: 133, h: 35 }));
+
+  const scroll = panel.add(new FakeNode({ name: 'wildlevelScroll', x: 163, y: 190, w: 266, h: 420 }));
+  (rows || [{ name: bossName, detail }]).forEach((item, index) => {
+    const y = 403 + index * 77;
+    const row = scroll.add(new FakeNode({
+      packageItem: { name: 'BtnBoss', id: 'w4lfq9', owner: '_UIComponent' },
+      x: 163,
+      y,
+      w: 266,
+      h: 77,
+    }));
+    row.add(new FakeNode({ name: 'lab_name', text: item.name, x: 244, y: y + 9, w: 88, h: 16 }));
+    row.add(new FakeNode({ name: 'lab_level', text: item.detail || detail, x: 244, y: y + 30, w: 167, h: 44 }));
+  });
+
+  mapButtons.forEach((text, index) => {
+    const x = 455 + (index % 3) * 222;
+    const y = 530 + Math.floor(index / 3) * 50;
+    const button = panel.add(new FakeNode({
+      packageItem: { name: 'BtnBossMore', id: 'qt7vq5', owner: '_UIComponent' },
+      x,
+      y,
+      w: 212,
+      h: 40,
+    }));
+    button.add(new FakeNode({ name: 'lab_mapName', text, x: x + 9, y: y + 14, w: 180, h: 15 }));
+  });
+
+  if (hiddenKunDunEntrance) {
+    const hiddenPanel = panel.add(new FakeNode({
+      name: 'KunDunBossPanel',
+      packageItem: { name: 'KunDunBossPanel', id: 'qt7vk0', owner: 'InstanceBossWnd' },
+      x: 30,
+      y: 60,
+      w: 1006,
+      h: 490,
+      internalVisible: false,
+    }));
+    const mapList = hiddenPanel.add(new FakeNode({ name: 'KunDun_mapName', x: 322, y: 435, w: 226, h: 48 }));
+    const button = mapList.add(new FakeNode({
+      packageItem: { name: 'BtnBossMore', id: 'qt7vq5', owner: '_UIComponent' },
+      x: 322,
+      y: 435,
+      w: 212,
+      h: 40,
+    }));
+    button.add(new FakeNode({ name: 'lab_mapName', text: '秘境14层 (23,232)', x: 331, y: 449, w: 130, h: 15 }));
+    button.add(new FakeNode({ name: 'lab_bossCount', text: '20只', x: 470, y: 449, w: 50, h: 15 }));
+  }
+  return root;
+}
+
+function buildWarriorTaskScene(firstState = 'available') {
+  const root = buildEmptyRoot();
+  const panel = root.add(new FakeNode({
+    name: 'Task_TaskStart',
+    packageItem: { name: 'StarTaskWnd', id: 'chtd2', owner: 'StarTaskWnd' },
+    x: 119,
+    y: 89,
+    w: 1067,
+    h: 573,
+  }));
+
+  panel.add(new FakeNode({ name: 'title', text: '勇士任务', x: 412, y: 102, w: 482, h: 49 }));
+  const taskList = panel.add(new FakeNode({ name: 'taskList', x: 155, y: 167, w: 746, h: 376 }));
+
+  addWarriorCard(taskList, {
+    index: 0,
+    name: '傲之煞',
+    map: '四风平原',
+    progress: firstState === 'reward_ready' ? '1/1' : '0/1',
+    star: 3,
+    state: firstState,
+    x: 155,
+  });
+  addWarriorCard(taskList, {
+    index: 1,
+    name: '狂暴火焰巨人',
+    map: '安宁池',
+    progress: '0/1',
+    star: 2,
+    state: 'available',
+    x: 408,
+  });
+  addWarriorCard(taskList, {
+    index: 2,
+    name: '愤怒火焰巨人',
+    map: '安宁池',
+    progress: '0/1',
+    star: 1,
+    state: 'available',
+    x: 661,
+  });
+
+  panel.add(new FakeNode({ name: 'n5', text: '完成次数：', x: 490, y: 545, w: 90, h: 18 }));
+  panel.add(new FakeNode({ name: 'textFinishTime', text: '2/4', x: 580, y: 545, w: 33, h: 18 }));
+  panel.add(new FakeNode({ name: 'n6', text: '消耗：', x: 643, y: 544, w: 54, h: 18 }));
+  panel.add(new FakeNode({ name: 'textTaskCost', text: '6379613/200', x: 763, y: 545, w: 113, h: 18 }));
+  panel.add(new FakeNode({ name: 'btnRefresh', text: '一键刷新', x: 565, y: 582, w: 191, h: 47 }));
+  panel.add(new FakeNode({ name: 'n4', text: '最高可接取三星难度任务', x: 586, y: 635, w: 132, h: 12 }));
+  return root;
+}
+
+function addWarriorCard(parent, { index, name, map, progress, star, state, x }) {
+  const card = parent.add(new FakeNode({
+    packageItem: { name: 'taskItem', id: 'w6ae6', owner: 'StarTaskWnd' },
+    x,
+    y: 167,
+    w: 240,
+    h: 376,
+  }));
+  card.add(new FakeNode({ name: `bg${star}`, packageItem: { name: `bg${star}`, id: `bg${star}`, owner: 'StarTaskWnd' }, x, y: 167, w: 240, h: 368 }));
+  const listStar = card.add(new FakeNode({ name: 'listStar', x: x + 73, y: 187, w: 96, h: 29 }));
+  for (let i = 0; i < star; i += 1) {
+    listStar.add(new FakeNode({ packageItem: { name: 'ico_auctionStar_bright', id: 'fihopi', owner: '_UIComponent' }, x: x + 74 + i * 31, y: 187, w: 31, h: 29 }));
+  }
+  card.add(new FakeNode({ name: 'textName', text: name, x: x - 1, y: 360, w: 150, h: 26 }));
+  card.add(new FakeNode({ name: 'textMapName', text: `所在地图：${map}`, x: x + 42, y: 385, w: 144, h: 16 }));
+  card.add(new FakeNode({ name: 'textTaskTarget', text: progress, x: x + 125, y: 406, w: 107, h: 24 }));
+  card.add(new FakeNode({
+    name: 'btnQuit',
+    text: '放弃',
+    packageItem: { name: 'btnShort2', id: 'hxnani', owner: '_UIComponent' },
+    x: state === 'accepted' ? x + 22 : 22,
+    y: state === 'accepted' ? 493 : 326,
+    w: 93,
+    h: 31,
+    internalVisible: state === 'accepted',
+  }));
+  card.add(new FakeNode({
+    name: 'btnAccept',
+    text: state === 'reward_ready' ? '领取奖励' : '领取任务',
+    packageItem: { name: 'btnShort3', id: 'qhb62d', owner: '_UIComponent' },
+    x: x + 63,
+    y: 487,
+    w: 113,
+    h: 40,
+    internalVisible: state !== 'accepted',
+    grayed: false,
+  }));
+  card.add(new FakeNode({
+    name: 'btnGo',
+    text: '前往',
+    packageItem: { name: 'btnShort2', id: 'hxnani', owner: '_UIComponent' },
+    x: state === 'accepted' ? x + 129 : 129,
+    y: state === 'accepted' ? 493 : 326,
+    w: 93,
+    h: 31,
+    internalVisible: state === 'accepted',
+  }));
+  return card;
+}
+
 function makeStorage(seed = {}) {
   return {
     data: { ...seed },
@@ -114,6 +359,9 @@ function serializeNode(node) {
     height: node.height,
     visible: node.visible,
     internalVisible: node.internalVisible,
+    enabled: node.enabled,
+    touchable: node.touchable,
+    grayed: node.grayed,
     children: node.children.map(serializeNode),
   };
 }
@@ -242,6 +490,9 @@ function loadUserscript(root = buildEmptyRoot(), storage = makeStorage(), now = 
         height: data.height || 0,
         visible: data.visible !== false,
         internalVisible: data.internalVisible !== false,
+        enabled: data.enabled !== false,
+        touchable: data.touchable !== false,
+        grayed: data.grayed,
         parent: parent || null,
         children: [],
         getChildAt(index) {
@@ -438,6 +689,166 @@ function testSensorSnapshotFromUi() {
   assert(snapshot.confidence.bossPanel > 0.5);
 }
 
+function testBossPanelScansInstanceBossWndRows() {
+  const { api } = loadUserscript(buildInstanceBossWndScene());
+  const snapshot = api.scan();
+
+  assert.strictEqual(snapshot.bossPanel.open, true);
+  assert(snapshot.bossPanel.tabs.some((tab) => tab.text === '野外BOSS'));
+  assert.strictEqual(snapshot.bossPanel.tabs.filter((tab) => tab.text === '野外BOSS').length, 1);
+  assert(snapshot.bossPanel.rows.some((row) => row.name === '愤怒傲之煞' && /33366/.test(row.text)));
+  assert(snapshot.bossPanel.rows.some((row) => row.name === '地狱骑士' && /4转/.test(row.text)));
+  assert(!snapshot.bossPanel.rows.some((row) => row.name === '冰后'));
+  assert(snapshot.bossPanel.enterButtons.some((button) => button.text.includes('四风平原') && button.text.includes('1只')));
+  assert(!snapshot.bossPanel.rows.some((row) => row.text.includes('[color=')));
+  assert(!snapshot.bossPanel.enterButtons.some((button) => button.text.includes('[color=')));
+  assert(!snapshot.bossPanel.enterButtons.some((button) => button.text.includes('前往下层')));
+  assert(snapshot.confidence.bossPanel > 0.5);
+}
+
+function testBossPanelParsesEntranceAvailability() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene());
+  const panel = api.scan().bossPanel;
+
+  assert.strictEqual(panel.enterButtons[0].map, '幻术秘境3');
+  assert.strictEqual(panel.enterButtons[0].coordinate, '126,118');
+  assert.strictEqual(panel.enterButtons[0].count, 0);
+  assert.strictEqual(panel.enterButtons[0].blockedReason, '');
+
+  assert.strictEqual(panel.enterButtons[1].map, '会员秘境4');
+  assert.strictEqual(panel.enterButtons[1].count, 1);
+  assert(panel.enterButtons[1].blockedReason.includes('会员秘境'));
+
+  assert.strictEqual(panel.enterButtons[2].map, '四风平原 [1线]');
+  assert.strictEqual(panel.enterButtons[2].count, 1);
+  assert.strictEqual(panel.enterButtons[2].blockedReason, '');
+}
+
+function testBossPanelIgnoresHiddenAncestorEntrances() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene({
+    hiddenKunDunEntrance: true,
+    mapButtons: ['幻术秘境3 (126,118) 1只'],
+  }));
+  const panel = api.scan().bossPanel;
+
+  assert(panel.enterButtons.some((button) => button.map === '幻术秘境3'));
+  assert(!panel.enterButtons.some((button) => button.map === '秘境14层'));
+}
+
+function testPlannerUsesConfiguredBossEligibleEntrance() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene());
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '野外BOSS', name: '傲之煞', priority: 100, dailyLimit: 3 }],
+    warriorTask: { enabled: false },
+  });
+
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'prepare_boss');
+  assert.strictEqual(plan.intent.reason, 'configured boss panel candidate');
+  assert.strictEqual(plan.intent.row.name, '傲之煞');
+  assert.strictEqual(plan.intent.enterButton.map, '四风平原 [1线]');
+  assert.strictEqual(plan.intent.enterButton.count, 1);
+}
+
+function testPlannerDoesNotMatchDecoratedBossNameByDefault() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene({
+    bossName: '愤怒闪电巨人',
+    mapButtons: ['幻术秘境3 (126,118) 1只'],
+  }));
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '野外BOSS', name: '闪电巨人', priority: 100, dailyLimit: 3 }],
+    warriorTask: { enabled: false },
+    fallbackFarmSpots: [],
+  });
+
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'pause');
+  assert.strictEqual(plan.intent.reason, 'no actionable target and no valid farm spot');
+}
+
+function testPlannerAllowsConfiguredContainsNameMatch() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene({
+    bossName: '愤怒闪电巨人',
+    mapButtons: ['幻术秘境3 (126,118) 1只'],
+  }));
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '野外BOSS', name: '闪电巨人', matchMode: 'contains', priority: 100, dailyLimit: 3 }],
+    warriorTask: { enabled: false },
+  });
+
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'prepare_boss');
+  assert.strictEqual(plan.intent.row.name, '愤怒闪电巨人');
+}
+
+function testPlannerBlocksConfiguredBossWithoutEligibleEntrance() {
+  const { api } = loadUserscript(buildConfiguredBossPanelScene({
+    bossName: '闪电巨人',
+    mapButtons: ['会员秘境4 (126,118) 1只', '会员9层 [1线] 3只', '幻术秘境3 (126,118) 0只'],
+  }));
+  api.setConfig({
+    enabled: true,
+    targets: [{ type: '野外BOSS', name: '闪电巨人', priority: 100, dailyLimit: 3 }],
+    warriorTask: { enabled: false },
+  });
+
+  const plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'configured_boss_blocked');
+  assert.strictEqual(plan.intent.reason, 'configured boss has no eligible entrance');
+  assert.strictEqual(plan.intent.row.name, '闪电巨人');
+  assert(plan.intent.blockedEntrances.some((entry) => entry.blockedReason.includes('会员秘境')));
+  assert(plan.intent.blockedEntrances.some((entry) => entry.blockedReason.includes('会员\\d+层')));
+}
+
+function testWarriorTaskPanelScansAvailableAcceptedAndRewardStates() {
+  let snapshot = loadUserscript(buildWarriorTaskScene('available')).api.scan();
+  assert.strictEqual(snapshot.warriorTaskPanel.open, true);
+  assert.strictEqual(snapshot.warriorTaskPanel.completed, 2);
+  assert.strictEqual(snapshot.warriorTaskPanel.limit, 4);
+  assert.strictEqual(snapshot.warriorTaskPanel.maxStar, 3);
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].name, '傲之煞');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].map, '四风平原');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].progressText, '0/1');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].star, 3);
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].state, 'available');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].buttons.accept.text, '领取任务');
+
+  snapshot = loadUserscript(buildWarriorTaskScene('accepted')).api.scan();
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].state, 'accepted');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].buttons.go.text, '前往');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].buttons.abandon.text, '放弃');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[1].state, 'available');
+
+  snapshot = loadUserscript(buildWarriorTaskScene('reward_ready')).api.scan();
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].state, 'reward_ready');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].progressText, '1/1');
+  assert.strictEqual(snapshot.warriorTaskPanel.cards[0].buttons.reward.text, '领取奖励');
+}
+
+function testPlannerUsesWarriorTaskPanelPriority() {
+  let { api } = loadUserscript(buildWarriorTaskScene('reward_ready'));
+  api.setConfig({ enabled: true, targets: [], warriorTask: { requiredStar: 3 } });
+  let plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'warrior_task_claim_reward');
+  assert.strictEqual(plan.intent.task.name, '傲之煞');
+
+  ({ api } = loadUserscript(buildWarriorTaskScene('accepted')));
+  api.setConfig({ enabled: true, targets: [], warriorTask: { requiredStar: 3 } });
+  plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'warrior_task_go');
+  assert.strictEqual(plan.intent.task.name, '傲之煞');
+
+  ({ api } = loadUserscript(buildWarriorTaskScene('available')));
+  api.setConfig({ enabled: true, targets: [], warriorTask: { requiredStar: 3 } });
+  plan = api.plan(api.scan());
+  assert.strictEqual(plan.intent.type, 'warrior_task_accept');
+  assert.strictEqual(plan.intent.task.name, '傲之煞');
+  assert.strictEqual(plan.intent.task.star, 3);
+}
+
 function testPlannerChoosesConfiguredReadyBoss() {
   const { api } = loadUserscript(buildSensorScene());
   api.setConfig({
@@ -623,6 +1034,15 @@ function run() {
   testMalformedConfigPatchesUseDefaults();
   testPauseResumeAndManualResult();
   testSensorSnapshotFromUi();
+  testBossPanelScansInstanceBossWndRows();
+  testBossPanelParsesEntranceAvailability();
+  testBossPanelIgnoresHiddenAncestorEntrances();
+  testPlannerUsesConfiguredBossEligibleEntrance();
+  testPlannerDoesNotMatchDecoratedBossNameByDefault();
+  testPlannerAllowsConfiguredContainsNameMatch();
+  testPlannerBlocksConfiguredBossWithoutEligibleEntrance();
+  testWarriorTaskPanelScansAvailableAcceptedAndRewardStates();
+  testPlannerUsesWarriorTaskPanelPriority();
   testPlannerChoosesConfiguredReadyBoss();
   testPlannerPreWaitsConfiguredCooldownBoss();
   testPlannerAllowsWarriorTaskDuringLongBossCooldown();

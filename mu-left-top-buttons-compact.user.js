@@ -285,24 +285,23 @@
     function compactTipsView(node) {
       if (!node) return;
       const target = CFG.tipsView.scale;
-      // 已是目标 scale 则跳过（避免重复补偿 x/y 导致漂移）
-      if (Math.abs(Number(node.scaleX) - target) < 0.001 && Math.abs(Number(node.scaleY) - target) < 0.001) return;
-
-      const before = getRect(node);
-      if (!before) return;
-      const anchorBR = { x: before.x + before.w, y: before.y + before.h };
-
-      try { node.scaleX = target; } catch (_) {}
-      try { node.scaleY = target; } catch (_) {}
-
-      const after = getRect(node);
-      if (!after) return;
-      const newBR = { x: after.x + after.w, y: after.y + after.h };
-      // 补偿 x/y 让右下角保持不变
+      // 把 pivot 设到右下角(不改 x/y 语义:pivotAsAnchor=false),
+      // 缩放即以右下角为中心 → 右下角恒定贴着游戏给出的自然位置。
+      // 游戏 resize 后会重写 x/y(仍是缩放前的左上角),右下角自动跟随,
+      // 无需任何 x/y 补偿,天然幂等(每 tick 重复执行不漂移)。
       try {
-        node.x = node.x + (anchorBR.x - newBR.x);
-        node.y = node.y + (anchorBR.y - newBR.y);
+        if (typeof node.setPivot === 'function') {
+          if (!(Number(node.pivotX) === 1 && Number(node.pivotY) === 1)) {
+            node.setPivot(1, 1, false);
+          }
+        } else {
+          node.pivotX = 1;
+          node.pivotY = 1;
+        }
       } catch (_) {}
+
+      try { if (Math.abs(Number(node.scaleX) - target) > 0.001) node.scaleX = target; } catch (_) {}
+      try { if (Math.abs(Number(node.scaleY) - target) > 0.001) node.scaleY = target; } catch (_) {}
     }
 
     function throttledLog(label, data) {
