@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.1.9
+// @version      0.1.10
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -18,7 +18,7 @@
   const injected = function () {
     'use strict';
 
-    const VERSION = '0.1.9';
+    const VERSION = '0.1.10';
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
@@ -62,6 +62,7 @@
       scanCount: 0,
       lastDetected: [],
       recentBossName: null,
+      dismissedRecords: {},
     };
 
     window.__muBossRespawnOverlay = {
@@ -99,6 +100,9 @@
       },
       renameRecord(id, name) {
         return renameRecordById(id, name);
+      },
+      removeRecord(id) {
+        return removeRecordById(id);
       },
       toggle() {
         state.collapsed = !state.collapsed;
@@ -326,7 +330,7 @@
       if (bossName === '未知BOSS' && !configuredCandidates().length) return null;
       const confidence = scoreRecordConfidence(candidate, context);
       if (confidence < 0.45) return null;
-      return {
+      const record = {
         id: recordKey({
           bossName,
           mapName: context.mapName,
@@ -345,6 +349,8 @@
         sourcePath: candidate.sourcePath,
         confidence,
       };
+      if (isDismissedRecord(record)) return null;
+      return record;
     }
 
     function scoreRecordConfidence(candidate, context) {
@@ -540,6 +546,47 @@
       return clone(state.records.find((record) => record.refreshAt === previous.refreshAt && record.bossName === targetName) || state.records[index] || null);
     }
 
+    function removeRecordById(id) {
+      const key = cleanText(id);
+      if (!key) return false;
+      const record = state.records.find((item) => cleanText(item.id) === key);
+      if (record) markRecordDismissed(record);
+      const before = state.records.length;
+      state.records = state.records.filter((record) => cleanText(record.id) !== key);
+      if (state.records.length === before) return false;
+      persistRecords();
+      renderOverlay();
+      return true;
+    }
+
+    function markRecordDismissed(record) {
+      if (!record) return;
+      const refreshAt = Number(record.refreshAt) || Date.now();
+      const expiresAt = refreshAt + EXPIRED_KEEP_MS;
+      [
+        cleanText(record.id),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt: refreshAt - MERGE_REFRESH_WINDOW_MS }),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt }),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt: refreshAt + MERGE_REFRESH_WINDOW_MS }),
+      ].forEach((key) => {
+        if (key) state.dismissedRecords[key] = expiresAt;
+      });
+      pruneDismissedRecords();
+    }
+
+    function isDismissedRecord(record) {
+      pruneDismissedRecords();
+      const key = cleanText(record && record.id);
+      return Boolean(key && Number(state.dismissedRecords[key]) > Date.now());
+    }
+
+    function pruneDismissedRecords() {
+      const now = Date.now();
+      Object.keys(state.dismissedRecords).forEach((key) => {
+        if (Number(state.dismissedRecords[key]) <= now) delete state.dismissedRecords[key];
+      });
+    }
+
     function normalizeCandidateName(name) {
       const value = cleanText(name);
       if (!isConfiguredCandidate(value)) return '';
@@ -660,7 +707,7 @@
       status.style.textOverflow = 'ellipsis';
 
       const body = doc.createElement('div');
-      body.style.padding = '5px 6px';
+      body.style.padding = '4px 5px';
       body.style.maxHeight = '280px';
       body.style.overflow = 'hidden auto';
 
@@ -818,11 +865,19 @@
       const expired = remaining < 0;
       const soon = remaining >= 0 && remaining <= HIGHLIGHT_SECONDS;
 
-      row.style.padding = '5px 6px';
-      row.style.margin = '0 0 5px';
+      row.style.position = 'relative';
+      row.style.padding = '4px 26px 4px 6px';
+      row.style.margin = '0 0 4px';
       row.style.border = soon ? '1px solid rgba(255,226,82,0.85)' : '1px solid rgba(255,255,255,0.12)';
       row.style.background = soon ? 'rgba(164,84,0,0.58)' : 'rgba(255,255,255,0.06)';
       row.style.borderRadius = '4px';
+
+      const head = doc.createElement('div');
+      head.style.display = 'flex';
+      head.style.alignItems = 'center';
+      head.style.justifyContent = 'space-between';
+      head.style.gap = '6px';
+      head.style.minWidth = '0';
 
       const title = doc.createElement('div');
       title.textContent = record.bossName || '未知BOSS';
@@ -831,6 +886,8 @@
       title.style.whiteSpace = 'nowrap';
       title.style.overflow = 'hidden';
       title.style.textOverflow = 'ellipsis';
+      title.style.minWidth = '0';
+      title.style.flex = '1 1 auto';
 
       const place = doc.createElement('div');
       place.textContent = record.mapName || '未知地图';
@@ -838,6 +895,31 @@
       place.style.whiteSpace = 'nowrap';
       place.style.overflow = 'hidden';
       place.style.textOverflow = 'ellipsis';
+      place.style.maxWidth = '42%';
+      place.style.flex = '0 1 auto';
+      place.style.textAlign = 'right';
+
+      const close = doc.createElement('button');
+      close.type = 'button';
+      close.textContent = '×';
+      close.title = '删除该BOSS追踪';
+      close.style.position = 'absolute';
+      close.style.top = '3px';
+      close.style.right = '4px';
+      close.style.width = '18px';
+      close.style.height = '18px';
+      close.style.padding = '0';
+      close.style.border = '1px solid rgba(255,255,255,0.22)';
+      close.style.borderRadius = '3px';
+      close.style.background = 'rgba(22,25,30,0.86)';
+      close.style.color = '#dce7f6';
+      close.style.font = '14px/16px Arial, sans-serif';
+      close.style.cursor = 'pointer';
+      close.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        removeRecordById(record.id);
+      });
 
       const time = doc.createElement('div');
       time.textContent = expired
@@ -845,16 +927,15 @@
         : `剩余 ${formatDuration(remaining)} | 刷新 ${record.refreshAtText || formatClock(record.refreshAt)}`;
       time.style.color = expired ? '#72ff92' : (soon ? '#ffe66d' : '#9fe6ff');
       time.style.fontWeight = soon ? '700' : '400';
+      time.style.whiteSpace = 'nowrap';
+      time.style.overflow = 'hidden';
+      time.style.textOverflow = 'ellipsis';
 
-      const meta = doc.createElement('div');
-      meta.textContent = `来源 ${record.bossNameSource || 'unknown'} · 可信度 ${Math.round((Number(record.confidence) || 0) * 100)}%`;
-      meta.style.color = '#8997aa';
-      meta.style.fontSize = '11px';
-
-      row.appendChild(title);
-      row.appendChild(place);
+      head.appendChild(title);
+      head.appendChild(place);
+      row.appendChild(head);
+      row.appendChild(close);
       row.appendChild(time);
-      row.appendChild(meta);
       if (record.bossName === '未知BOSS') {
         row.appendChild(renderRenameButtons(record));
       }
