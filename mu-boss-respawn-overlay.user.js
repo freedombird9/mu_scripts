@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.1.10
+// @version      0.1.18
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -18,13 +18,14 @@
   const injected = function () {
     'use strict';
 
-    const VERSION = '0.1.10';
+    const VERSION = '0.1.18';
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
     const CONFIG_KEY = 'mu_boss_respawn_overlay_config_v1';
     const SCAN_INTERVAL_MS = 500;
     const HIGHLIGHT_SECONDS = 90;
+    const NEW_RECORD_HIGHLIGHT_MS = 5000;
     const MERGE_REFRESH_WINDOW_MS = 15000;
     const RECENT_BOSS_NAME_TTL_MS = 10000;
     const EXPIRED_KEEP_MS = 30000;
@@ -45,9 +46,10 @@
     ];
     const DEFAULT_CANDIDATES = ['傲之煞', '闪电巨人'];
 
+    const initialConfig = normalizeConfig(readJson(CONFIG_KEY, defaultConfig()));
     const state = {
-      records: normalizeRecords(readJson(STORAGE_KEY, [])),
-      config: normalizeConfig(readJson(CONFIG_KEY, defaultConfig())),
+      records: normalizeRecords(readJson(STORAGE_KEY, []), initialConfig),
+      config: initialConfig,
       collapsed: readBool(COLLAPSED_KEY, false),
       position: readPosition(),
       drag: null,
@@ -63,6 +65,7 @@
       lastDetected: [],
       recentBossName: null,
       dismissedRecords: {},
+      newRecordHighlights: {},
     };
 
     window.__muBossRespawnOverlay = {
@@ -74,6 +77,7 @@
       },
       clearRecords() {
         state.records = [];
+        state.newRecordHighlights = {};
         persistRecords();
         renderOverlay();
         return [];
@@ -100,6 +104,9 @@
       },
       renameRecord(id, name) {
         return renameRecordById(id, name);
+      },
+      confirmNameChoice(id, name, choice) {
+        return confirmRecordNameChoice(id, name, choice);
       },
       removeRecord(id) {
         return removeRecordById(id);
@@ -180,16 +187,19 @@
       state.scanCount += 1;
       state.lastScanAt = Date.now();
       const context = readContext();
-      const candidates = scanSceneCountdowns();
+      const candidates = scanSceneCountdowns().concat(scanTrialTaskbarCountdowns(context));
       state.lastDetected = candidates.map((item) => ({
         text: item.text,
         seconds: item.seconds,
+        bossName: item.bossName,
+        mapName: item.mapName,
+        source: item.source,
         sourcePath: item.sourcePath,
         score: item.score,
       }));
 
       if (!candidates.length) {
-        state.lastScanReason = 'no visible scene countdown';
+        state.lastScanReason = 'no visible boss countdown';
         pruneRecords();
         return [];
       }
@@ -217,7 +227,7 @@
       const reliableBossName = cleanText(bot.combat.targetName || fgui.targetName || '');
       const bossNameSource = bot.combat.targetName ? 'muBossBot.combat' : (fgui.targetName ? 'fgui.combat' : '');
       const mapName = cleanText(bot.scene.mapName || fgui.mapName || '');
-      if (reliableBossName && isConfiguredCandidate(reliableBossName)) {
+      if (reliableBossName) {
         state.recentBossName = {
           name: reliableBossName,
           source: bossNameSource,
@@ -228,7 +238,6 @@
       const recent = state.recentBossName
         && Date.now() - Number(state.recentBossName.at) <= RECENT_BOSS_NAME_TTL_MS
         && sameKnownMap(mapName, state.recentBossName.mapName)
-        && isConfiguredCandidate(state.recentBossName.name)
         ? state.recentBossName
         : null;
       const bossName = reliableBossName || (recent ? recent.name : '');
@@ -322,30 +331,169 @@
       return candidates.sort((a, b) => b.score - a.score || a.seconds - b.seconds).slice(0, 3);
     }
 
+    function scanTrialTaskbarCountdowns(context) {
+      const root = window.fgui && window.fgui.GRoot && window.fgui.GRoot.inst;
+      if (!root) return [];
+      const candidates = [];
+      const mapName = taskbarMapName(context);
+      walkFgui(root, (node, effectiveVisible, path) => {
+        if (!effectiveVisible || !isTrialTaskbarEntryPath(path)) return;
+        const pair = readDirectChildTexts(node);
+        const nameText = cleanText(pair.nameTxt);
+        const countdownText = cleanText(pair.desTxt);
+        if (!nameText || !countdownText) return;
+        const bossName = extractTaskbarBossName(nameText);
+        if (!bossName) return;
+        const seconds = parseTaskbarCountdownSeconds(countdownText);
+        if (seconds == null || seconds <= 0) return;
+        candidates.push({
+          text: `${nameText} ${countdownText}`,
+          seconds,
+          bossName,
+          bossNameSource: 'fgui.trial_taskbar',
+          mapName,
+          mapSource: mapName ? context.mapSource : 'unknown',
+          source: 'fgui_trial_taskbar',
+          sourcePath: path,
+          score: 260,
+          confidence: 0.9,
+        });
+      }, true, 0);
+      scanTrialLeftPanelCountdowns(root, context).forEach((candidate) => candidates.push(candidate));
+      return dedupeTaskbarCandidates(candidates)
+        .sort((a, b) => a.seconds - b.seconds)
+        .slice(0, 8);
+    }
+
+    function scanTrialLeftPanelCountdowns(root, context) {
+      const mapName = taskbarMapName(context);
+      return groupTrialLeftPanelBossRows(trialLeftPanelRows(root))
+        .map((entry) => {
+          const refreshText = extractTaskbarRefreshText(entry.text);
+          const seconds = parseTaskbarCountdownSeconds(refreshText);
+          if (seconds == null || seconds <= 0) return null;
+          return {
+            text: `${entry.bossName} ${refreshText}`,
+            seconds,
+            bossName: entry.bossName,
+            bossNameSource: 'fgui.trial_left_panel',
+            mapName,
+            mapSource: mapName ? context.mapSource : 'unknown',
+            source: 'fgui_trial_left_panel',
+            sourcePath: `fgui.left_panel:${Math.round(entry.rect.y)}:${entry.bossName}`,
+            score: 255,
+            confidence: 0.9,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    function trialLeftPanelRows(root) {
+      const items = [];
+      walkFgui(root, (node, effectiveVisible) => {
+        if (!effectiveVisible) return;
+        const childCount = Number(node && node.numChildren) || 0;
+        if (childCount !== 0) return;
+        const text = fguiContentText(node);
+        if (!text) return;
+        const rect = fguiRect(node);
+        if (!isTrialLeftPanelTextRect(rect)) return;
+        items.push({ text, rect });
+      }, true, 0);
+
+      const rows = [];
+      items
+        .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x))
+        .forEach((item) => {
+          let row = rows.find((candidate) => Math.abs(candidate.y - item.rect.y) <= 14);
+          if (!row) {
+            row = { y: item.rect.y, items: [] };
+            rows.push(row);
+          }
+          row.items.push(item);
+          row.y = (row.y + item.rect.y) / 2;
+        });
+
+      return rows.map((row) => {
+        const sorted = row.items.sort((a, b) => a.rect.x - b.rect.x);
+        return {
+          y: row.y,
+          rect: unionRects(sorted.map((item) => item.rect)),
+          text: cleanText(sorted.map((item) => item.text).join(' ')),
+        };
+      });
+    }
+
+    function groupTrialLeftPanelBossRows(rows) {
+      const out = [];
+      let current = null;
+      rows.forEach((row) => {
+        const bossName = extractTaskbarBossName(row.text);
+        if (bossName) {
+          if (current) out.push(finalizeTrialLeftPanelEntry(current));
+          current = { bossName, parts: [row.text], rects: [row.rect] };
+          return;
+        }
+        if (current && isTaskbarBossDetailText(row.text)) {
+          current.parts.push(row.text);
+          current.rects.push(row.rect);
+        }
+      });
+      if (current) out.push(finalizeTrialLeftPanelEntry(current));
+      return out.filter((entry) => extractTaskbarRefreshText(entry.text));
+    }
+
+    function finalizeTrialLeftPanelEntry(entry) {
+      return {
+        bossName: entry.bossName,
+        text: cleanText(entry.parts.join(' ')),
+        rect: unionRects(entry.rects),
+      };
+    }
+
+    function dedupeTaskbarCandidates(candidates) {
+      const out = [];
+      candidates.forEach((candidate) => {
+        if (!candidate) return;
+        const duplicate = out.some((item) => item.bossName === candidate.bossName
+          && Math.abs(Number(item.seconds) - Number(candidate.seconds)) <= 1);
+        if (!duplicate) out.push(candidate);
+      });
+      return out;
+    }
+
     function recordFromCandidate(candidate, context) {
       const observedAt = Date.now();
       const refreshAt = observedAt + candidate.seconds * 1000;
-      const bossName = context.bossName || '未知BOSS';
-      if (bossName !== '未知BOSS' && !isConfiguredCandidate(bossName)) return null;
+      const bossName = candidate.bossName || context.bossName || '未知BOSS';
+      const mapName = candidate.mapName || (isExplicitBossSource(candidate) ? '' : context.mapName);
+      const bossNameSource = candidate.bossNameSource || context.bossNameSource;
+      const mapSource = candidate.mapName ? candidate.mapSource : (isExplicitBossSource(candidate) ? 'unknown' : context.mapSource);
       if (bossName === '未知BOSS' && !configuredCandidates().length) return null;
-      const confidence = scoreRecordConfidence(candidate, context);
+      const confidence = Math.max(scoreRecordConfidence(candidate, { ...context, bossName, mapName }), Number(candidate.confidence) || 0);
       if (confidence < 0.45) return null;
+      const detectedBossName = bossName !== '未知BOSS' ? bossName : '';
+      const taskbarBossNameConfirmed = isExplicitBossSource(candidate) && detectedBossName;
+      const autoNameConfirmed = taskbarBossNameConfirmed || shouldAutoConfirmNameChoice(bossName);
       const record = {
         id: recordKey({
           bossName,
-          mapName: context.mapName,
+          mapName,
           refreshAt,
         }),
         bossName,
-        bossNameSource: context.bossNameSource,
-        mapName: context.mapName,
-        mapSource: context.mapSource,
+        bossNameSource,
+        detectedBossName,
+        nameChoiceConfirmed: Boolean(autoNameConfirmed),
+        nameChoice: autoNameConfirmed ? 'auto' : '',
+        mapName,
+        mapSource,
         countdownText: candidate.text,
         detectedSeconds: candidate.seconds,
         observedAt,
         refreshAt,
         refreshAtText: formatClock(refreshAt),
-        source: 'laya_scene_countdown',
+        source: candidate.source || 'laya_scene_countdown',
         sourcePath: candidate.sourcePath,
         confidence,
       };
@@ -367,15 +515,26 @@
       const existingIndex = findMergeableRecordIndex(next, state.records);
       if (existingIndex >= 0) {
         const prev = state.records[existingIndex];
+        const preferred = preferredRecordOnMerge(prev, next);
         state.records[existingIndex] = {
           ...prev,
           ...next,
-          id: prev.id || next.id,
-          bossName: chooseBetterText(prev.bossName, next.bossName, '未知BOSS'),
-          bossNameSource: next.bossName && next.bossName !== '未知BOSS' ? next.bossNameSource : prev.bossNameSource,
+          id: preferred.id || prev.id || next.id,
+          bossName: chooseMergedBossName(prev, next),
+          bossNameSource: chooseMergedBossNameSource(prev, next),
+          detectedBossName: chooseBetterText(prev.detectedBossName, next.detectedBossName, ''),
+          nameChoiceConfirmed: Boolean(prev.nameChoiceConfirmed) || Boolean(next.nameChoiceConfirmed),
+          nameChoice: prev.nameChoiceConfirmed ? prev.nameChoice : next.nameChoice,
           mapName: chooseBetterText(prev.mapName, next.mapName, '未知地图'),
           mapSource: next.mapName ? next.mapSource : prev.mapSource,
           firstObservedAt: prev.firstObservedAt || prev.observedAt || next.observedAt,
+          countdownText: preferred.countdownText,
+          detectedSeconds: preferred.detectedSeconds,
+          observedAt: preferred.observedAt,
+          refreshAt: preferred.refreshAt,
+          refreshAtText: preferred.refreshAtText,
+          source: preferred.source,
+          sourcePath: preferred.sourcePath,
           updatedAt: Date.now(),
         };
       } else {
@@ -384,6 +543,7 @@
           firstObservedAt: next.observedAt,
           updatedAt: Date.now(),
         });
+        markNewRecordHighlighted(next);
       }
       state.records.sort((a, b) => Number(a.refreshAt || 0) - Number(b.refreshAt || 0));
       if (state.records.length > MAX_RECORDS) state.records = state.records.slice(0, MAX_RECORDS);
@@ -391,19 +551,31 @@
 
     function pruneRecords() {
       const now = Date.now();
+      pruneNewRecordHighlights(now);
       state.records = normalizeRecords(state.records)
         .reduce((out, item) => {
           const existingIndex = findMergeableRecordIndex(item, out);
           if (existingIndex >= 0) {
             const prev = out[existingIndex];
+            const preferred = preferredRecordOnMerge(prev, item);
             out[existingIndex] = {
               ...prev,
               ...item,
-              id: prev.id || item.id,
-              bossName: chooseBetterText(prev.bossName, item.bossName, '未知BOSS'),
-              bossNameSource: item.bossName && item.bossName !== '未知BOSS' ? item.bossNameSource : prev.bossNameSource,
+              id: preferred.id || prev.id || item.id,
+              bossName: chooseMergedBossName(prev, item),
+              bossNameSource: chooseMergedBossNameSource(prev, item),
+              detectedBossName: chooseBetterText(prev.detectedBossName, item.detectedBossName, ''),
+              nameChoiceConfirmed: Boolean(prev.nameChoiceConfirmed) || Boolean(item.nameChoiceConfirmed),
+              nameChoice: prev.nameChoiceConfirmed ? prev.nameChoice : item.nameChoice,
               mapName: chooseBetterText(prev.mapName, item.mapName, '未知地图'),
               mapSource: item.mapName ? item.mapSource : prev.mapSource,
+              countdownText: preferred.countdownText,
+              detectedSeconds: preferred.detectedSeconds,
+              observedAt: preferred.observedAt,
+              refreshAt: preferred.refreshAt,
+              refreshAtText: preferred.refreshAtText,
+              source: preferred.source,
+              sourcePath: preferred.sourcePath,
               firstObservedAt: Math.min(Number(prev.firstObservedAt) || Number(prev.observedAt) || Date.now(), Number(item.firstObservedAt) || Number(item.observedAt) || Date.now()),
               updatedAt: Math.max(Number(prev.updatedAt) || 0, Number(item.updatedAt) || 0, Date.now()),
             };
@@ -415,6 +587,7 @@
         .filter((item) => shouldKeepExistingRecord(item) && Number(item.refreshAt) > now - EXPIRED_KEEP_MS)
         .sort((a, b) => Number(a.refreshAt || 0) - Number(b.refreshAt || 0))
         .slice(0, MAX_RECORDS);
+      pruneNewRecordHighlights(now);
       persistRecords();
     }
 
@@ -433,16 +606,44 @@
 
     function canMergeRecords(left, right) {
       if (!left || !right) return false;
-      if (!namesMergeable(left.bossName, right.bossName)) return false;
+      if (!recordNamesMergeable(left, right)) return false;
       if (!mapsMergeable(left.mapName, right.mapName)) return false;
+      if (sameTrialTaskbarBossRecord(left, right)) return true;
       if (Number(left.refreshAt) <= Date.now() && Number(right.refreshAt) > Date.now()) return true;
       return Math.abs(Number(left.refreshAt) - Number(right.refreshAt)) <= MERGE_REFRESH_WINDOW_MS;
     }
 
-    function namesMergeable(left, right) {
-      const a = cleanText(left || '未知BOSS');
-      const b = cleanText(right || '未知BOSS');
-      return a === b || a === '未知BOSS' || b === '未知BOSS';
+    function sameTrialTaskbarBossRecord(left, right) {
+      return isTrialTaskbarRecord(left) && isTrialTaskbarRecord(right);
+    }
+
+    function isTrialTaskbarRecord(record) {
+      return /^fgui_trial_/.test(cleanText(record && record.source))
+        || /^fgui\.left_panel:/.test(cleanText(record && record.sourcePath));
+    }
+
+    function preferredRecordOnMerge(previous, next) {
+      if (sameTrialTaskbarBossRecord(previous, next)) {
+        return Number(next.observedAt) >= Number(previous.observedAt) ? next : previous;
+      }
+      return next;
+    }
+
+    function recordNamesMergeable(left, right) {
+      const leftNames = recordKnownNames(left);
+      const rightNames = recordKnownNames(right);
+      if (!leftNames.length || !rightNames.length) return true;
+      return leftNames.some((name) => rightNames.includes(name));
+    }
+
+    function recordKnownNames(record) {
+      return uniqueStrings([
+        record && record.bossName,
+        record && record.detectedBossName,
+      ].filter((name) => {
+        const value = cleanText(name);
+        return value && value !== '未知BOSS';
+      }));
     }
 
     function mapsMergeable(left, right) {
@@ -463,6 +664,18 @@
       if (!prev || prev === unknown) return value || prev;
       if (!value || value === unknown) return prev;
       return value.length >= prev.length ? value : prev;
+    }
+
+    function chooseMergedBossName(previous, next) {
+      if (previous && previous.nameChoiceConfirmed && cleanText(previous.bossName) && cleanText(previous.bossName) !== '未知BOSS') {
+        return cleanText(previous.bossName);
+      }
+      return chooseBetterText(previous && previous.bossName, next && next.bossName, '未知BOSS');
+    }
+
+    function chooseMergedBossNameSource(previous, next) {
+      if (previous && previous.nameChoiceConfirmed && cleanText(previous.bossNameSource)) return cleanText(previous.bossNameSource);
+      return next && next.bossName && next.bossName !== '未知BOSS' ? next.bossNameSource : previous && previous.bossNameSource;
     }
 
     function defaultConfig() {
@@ -492,8 +705,8 @@
       return [];
     }
 
-    function configuredCandidates() {
-      return normalizeConfig(state.config).candidates;
+    function configuredCandidates(config) {
+      return normalizeConfig(config || state.config).candidates;
     }
 
     function isConfiguredCandidate(name) {
@@ -504,6 +717,9 @@
 
     function shouldKeepExistingRecord(record) {
       if (!record) return false;
+      if (record.nameChoiceConfirmed && record.bossName && record.bossName !== '未知BOSS') return true;
+      if (record.detectedBossName && record.detectedBossName !== '未知BOSS') return true;
+      if (isExplicitBossSource(record) && record.bossName && record.bossName !== '未知BOSS') return true;
       if (record.bossName === '未知BOSS') return configuredCandidates().length > 0;
       return isConfiguredCandidate(record.bossName);
     }
@@ -530,16 +746,43 @@
     }
 
     function renameRecordAt(index, targetName) {
+      return setRecordNameAt(index, targetName, 'manual');
+    }
+
+    function confirmRecordNameChoice(id, name, choice) {
+      const targetName = cleanText(name);
+      if (!targetName || targetName === '未知BOSS') return null;
+      const key = cleanText(id);
+      const index = state.records.findIndex((record) => cleanText(record.id) === key);
+      if (index < 0) return null;
+      const normalizedChoice = cleanText(choice) === 'config' || cleanText(choice) === 'config_overwrite'
+        ? 'config_overwrite'
+        : 'auto';
+      return setRecordNameAt(index, targetName, normalizedChoice);
+    }
+
+    function setRecordNameAt(index, targetName, choice) {
       const previous = state.records[index];
       if (!previous) return null;
+      const previousKey = cleanText(previous.id);
+      const nextKey = recordKey({ bossName: targetName, mapName: previous.mapName, refreshAt: previous.refreshAt });
+      const highlightUntil = previousKey ? Number(state.newRecordHighlights[previousKey]) || 0 : 0;
+      const previousSource = cleanText(previous.bossNameSource);
+      const detectedBossName = cleanText(previous.detectedBossName)
+        || (previousSource && previousSource !== 'manual' ? cleanText(previous.bossName) : '');
       state.records[index] = {
         ...previous,
-        id: recordKey({ bossName: targetName, mapName: previous.mapName, refreshAt: previous.refreshAt }),
+        id: nextKey,
         bossName: targetName,
-        bossNameSource: 'manual',
+        bossNameSource: choice === 'auto' ? (previous.bossNameSource || 'auto.confirmed') : 'manual',
+        detectedBossName,
+        nameChoiceConfirmed: true,
+        nameChoice: choice || 'manual',
         confidence: Math.max(Number(previous.confidence) || 0, 0.95),
         updatedAt: Date.now(),
       };
+      if (previousKey && previousKey !== nextKey) delete state.newRecordHighlights[previousKey];
+      if (highlightUntil > Date.now()) state.newRecordHighlights[nextKey] = highlightUntil;
       pruneRecords();
       persistRecords();
       renderOverlay();
@@ -554,6 +797,7 @@
       const before = state.records.length;
       state.records = state.records.filter((record) => cleanText(record.id) !== key);
       if (state.records.length === before) return false;
+      delete state.newRecordHighlights[key];
       persistRecords();
       renderOverlay();
       return true;
@@ -587,10 +831,40 @@
       });
     }
 
+    function markNewRecordHighlighted(record) {
+      const key = cleanText(record && record.id);
+      if (key) state.newRecordHighlights[key] = Date.now() + NEW_RECORD_HIGHLIGHT_MS;
+    }
+
+    function isNewRecordHighlighted(record, now) {
+      const key = cleanText(record && record.id);
+      return Boolean(key && Number(state.newRecordHighlights[key]) > now);
+    }
+
+    function pruneNewRecordHighlights(now) {
+      const activeRecordIds = {};
+      state.records.forEach((record) => {
+        const key = cleanText(record && record.id);
+        if (key) activeRecordIds[key] = true;
+      });
+      Object.keys(state.newRecordHighlights).forEach((key) => {
+        if (Number(state.newRecordHighlights[key]) <= now || !activeRecordIds[key]) {
+          delete state.newRecordHighlights[key];
+        }
+      });
+    }
+
     function normalizeCandidateName(name) {
       const value = cleanText(name);
       if (!isConfiguredCandidate(value)) return '';
       return value;
+    }
+
+    function shouldAutoConfirmNameChoice(name, config) {
+      const value = cleanText(name);
+      if (!value || value === '未知BOSS') return false;
+      const candidates = configuredCandidates(config);
+      return !candidates.some((candidate) => cleanText(candidate) && cleanText(candidate) !== value);
     }
 
     function uniqueStrings(values) {
@@ -665,6 +939,7 @@
       clear.addEventListener('click', (event) => {
         event.stopPropagation();
         state.records = [];
+        state.newRecordHighlights = {};
         persistRecords();
         renderOverlay();
       });
@@ -827,6 +1102,7 @@
       renderConfigPanel();
 
       const now = Date.now();
+      pruneNewRecordHighlights(now);
       const activeRecords = state.records
         .filter((item) => Number(item.refreshAt) > now - EXPIRED_KEEP_MS)
         .sort((a, b) => Number(a.refreshAt || 0) - Number(b.refreshAt || 0));
@@ -864,13 +1140,19 @@
       const remaining = Math.ceil((Number(record.refreshAt) - now) / 1000);
       const expired = remaining < 0;
       const soon = remaining >= 0 && remaining <= HIGHLIGHT_SECONDS;
+      const isNewHighlight = isNewRecordHighlighted(record, now);
 
       row.style.position = 'relative';
       row.style.padding = '4px 26px 4px 6px';
       row.style.margin = '0 0 4px';
-      row.style.border = soon ? '1px solid rgba(255,226,82,0.85)' : '1px solid rgba(255,255,255,0.12)';
-      row.style.background = soon ? 'rgba(164,84,0,0.58)' : 'rgba(255,255,255,0.06)';
+      row.style.border = isNewHighlight
+        ? '1px solid rgba(92,226,255,0.95)'
+        : (soon ? '1px solid rgba(255,226,82,0.85)' : '1px solid rgba(255,255,255,0.12)');
+      row.style.background = isNewHighlight
+        ? 'rgba(10,116,138,0.72)'
+        : (soon ? 'rgba(164,84,0,0.58)' : 'rgba(255,255,255,0.06)');
       row.style.borderRadius = '4px';
+      row.style.boxShadow = isNewHighlight ? '0 0 10px rgba(92,226,255,0.32)' : 'none';
 
       const head = doc.createElement('div');
       head.style.display = 'flex';
@@ -882,7 +1164,7 @@
       const title = doc.createElement('div');
       title.textContent = record.bossName || '未知BOSS';
       title.style.fontWeight = '700';
-      title.style.color = soon ? '#fff0a8' : '#ffffff';
+      title.style.color = isNewHighlight ? '#e8fcff' : (soon ? '#fff0a8' : '#ffffff');
       title.style.whiteSpace = 'nowrap';
       title.style.overflow = 'hidden';
       title.style.textOverflow = 'ellipsis';
@@ -925,8 +1207,8 @@
       time.textContent = expired
         ? `已刷新 | ${record.refreshAtText || formatClock(record.refreshAt)}`
         : `剩余 ${formatDuration(remaining)} | 刷新 ${record.refreshAtText || formatClock(record.refreshAt)}`;
-      time.style.color = expired ? '#72ff92' : (soon ? '#ffe66d' : '#9fe6ff');
-      time.style.fontWeight = soon ? '700' : '400';
+      time.style.color = isNewHighlight ? '#c9fbff' : (expired ? '#72ff92' : (soon ? '#ffe66d' : '#9fe6ff'));
+      time.style.fontWeight = isNewHighlight || soon ? '700' : '400';
       time.style.whiteSpace = 'nowrap';
       time.style.overflow = 'hidden';
       time.style.textOverflow = 'ellipsis';
@@ -936,9 +1218,8 @@
       row.appendChild(head);
       row.appendChild(close);
       row.appendChild(time);
-      if (record.bossName === '未知BOSS') {
-        row.appendChild(renderRenameButtons(record));
-      }
+      const nameChoice = renderNameChoice(record);
+      if (nameChoice) row.appendChild(nameChoice);
       return row;
     }
 
@@ -1061,31 +1342,64 @@
       event.stopPropagation();
     }
 
-    function renderRenameButtons(record) {
+    function renderNameChoice(record) {
+      if (!shouldShowNameChoice(record)) return null;
       const wrap = window.document.createElement('div');
       wrap.style.display = 'flex';
       wrap.style.flexWrap = 'wrap';
+      wrap.style.alignItems = 'center';
       wrap.style.gap = '4px';
       wrap.style.marginTop = '5px';
-      configuredCandidates().forEach((name) => {
-        const button = window.document.createElement('button');
-        button.type = 'button';
-        button.textContent = shortBossName(name);
-        button.title = `标记为${name}`;
-        button.style.padding = '2px 5px';
-        button.style.border = '1px solid rgba(255,255,255,0.24)';
-        button.style.borderRadius = '4px';
-        button.style.background = 'rgba(50,62,78,0.92)';
-        button.style.color = '#fff';
-        button.style.font = '11px/1.3 Arial, sans-serif';
-        button.style.cursor = 'pointer';
-        button.addEventListener('click', (event) => {
+      const detectedName = detectedRecordName(record);
+      if (detectedName) {
+        wrap.appendChild(createNameChoiceButton(shortBossName(detectedName), `确认使用自动检测名: ${detectedName}`, '#236b53', (event) => {
           event.stopPropagation();
-          renameRecordById(record.id, name);
+          confirmRecordNameChoice(record.id, detectedName, 'auto');
+        }));
+      }
+      configuredCandidates()
+        .filter((name) => cleanText(name) && cleanText(name) !== detectedName)
+        .forEach((name) => {
+          wrap.appendChild(createNameChoiceButton(shortBossName(name), `使用配置名覆盖: ${name}`, 'rgba(138,38,38,0.92)', (event) => {
+            event.stopPropagation();
+            confirmRecordNameChoice(record.id, name, 'config_overwrite');
+          }));
         });
-        wrap.appendChild(button);
-      });
       return wrap;
+    }
+
+    function shouldShowNameChoice(record) {
+      if (!record || record.nameChoiceConfirmed) return false;
+      if (isExplicitBossSource(record)) return false;
+      const detectedName = detectedRecordName(record);
+      const configNames = configuredCandidates().filter((name) => cleanText(name) && cleanText(name) !== detectedName);
+      if (!configNames.length) return false;
+      return Boolean(detectedName || record.bossName === '未知BOSS');
+    }
+
+    function detectedRecordName(record) {
+      const detected = cleanText(record && record.detectedBossName);
+      if (detected && detected !== '未知BOSS') return detected;
+      const source = cleanText(record && record.bossNameSource);
+      const current = cleanText(record && record.bossName);
+      if (current && current !== '未知BOSS' && source !== 'manual') return current;
+      return '';
+    }
+
+    function createNameChoiceButton(text, title, background, onClick) {
+      const button = window.document.createElement('button');
+      button.type = 'button';
+      button.textContent = text;
+      button.title = title;
+      button.style.padding = '2px 5px';
+      button.style.border = '1px solid rgba(255,255,255,0.24)';
+      button.style.borderRadius = '4px';
+      button.style.background = background;
+      button.style.color = '#fff';
+      button.style.font = '11px/1.3 Arial, sans-serif';
+      button.style.cursor = 'pointer';
+      button.addEventListener('click', onClick);
+      return button;
     }
 
     function shortBossName(name) {
@@ -1112,14 +1426,19 @@
       button.style.cursor = 'pointer';
     }
 
-    function walkFgui(node, visit, inheritedVisible, depth) {
+    function walkFgui(node, visit, inheritedVisible, depth, path) {
       if (!node || depth > 18) return;
       const selfVisible = node.visible !== false && node.internalVisible !== false;
       const effectiveVisible = inheritedVisible !== false && selfVisible;
-      visit(node, effectiveVisible);
+      const currentPath = path || 'fgui.root';
+      visit(node, effectiveVisible, currentPath);
       const count = Number(node.numChildren) || 0;
       for (let index = 0; index < count; index += 1) {
-        if (typeof node.getChildAt === 'function') walkFgui(node.getChildAt(index), visit, effectiveVisible, depth + 1);
+        if (typeof node.getChildAt === 'function') {
+          const child = node.getChildAt(index);
+          const childName = cleanText(safeString(() => child.name)) || '?';
+          walkFgui(child, visit, effectiveVisible, depth + 1, `${currentPath}/${childName}[${index}]`);
+        }
       }
     }
 
@@ -1169,10 +1488,162 @@
       return names.find((name) => value.includes(name)) || '';
     }
 
+    function extractTaskbarBossName(text) {
+      const value = cleanText(text);
+      if (!value) return '';
+      const names = uniqueStrings(configuredCandidates().concat(BOSS_NAME_EXAMPLES))
+        .sort((a, b) => b.length - a.length);
+      return names.find((name) => {
+        if (!name) return false;
+        if (value === name || value.indexOf(name) === 0) return true;
+        if (name === '龙虾') return /^龙虾(?:战士)?$/.test(value);
+        return name.length >= 4 && value.includes(name);
+      }) || '';
+    }
+
+    function isExplicitBossSource(item) {
+      return /^fgui_trial_/.test(cleanText(item && item.source));
+    }
+
     function parseColonSeconds(text) {
       const match = cleanText(text).match(/^(\d{1,2}):([0-5]\d)$/);
       if (!match) return null;
       return Number(match[1]) * 60 + Number(match[2]);
+    }
+
+    function parseCountdownSeconds(text) {
+      const value = cleanText(text);
+      let match = value.match(/(\d{1,2}):([0-5]\d)(?::([0-5]\d))?/);
+      if (match) {
+        if (match[3] != null) return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        return Number(match[1]) * 60 + Number(match[2]);
+      }
+      const hourMatch = value.match(/(\d+)\s*小时/);
+      const minuteMatch = value.match(/(\d+)\s*分/);
+      const secondMatch = value.match(/(\d+)\s*秒/);
+      if (!hourMatch && !minuteMatch && !secondMatch) return null;
+      return (Number(hourMatch && hourMatch[1]) || 0) * 3600
+        + (Number(minuteMatch && minuteMatch[1]) || 0) * 60
+        + (Number(secondMatch && secondMatch[1]) || 0);
+    }
+
+    function parseTaskbarCountdownSeconds(text) {
+      const value = cleanText(text).replace(/\s+/g, '');
+      if (!value || isTrialTaskbarLiveBossStatus(value)) return null;
+      const countdownText = stripTaskbarCountdownLabel(value);
+      const colonMatch = countdownText.match(/^(\d{1,2}:[0-5]\d(?::[0-5]\d)?)(?:后)?(?:刷新|复活)?$/);
+      if (colonMatch) return parseCountdownSeconds(colonMatch[1]);
+      const unitMatch = countdownText.match(/^((?:(?:\d+)小时)?(?:(?:\d+)分)?(?:(?:\d+)秒)?)(?:后)?(?:刷新|复活)?$/);
+      if (!unitMatch || !/\d+(?:小时|分|秒)/.test(unitMatch[1])) return null;
+      return parseCountdownSeconds(unitMatch[1]);
+    }
+
+    function stripTaskbarCountdownLabel(text) {
+      return cleanText(text)
+        .replace(/\s+/g, '')
+        .replace(/^(?:剩余(?:刷新|复活)?(?:倒计时|时间)?|(?:刷新|复活)(?:倒计时|时间)?|倒计时|时间)[:：]?/, '');
+    }
+
+    function extractTaskbarRefreshText(text) {
+      const value = cleanText(text).replace(/\s+/g, '');
+      const match = value.match(/(?:剩余)?(?:刷新|复活)?(?:倒计时|时间)?[:：]?(?:\d{1,2}:[0-5]\d(?::[0-5]\d)?|\d+小时(?:\d+分)?(?:\d+秒)?|\d+分(?:\d+秒)?|\d+秒)(?:后)?(?:刷新|复活)?/);
+      return match ? match[0] : '';
+    }
+
+    function isTrialTaskbarLiveBossStatus(text) {
+      const value = cleanText(text);
+      return /待击杀|已刷新|伤害|排名|排行|第[一二三四五六七八九十\d]+名|输出|玩家|挑战/.test(value);
+    }
+
+    function isTaskbarBossDetailText(text) {
+      return /坐标\s*\d{1,3},\d{1,3}|\(\d{1,3},\d{1,3}\)|剩余刷新时间|刷新时间|待击杀/.test(cleanText(text));
+    }
+
+    function taskbarMapName(context) {
+      const mapName = cleanText(context && context.mapName);
+      return isTrialLandMap(mapName) ? mapName : '';
+    }
+
+    function readDirectChildTexts(node) {
+      const out = {};
+      const count = Number(node && node.numChildren) || 0;
+      for (let index = 0; index < count; index += 1) {
+        if (!node || typeof node.getChildAt !== 'function') continue;
+        const child = node.getChildAt(index);
+        if (child.visible === false || child.internalVisible === false) continue;
+        const name = cleanText(safeString(() => child.name));
+        if (name === 'nameTxt' || name === 'desTxt') {
+          out[name] = firstCleanText(
+            safeString(() => child.text),
+            safeString(() => child.title)
+          );
+        }
+      }
+      return out;
+    }
+
+    function isTrialTaskbarEntryPath(path) {
+      return /compLeftTop.*activityInfoCom.*Damage list/i.test(cleanText(path));
+    }
+
+    function isTrialLandMap(mapName) {
+      return /试炼之地/.test(cleanText(mapName));
+    }
+
+    function fguiContentText(node) {
+      return firstCleanText(
+        safeString(() => node.text),
+        safeString(() => node.title)
+      );
+    }
+
+    function fguiRect(node) {
+      try {
+        if (node && typeof node.localToGlobalRect === 'function') {
+          const rect = node.localToGlobalRect(0, 0, node.width || 0, node.height || 0);
+          if (rect) {
+            return {
+              x: Number(rect.x) || 0,
+              y: Number(rect.y) || 0,
+              w: Number(rect.width) || 0,
+              h: Number(rect.height) || 0,
+            };
+          }
+        }
+      } catch (_) {}
+      const rect = {
+        x: Number(node && node.x) || 0,
+        y: Number(node && node.y) || 0,
+        w: Number(node && node.width) || 0,
+        h: Number(node && node.height) || 0,
+      };
+      let parent = node && node.parent;
+      while (parent) {
+        rect.x += Number(parent.x) || 0;
+        rect.y += Number(parent.y) || 0;
+        parent = parent.parent;
+      }
+      return rect;
+    }
+
+    function isTrialLeftPanelTextRect(rect) {
+      if (!rect) return false;
+      return rect.x <= 420
+        && rect.y >= 60
+        && rect.y <= 430
+        && rect.w >= 10
+        && rect.h >= 8
+        && rect.h <= 90;
+    }
+
+    function unionRects(rects) {
+      const valid = (rects || []).filter(Boolean);
+      if (!valid.length) return { x: 0, y: 0, w: 0, h: 0 };
+      const minX = Math.min.apply(null, valid.map((rect) => rect.x));
+      const minY = Math.min.apply(null, valid.map((rect) => rect.y));
+      const maxX = Math.max.apply(null, valid.map((rect) => rect.x + rect.w));
+      const maxY = Math.max.apply(null, valid.map((rect) => rect.y + rect.h));
+      return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
     }
 
     function normalizeCoordinate(text) {
@@ -1205,7 +1676,7 @@
       return `${h}:${m}:${s}`;
     }
 
-    function normalizeRecords(value) {
+    function normalizeRecords(value, config) {
       if (!Array.isArray(value)) return [];
       return value
         .map((item) => {
@@ -1213,6 +1684,12 @@
           const refreshAt = Number(item.refreshAt);
           if (!Number.isFinite(refreshAt)) return null;
           const bossName = cleanText(item.bossName || item.name || '未知BOSS');
+          const bossNameSource = cleanText(item.bossNameSource);
+          const detectedBossName = cleanText(item.detectedBossName)
+            || (bossNameSource && bossNameSource !== 'manual' && bossName !== '未知BOSS' ? bossName : '');
+          const nameChoiceConfirmed = item.nameChoiceConfirmed === true
+            || (bossNameSource === 'manual' && bossName !== '未知BOSS')
+            || shouldAutoConfirmNameChoice(bossName, config);
           return {
             id: cleanText(item.id) || recordKey({
               bossName,
@@ -1220,7 +1697,10 @@
               refreshAt,
             }),
             bossName,
-            bossNameSource: cleanText(item.bossNameSource),
+            bossNameSource,
+            detectedBossName,
+            nameChoiceConfirmed,
+            nameChoice: cleanText(item.nameChoice) || (nameChoiceConfirmed ? 'auto' : ''),
             mapName: cleanText(item.mapName),
             mapSource: cleanText(item.mapSource),
             countdownText: cleanText(item.countdownText),
