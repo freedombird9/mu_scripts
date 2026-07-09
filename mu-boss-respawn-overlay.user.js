@@ -22,6 +22,7 @@
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
+    const SIZE_KEY = 'mu_boss_respawn_overlay_size_v1';
     const CONFIG_KEY = 'mu_boss_respawn_overlay_config_v1';
     const SCAN_INTERVAL_MS = 500;
     const HIGHLIGHT_SECONDS = 90;
@@ -30,6 +31,12 @@
     const RECENT_BOSS_NAME_TTL_MS = 10000;
     const EXPIRED_KEEP_MS = 30000;
     const MAX_RECORDS = 40;
+    const DEFAULT_OVERLAY_WIDTH = 292;
+    const DEFAULT_OVERLAY_HEIGHT = 180;
+    const MIN_OVERLAY_WIDTH = 220;
+    const MIN_OVERLAY_HEIGHT = 118;
+    const MIN_OVERLAY_FONT_PX = 10;
+    const MAX_OVERLAY_FONT_PX = 20;
     const BOSS_NAME_EXAMPLES = [
       '愤怒闪电巨人',
       '深渊咒怨魔王',
@@ -52,7 +59,9 @@
       config: initialConfig,
       collapsed: readBool(COLLAPSED_KEY, false),
       position: readPosition(),
+      size: readSize(),
       drag: null,
+      resize: null,
       overlayEl: null,
       bodyEl: null,
       statusEl: null,
@@ -125,6 +134,7 @@
           lastScanReason: state.lastScanReason,
           collapsed: state.collapsed,
           position: state.position ? { ...state.position } : null,
+          size: state.size ? { ...state.size } : null,
           config: clone(state.config),
           configEditing: state.configEditing,
           records: state.records.length,
@@ -139,6 +149,18 @@
           state.overlayEl.style.left = '';
           state.overlayEl.style.right = '8px';
           state.overlayEl.style.top = '220px';
+        }
+        return null;
+      },
+      resetSize() {
+        state.size = null;
+        writeJson(SIZE_KEY, null);
+        if (state.overlayEl) {
+          state.overlayEl.style.width = `${DEFAULT_OVERLAY_WIDTH}px`;
+          state.overlayEl.style.height = '';
+          applyOverlayTypography();
+          applyOverlayBodySizing();
+          clampOverlayToViewport();
         }
         return null;
       },
@@ -896,17 +918,24 @@
       panel.style.position = 'fixed';
       applyOverlayPosition(panel);
       panel.style.zIndex = '2147483647';
-      panel.style.width = '292px';
-      panel.style.maxWidth = '34vw';
+      applyOverlaySize(panel);
       panel.style.boxSizing = 'border-box';
       panel.style.border = '1px solid rgba(255,255,255,0.28)';
       panel.style.background = 'rgba(10,12,16,0.78)';
       panel.style.color = '#f3f7ff';
-      panel.style.font = '12px/1.35 Arial, sans-serif';
+      panel.style.font = 'var(--mu-boss-overlay-font-size, 12px)/1.35 Arial, sans-serif';
       panel.style.borderRadius = '6px';
       panel.style.boxShadow = '0 6px 18px rgba(0,0,0,0.35)';
       panel.style.pointerEvents = 'auto';
       panel.style.userSelect = 'none';
+      panel.style.display = 'flex';
+      panel.style.flexDirection = 'column';
+      panel.style.minWidth = `${MIN_OVERLAY_WIDTH}px`;
+      panel.style.minHeight = `${MIN_OVERLAY_HEIGHT}px`;
+      panel.style.maxWidth = 'calc(100vw - 8px)';
+      panel.style.maxHeight = 'calc(100vh - 8px)';
+      panel.style.overflow = 'hidden';
+      applyOverlayTypography(panel);
 
       const header = doc.createElement('div');
       header.style.display = 'flex';
@@ -916,6 +945,7 @@
       header.style.padding = '5px 6px';
       header.style.borderBottom = '1px solid rgba(255,255,255,0.16)';
       header.style.cursor = 'move';
+      header.style.flex = '0 0 auto';
       header.title = '拖动调整浮层位置';
       header.addEventListener('mousedown', startDragOverlay);
 
@@ -980,11 +1010,14 @@
       status.style.whiteSpace = 'nowrap';
       status.style.overflow = 'hidden';
       status.style.textOverflow = 'ellipsis';
+      status.style.flex = '0 0 auto';
 
       const body = doc.createElement('div');
       body.style.padding = '4px 5px';
       body.style.maxHeight = '280px';
       body.style.overflow = 'hidden auto';
+      body.style.flex = '1 1 auto';
+      body.style.minHeight = '0';
 
       const configPanel = doc.createElement('div');
       configPanel.style.display = 'none';
@@ -993,14 +1026,17 @@
       configPanel.style.background = 'rgba(255,255,255,0.05)';
       configPanel.style.userSelect = 'text';
       configPanel.style.webkitUserSelect = 'text';
+      configPanel.style.flex = '0 0 auto';
 
       panel.appendChild(header);
       panel.appendChild(status);
       panel.appendChild(configPanel);
       panel.appendChild(body);
+      appendResizeHandles(doc, panel);
       state.statusEl = status;
       state.configEl = configPanel;
       state.bodyEl = body;
+      applyOverlayBodySizing();
       if (typeof window.addEventListener === 'function') {
         window.addEventListener('resize', clampOverlayToViewport);
       }
@@ -1021,9 +1057,58 @@
       panel.style.left = '';
     }
 
+    function applyOverlaySize(panel) {
+      const target = panel || state.overlayEl;
+      if (!target) return;
+      const size = clampSize(state.size || { width: DEFAULT_OVERLAY_WIDTH, height: null }, target);
+      target.style.width = `${size.width}px`;
+      target.style.height = state.size ? `${size.height}px` : '';
+      if (state.size) state.size = size;
+    }
+
+    function appendResizeHandles(doc, panel) {
+      [
+        ['n', 'ns-resize'],
+        ['e', 'ew-resize'],
+        ['s', 'ns-resize'],
+        ['w', 'ew-resize'],
+        ['ne', 'nesw-resize'],
+        ['nw', 'nwse-resize'],
+        ['se', 'nwse-resize'],
+        ['sw', 'nesw-resize'],
+      ].forEach(([edge, cursor]) => {
+        const handle = doc.createElement('div');
+        handle.setAttribute('data-mu-boss-resize', edge);
+        handle.style.position = 'absolute';
+        handle.style.zIndex = '2';
+        handle.style.pointerEvents = 'auto';
+        handle.style.cursor = cursor;
+        handle.style.background = 'transparent';
+        if (edge.indexOf('n') >= 0) handle.style.top = '-4px';
+        if (edge.indexOf('s') >= 0) handle.style.bottom = '-4px';
+        if (edge.indexOf('w') >= 0) handle.style.left = '-4px';
+        if (edge.indexOf('e') >= 0) handle.style.right = '-4px';
+        if (edge === 'n' || edge === 's') {
+          handle.style.left = '10px';
+          handle.style.right = '10px';
+          handle.style.height = '8px';
+        } else if (edge === 'e' || edge === 'w') {
+          handle.style.top = '10px';
+          handle.style.bottom = '10px';
+          handle.style.width = '8px';
+        } else {
+          handle.style.width = '12px';
+          handle.style.height = '12px';
+        }
+        handle.addEventListener('mousedown', (event) => startResizeOverlay(event, edge));
+        panel.appendChild(handle);
+      });
+    }
+
     function startDragOverlay(event) {
       if (!state.overlayEl || event.button !== 0) return;
       if (isConfigInputEvent(event)) return;
+      if (event.target && event.target.getAttribute && event.target.getAttribute('data-mu-boss-resize')) return;
       event.preventDefault();
       const rect = state.overlayEl.getBoundingClientRect();
       state.drag = {
@@ -1035,6 +1120,29 @@
       state.overlayEl.style.top = `${rect.top}px`;
       window.document.addEventListener('mousemove', dragOverlay);
       window.document.addEventListener('mouseup', stopDragOverlay);
+    }
+
+    function startResizeOverlay(event, edge) {
+      if (!state.overlayEl || event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = state.overlayEl.getBoundingClientRect();
+      state.resize = {
+        edge,
+        startX: event.clientX,
+        startY: event.clientY,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      };
+      state.overlayEl.style.right = '';
+      state.overlayEl.style.left = `${Math.round(rect.left)}px`;
+      state.overlayEl.style.top = `${Math.round(rect.top)}px`;
+      state.overlayEl.style.width = `${Math.round(rect.width)}px`;
+      state.overlayEl.style.height = `${Math.round(rect.height)}px`;
+      window.document.addEventListener('mousemove', resizeOverlay);
+      window.document.addEventListener('mouseup', stopResizeOverlay);
     }
 
     function dragOverlay(event) {
@@ -1056,6 +1164,74 @@
       window.document.removeEventListener('mouseup', stopDragOverlay);
     }
 
+    function resizeOverlay(event) {
+      if (!state.resize || !state.overlayEl) return;
+      const next = resizeRectFromPointer(event.clientX, event.clientY, state.resize);
+      state.size = { width: next.width, height: next.height };
+      state.overlayEl.style.left = `${next.left}px`;
+      state.overlayEl.style.top = `${next.top}px`;
+      state.overlayEl.style.width = `${next.width}px`;
+      state.overlayEl.style.height = `${next.height}px`;
+      applyOverlayTypography();
+      applyOverlayBodySizing();
+    }
+
+    function stopResizeOverlay() {
+      if (!state.resize || !state.overlayEl) return;
+      state.resize = null;
+      const rect = state.overlayEl.getBoundingClientRect();
+      state.position = clampPoint(rect.left, rect.top, state.overlayEl);
+      state.size = clampSize({ width: rect.width, height: rect.height }, state.overlayEl);
+      state.overlayEl.style.left = `${state.position.left}px`;
+      state.overlayEl.style.top = `${state.position.top}px`;
+      state.overlayEl.style.width = `${state.size.width}px`;
+      state.overlayEl.style.height = `${state.size.height}px`;
+      writeJson(POSITION_KEY, state.position);
+      writeJson(SIZE_KEY, state.size);
+      applyOverlayTypography();
+      applyOverlayBodySizing();
+      window.document.removeEventListener('mousemove', resizeOverlay);
+      window.document.removeEventListener('mouseup', stopResizeOverlay);
+    }
+
+    function resizeRectFromPointer(clientX, clientY, resize) {
+      const margin = 4;
+      const viewportWidth = Number(window.innerWidth) || 1334;
+      const viewportHeight = Number(window.innerHeight) || 750;
+      const dx = clientX - resize.startX;
+      const dy = clientY - resize.startY;
+      const edge = resize.edge || '';
+      let left = resize.left;
+      let top = resize.top;
+      let width = resize.width;
+      let height = resize.height;
+
+      if (edge.indexOf('w') >= 0) {
+        const right = resize.left + resize.width;
+        left = Math.max(margin, Math.min(resize.left + dx, right - MIN_OVERLAY_WIDTH));
+        width = right - left;
+      } else if (edge.indexOf('e') >= 0) {
+        width = Math.max(MIN_OVERLAY_WIDTH, Math.min(resize.width + dx, viewportWidth - left - margin));
+      }
+
+      if (edge.indexOf('n') >= 0) {
+        const bottom = resize.top + resize.height;
+        top = Math.max(margin, Math.min(resize.top + dy, bottom - MIN_OVERLAY_HEIGHT));
+        height = bottom - top;
+      } else if (edge.indexOf('s') >= 0) {
+        height = Math.max(MIN_OVERLAY_HEIGHT, Math.min(resize.height + dy, viewportHeight - top - margin));
+      }
+
+      width = Math.max(MIN_OVERLAY_WIDTH, Math.min(Math.round(width), viewportWidth - left - margin));
+      height = Math.max(MIN_OVERLAY_HEIGHT, Math.min(Math.round(height), viewportHeight - top - margin));
+      return {
+        left: Math.round(left),
+        top: Math.round(top),
+        width,
+        height,
+      };
+    }
+
     function isConfigInputEvent(event) {
       const target = event && event.target;
       return Boolean(target && state.configEl && containsElement(state.configEl, target));
@@ -1074,13 +1250,23 @@
     }
 
     function clampOverlayToViewport() {
-      if (!state.overlayEl || !state.position) return;
-      const point = clampPoint(state.position.left, state.position.top, state.overlayEl);
-      state.position = point;
-      state.overlayEl.style.left = `${point.left}px`;
-      state.overlayEl.style.top = `${point.top}px`;
-      state.overlayEl.style.right = '';
-      writeJson(POSITION_KEY, state.position);
+      if (!state.overlayEl) return;
+      if (state.size) {
+        state.size = clampSize(state.size, state.overlayEl);
+        state.overlayEl.style.width = `${state.size.width}px`;
+        state.overlayEl.style.height = `${state.size.height}px`;
+        writeJson(SIZE_KEY, state.size);
+      }
+      if (state.position) {
+        const point = clampPoint(state.position.left, state.position.top, state.overlayEl);
+        state.position = point;
+        state.overlayEl.style.left = `${point.left}px`;
+        state.overlayEl.style.top = `${point.top}px`;
+        state.overlayEl.style.right = '';
+        writeJson(POSITION_KEY, state.position);
+      }
+      applyOverlayTypography();
+      applyOverlayBodySizing();
     }
 
     function clampPoint(left, top, el) {
@@ -1095,8 +1281,48 @@
       };
     }
 
+    function clampSize(size, el) {
+      const margin = 4;
+      const currentWidth = Number(el && el.offsetWidth) || DEFAULT_OVERLAY_WIDTH;
+      const currentHeight = Number(el && el.offsetHeight) || DEFAULT_OVERLAY_HEIGHT;
+      const viewportWidth = Number(window.innerWidth) || 1334;
+      const viewportHeight = Number(window.innerHeight) || 750;
+      const rawWidth = Number(size && size.width);
+      const rawHeight = Number(size && size.height);
+      return {
+        width: Math.max(MIN_OVERLAY_WIDTH, Math.min(Math.round(Number.isFinite(rawWidth) ? rawWidth : currentWidth), viewportWidth - margin * 2)),
+        height: Math.max(MIN_OVERLAY_HEIGHT, Math.min(Math.round(Number.isFinite(rawHeight) ? rawHeight : currentHeight), viewportHeight - margin * 2)),
+      };
+    }
+
+    function applyOverlayTypography(panel) {
+      const target = panel || state.overlayEl;
+      if (!target) return;
+      const width = state.size ? state.size.width : DEFAULT_OVERLAY_WIDTH;
+      const height = state.size ? state.size.height : DEFAULT_OVERLAY_HEIGHT;
+      const scale = Math.sqrt(Math.max(0.45, width / DEFAULT_OVERLAY_WIDTH) * Math.max(0.45, height / DEFAULT_OVERLAY_HEIGHT));
+      const fontSize = Math.max(MIN_OVERLAY_FONT_PX, Math.min(MAX_OVERLAY_FONT_PX, Math.round(12 * scale * 10) / 10));
+      target.style.setProperty('--mu-boss-overlay-font-size', `${fontSize}px`);
+      target.style.setProperty('--mu-boss-small-font-size', `${Math.max(9, Math.round(fontSize * 0.92 * 10) / 10)}px`);
+      target.style.setProperty('--mu-boss-button-font-size', `${Math.max(10, Math.round(fontSize * 10) / 10)}px`);
+      target.style.setProperty('--mu-boss-button-height', `${Math.max(20, Math.round(fontSize * 1.85))}px`);
+      target.style.setProperty('--mu-boss-button-line-height', `${Math.max(18, Math.round(fontSize * 1.65))}px`);
+      target.style.setProperty('--mu-boss-close-size', `${Math.max(18, Math.round(fontSize * 1.55))}px`);
+      target.style.setProperty('--mu-boss-close-font-size', `${Math.max(13, Math.round(fontSize * 1.15 * 10) / 10)}px`);
+    }
+
+    function applyOverlayBodySizing() {
+      if (state.overlayEl && state.size) {
+        state.overlayEl.style.height = state.collapsed && !state.resize ? '' : `${state.size.height}px`;
+      }
+      if (!state.bodyEl) return;
+      state.bodyEl.style.maxHeight = state.size ? 'none' : '280px';
+    }
+
     function renderOverlayContent() {
       if (!state.overlayEl || !state.bodyEl || !state.statusEl) return;
+      applyOverlayTypography();
+      applyOverlayBodySizing();
       const toggle = state.overlayEl.querySelector && state.overlayEl.querySelector('button[title="收起/展开"]');
       if (toggle) toggle.textContent = state.collapsed ? '+' : '-';
       renderConfigPanel();
@@ -1188,14 +1414,14 @@
       close.style.position = 'absolute';
       close.style.top = '3px';
       close.style.right = '4px';
-      close.style.width = '18px';
-      close.style.height = '18px';
       close.style.padding = '0';
       close.style.border = '1px solid rgba(255,255,255,0.22)';
       close.style.borderRadius = '3px';
       close.style.background = 'rgba(22,25,30,0.86)';
       close.style.color = '#dce7f6';
-      close.style.font = '14px/16px Arial, sans-serif';
+      close.style.width = 'var(--mu-boss-close-size, 18px)';
+      close.style.height = 'var(--mu-boss-close-size, 18px)';
+      close.style.font = 'var(--mu-boss-close-font-size, 14px)/calc(var(--mu-boss-close-size, 18px) - 2px) Arial, sans-serif';
       close.style.cursor = 'pointer';
       close.addEventListener('click', (event) => {
         event.preventDefault();
@@ -1251,7 +1477,7 @@
       textarea.style.borderRadius = '4px';
       textarea.style.background = 'rgba(0,0,0,0.35)';
       textarea.style.color = '#f3f7ff';
-      textarea.style.font = '12px/1.35 Arial, sans-serif';
+      textarea.style.font = 'var(--mu-boss-overlay-font-size, 12px)/1.35 Arial, sans-serif';
       textarea.style.padding = '5px';
       textarea.style.userSelect = 'text';
       textarea.style.webkitUserSelect = 'text';
@@ -1269,7 +1495,7 @@
       hint.textContent = '支持换行、逗号、分号分隔；清空后暂停新增。';
       hint.style.marginTop = '4px';
       hint.style.color = '#9fb0c4';
-      hint.style.fontSize = '11px';
+      hint.style.fontSize = 'var(--mu-boss-small-font-size, 11px)';
       panel.appendChild(hint);
 
       const actions = window.document.createElement('div');
@@ -1396,7 +1622,7 @@
       button.style.borderRadius = '4px';
       button.style.background = background;
       button.style.color = '#fff';
-      button.style.font = '11px/1.3 Arial, sans-serif';
+      button.style.font = 'var(--mu-boss-small-font-size, 11px)/1.3 Arial, sans-serif';
       button.style.cursor = 'pointer';
       button.addEventListener('click', onClick);
       return button;
@@ -1415,14 +1641,14 @@
     }
 
     function styleSmallButton(button) {
-      button.style.width = '24px';
-      button.style.height = '22px';
+      button.style.width = 'calc(var(--mu-boss-button-height, 22px) + 2px)';
+      button.style.height = 'var(--mu-boss-button-height, 22px)';
       button.style.padding = '0';
       button.style.border = '1px solid rgba(255,255,255,0.28)';
       button.style.borderRadius = '4px';
       button.style.background = 'rgba(38,42,50,0.92)';
       button.style.color = '#fff';
-      button.style.font = '12px/20px Arial, sans-serif';
+      button.style.font = 'var(--mu-boss-button-font-size, 12px)/var(--mu-boss-button-line-height, 20px) Arial, sans-serif';
       button.style.cursor = 'pointer';
     }
 
@@ -1761,6 +1987,18 @@
       const top = Number(value.top);
       if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
       return { left, top };
+    }
+
+    function readSize() {
+      const value = readJson(SIZE_KEY, null);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const width = Number(value.width);
+      const height = Number(value.height);
+      if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+      return {
+        width: Math.max(MIN_OVERLAY_WIDTH, Math.round(width)),
+        height: Math.max(MIN_OVERLAY_HEIGHT, Math.round(height)),
+      };
     }
 
     function writeBool(key, value) {
