@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.2.0
+// @version      0.2.1
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -18,7 +18,7 @@
   const injected = function () {
     'use strict';
 
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
@@ -214,8 +214,11 @@
       state.scanCount += 1;
       state.lastScanAt = Date.now();
       const context = readContext();
+      const trialTaskbarOnly = isTrialLandMap(context.mapName);
+      const taskbarCandidates = scanTrialTaskbarCountdowns(context);
+      if (trialTaskbarOnly) removeTrialNonTaskbarRecords();
       const candidates = annotateCountdownObservations(
-        scanSceneCountdowns().concat(scanTrialTaskbarCountdowns(context)),
+        trialTaskbarOnly ? taskbarCandidates : scanSceneCountdowns().concat(taskbarCandidates),
       );
       state.lastDetected = candidates.map((item) => ({
         text: item.text,
@@ -248,6 +251,12 @@
       persistRecords();
       state.lastScanReason = `recorded ${records.length}`;
       return clone(records);
+    }
+
+    function removeTrialNonTaskbarRecords() {
+      state.records = state.records.filter((record) => (
+        !isTrialLandMap(record && record.mapName) || isTrialTaskbarRecord(record)
+      ));
     }
 
     function readContext() {
