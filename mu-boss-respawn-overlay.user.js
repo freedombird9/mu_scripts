@@ -1646,7 +1646,15 @@
       head.style.minWidth = '0';
 
       const title = doc.createElement('div');
-      title.textContent = record.bossName || '未知BOSS';
+      const direction = bossDirectionLabel(record, state.mapBossMarkers);
+      if (direction) {
+        const directionEl = doc.createElement('span');
+        directionEl.textContent = `${direction} · `;
+        directionEl.style.color = '#62b8ff';
+        directionEl.style.fontWeight = '700';
+        title.appendChild(directionEl);
+      }
+      title.appendChild(doc.createTextNode(record.bossName || '未知BOSS'));
       title.style.fontWeight = '700';
       title.style.color = isNewHighlight ? '#e8fcff' : (soon ? '#fff0a8' : '#ffffff');
       title.style.whiteSpace = 'nowrap';
@@ -2151,6 +2159,39 @@
     function normalizeBossCoordinate(value) {
       const match = cleanText(value).match(/^(\d{1,4})\s*(?:#|,|，)\s*(\d{1,4})$/);
       return match ? `${Number(match[1])},${Number(match[2])}` : '';
+    }
+
+    function parseBossCoordinate(value) {
+      const coordinate = normalizeBossCoordinate(value);
+      if (!coordinate) return null;
+      const [x, y] = coordinate.split(',').map(Number);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y, coordinate } : null;
+    }
+
+    function bossDirectionLabel(record, markers) {
+      const mapName = cleanText(record && record.mapName);
+      const bossName = cleanText(record && record.bossName);
+      const current = parseBossCoordinate(record && record.bossCoordinate);
+      if (!mapName || !bossName || !current) return '';
+
+      const seen = {};
+      const sameBosses = (markers || []).filter((marker) => {
+        const coordinate = normalizeBossCoordinate(marker && marker.coordinate);
+        if (cleanText(marker && marker.mapName) !== mapName || cleanText(marker && marker.name) !== bossName) return false;
+        if (!coordinate || seen[coordinate]) return false;
+        seen[coordinate] = true;
+        return true;
+      }).map((marker) => parseBossCoordinate(marker.coordinate));
+      if (sameBosses.length !== 2) return '';
+
+      if (!sameBosses.some((item) => item.coordinate === current.coordinate)) return '';
+      const other = sameBosses.find((item) => item.coordinate !== current.coordinate);
+      if (!other) return '';
+      const deltaX = other.x - current.x;
+      const deltaY = other.y - current.y;
+      if (deltaX === 0 && deltaY === 0) return '';
+      if (Math.abs(deltaX) >= Math.abs(deltaY)) return deltaX > 0 ? '左' : '右';
+      return deltaY > 0 ? '下' : '上';
     }
 
     function coordinateDistance(left, right) {
