@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.1.18
+// @version      0.2.0
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -18,7 +18,7 @@
   const injected = function () {
     'use strict';
 
-    const VERSION = '0.1.18';
+    const VERSION = '0.2.0';
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
@@ -28,7 +28,9 @@
     const HIGHLIGHT_SECONDS = 90;
     const NEW_RECORD_HIGHLIGHT_MS = 5000;
     const MERGE_REFRESH_WINDOW_MS = 15000;
-    const RECENT_BOSS_NAME_TTL_MS = 10000;
+    const REFRESH_RECONCILE_WINDOW_MS = 3000;
+    const RECENT_BOSS_NAME_TTL_MS = 4000;
+    const COUNTDOWN_SOURCE_GAP_MS = 1600;
     const EXPIRED_KEEP_MS = 30000;
     const MAX_RECORDS = 40;
     const DEFAULT_OVERLAY_WIDTH = 292;
@@ -73,6 +75,8 @@
       scanCount: 0,
       lastDetected: [],
       recentBossName: null,
+      mapBossMarkers: [],
+      countdownSources: {},
       dismissedRecords: {},
       newRecordHighlights: {},
     };
@@ -140,6 +144,7 @@
           records: state.records.length,
           lastDetected: clone(state.lastDetected),
           recentBossName: state.recentBossName ? { ...state.recentBossName } : null,
+          mapBossMarkers: clone(state.mapBossMarkers),
         };
       },
       resetPosition() {
@@ -209,7 +214,9 @@
       state.scanCount += 1;
       state.lastScanAt = Date.now();
       const context = readContext();
-      const candidates = scanSceneCountdowns().concat(scanTrialTaskbarCountdowns(context));
+      const candidates = annotateCountdownObservations(
+        scanSceneCountdowns().concat(scanTrialTaskbarCountdowns(context)),
+      );
       state.lastDetected = candidates.map((item) => ({
         text: item.text,
         seconds: item.seconds,
@@ -246,9 +253,14 @@
     function readContext() {
       const bot = readBotSnapshot();
       const fgui = readFguiContext();
+      const mapName = cleanText(bot.scene.mapName || fgui.mapName || '');
+      const visibleMapBossMarkers = readMapBossMarkers(mapName);
+      if (visibleMapBossMarkers.length) state.mapBossMarkers = visibleMapBossMarkers;
+      const mapBossMarkers = state.mapBossMarkers.filter((marker) => (
+        !mapName || !marker.mapName || marker.mapName === mapName
+      ));
       const reliableBossName = cleanText(bot.combat.targetName || fgui.targetName || '');
       const bossNameSource = bot.combat.targetName ? 'muBossBot.combat' : (fgui.targetName ? 'fgui.combat' : '');
-      const mapName = cleanText(bot.scene.mapName || fgui.mapName || '');
       if (reliableBossName) {
         state.recentBossName = {
           name: reliableBossName,
@@ -268,7 +280,31 @@
         bossNameSource: reliableBossName ? bossNameSource : (recent ? `recent.${recent.source}` : 'unknown'),
         mapName,
         mapSource: bot.scene.mapName ? 'muBossBot.scene' : (fgui.mapName ? 'fgui' : 'unknown'),
+        playerCoordinate: normalizeBossCoordinate(fgui.coordinates),
+        mapBossMarkers,
+        combatTargetVisible: Boolean(reliableBossName),
+        recentBossAgeMs: recent ? Date.now() - Number(recent.at) : null,
       };
+    }
+
+    function annotateCountdownObservations(candidates) {
+      const now = Date.now();
+      const result = (candidates || []).map((candidate) => {
+        const key = [cleanText(candidate.source), cleanText(candidate.sourcePath)].join('|');
+        const previous = state.countdownSources[key];
+        const isNewObservation = !previous || now - Number(previous.seenAt) > COUNTDOWN_SOURCE_GAP_MS;
+        state.countdownSources[key] = {
+          seenAt: now,
+          seconds: Number(candidate.seconds) || 0,
+        };
+        return { ...candidate, isNewObservation };
+      });
+      Object.keys(state.countdownSources).forEach((key) => {
+        if (now - Number(state.countdownSources[key].seenAt) > COUNTDOWN_SOURCE_GAP_MS) {
+          delete state.countdownSources[key];
+        }
+      });
+      return result;
     }
 
     function readBotSnapshot() {
@@ -278,6 +314,13 @@
           return {
             scene: snapshot.scene || {},
             combat: snapshot.combat || {},
+          };
+        }
+        if (window.__muBossObserver && typeof window.__muBossObserver.scan === 'function') {
+          const snapshot = window.__muBossObserver.scan() || {};
+          return {
+            scene: { mapName: cleanText(snapshot.scene && snapshot.scene.currentMap) },
+            combat: { targetName: cleanText(snapshot.combat && snapshot.combat.parsedTarget && snapshot.combat.parsedTarget.name) },
           };
         }
       } catch (_) {
@@ -294,7 +337,8 @@
       };
       const root = window.fgui && window.fgui.GRoot && window.fgui.GRoot.inst;
       if (!root) return out;
-      walkFgui(root, (node, effectiveVisible) => {
+      const targetCandidates = [];
+      walkFgui(root, (node, effectiveVisible, path) => {
         const nodeText = firstCleanText(
           safeString(() => node.text),
           safeString(() => node.title)
@@ -304,11 +348,93 @@
         if (!effectiveVisible && nodeName !== 'mapName') return;
         const text = cleanText([nodeText, nodeName].filter(Boolean).join(' '));
         if (!text) return;
-        if (!out.targetName && /Lv\s*\d+/.test(text)) out.targetName = extractBossName(text);
-        if (!out.coordinates) out.coordinates = normalizeCoordinate(text);
+        if (/Lv\s*\d+/i.test(text)) {
+          const targetName = extractCombatTargetName(text);
+          const rect = fguiRect(node);
+          if (targetName && isLikelyCombatTarget(path, rect, text)) {
+            targetCandidates.push({
+              name: targetName,
+              score: scoreCombatTarget(path, rect, text),
+            });
+          }
+        }
+        const coordinate = normalizeCoordinate(text);
+        if (!out.coordinates && coordinate && isLikelyPlayerCoordinate(path, nodeName, fguiRect(node))) {
+          out.coordinates = coordinate;
+        }
         if (!out.mapName) out.mapName = normalizeMapName(text, '');
       }, true, 0);
+      targetCandidates.sort((a, b) => b.score - a.score || b.name.length - a.name.length);
+      if (targetCandidates[0]) out.targetName = targetCandidates[0].name;
       return out;
+    }
+
+    function readMapBossMarkers(mapName) {
+      const root = window.fgui && window.fgui.GRoot && window.fgui.GRoot.inst;
+      if (!root) return [];
+      const maps = [];
+      walkFgui(root, (node, effectiveVisible) => {
+        if (!effectiveVisible || cleanText(safeString(() => node.name)) !== 'Main_MapDetailUI') return;
+        const entries = safeMapEntries(node.spmonsterList);
+        entries.forEach(([coordinate, value]) => {
+          const point = normalizeBossCoordinate(coordinate);
+          const marker = Array.isArray(value) ? value[0] : null;
+          const monsterId = Array.isArray(value) ? Number(value[1]) || 0 : 0;
+          const name = cleanText(safeString(() => marker && marker.title));
+          const icon = cleanText(safeString(() => marker && marker.icon));
+          if (!point || !name || !/ico_boss/i.test(icon)) return;
+          maps.push({
+            name,
+            coordinate: point,
+            monsterId,
+            mapName: cleanText(mapName),
+            source: 'fgui.map_marker',
+            seenAt: Date.now(),
+          });
+        });
+      }, true, 0);
+      return uniqueMapBossMarkers(maps);
+    }
+
+    function safeMapEntries(value) {
+      try {
+        return value && typeof value.forEach === 'function'
+          ? Array.from(value.entries ? value.entries() : [])
+          : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function uniqueMapBossMarkers(markers) {
+      const seen = {};
+      return (markers || []).filter((marker) => {
+        const key = [marker.mapName, marker.coordinate, marker.name, marker.monsterId].join('|');
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+      });
+    }
+
+    function isLikelyCombatTarget(path, rect, text) {
+      if (/\d+级怪物|经验|任务|地图|怪点/.test(cleanText(text))) return false;
+      if (!rect || rect.y > 210 || rect.x < 180 || rect.x > 980) return false;
+      return /boss|target|hp|fight|role/i.test(cleanText(path)) || rect.y <= 140;
+    }
+
+    function scoreCombatTarget(path, rect, text) {
+      let score = 0;
+      if (/Lv\s*\d+/i.test(text)) score += 80;
+      if (/\d+%/.test(text)) score += 25;
+      if (/boss|target|hp/i.test(cleanText(path))) score += 40;
+      if (rect.y <= 140) score += 25;
+      score -= Math.abs(rect.x - 570) / 20;
+      return score;
+    }
+
+    function isLikelyPlayerCoordinate(path, nodeName, rect) {
+      if (/coord|position|pos|map/i.test(cleanText(path)) || /coord|position|pos/i.test(cleanText(nodeName))) return true;
+      return Boolean(rect && rect.x >= 760 && rect.y <= 190);
     }
 
     function scanSceneCountdowns() {
@@ -487,20 +613,39 @@
     function recordFromCandidate(candidate, context) {
       const observedAt = Date.now();
       const refreshAt = observedAt + candidate.seconds * 1000;
-      const bossName = candidate.bossName || context.bossName || '未知BOSS';
-      const mapName = candidate.mapName || (isExplicitBossSource(candidate) ? '' : context.mapName);
-      const bossNameSource = candidate.bossNameSource || context.bossNameSource;
+      const detectedName = candidate.bossName || (canAttributeRecentCombat(candidate, context) ? context.bossName : '');
+      const mapMarker = chooseMapBossMarker(context, detectedName);
+      const initialMapName = candidate.mapName || (mapMarker && mapMarker.mapName) || (isExplicitBossSource(candidate) ? '' : context.mapName);
+      const reconciledRecord = mapMarker ? null : findUniqueRecordByRefresh({
+        mapName: initialMapName,
+        bossName: detectedName,
+        refreshAt,
+      });
+      const bossName = cleanText(mapMarker && mapMarker.name)
+        || cleanText(reconciledRecord && reconciledRecord.bossName)
+        || detectedName
+        || '未知BOSS';
+      const mapName = initialMapName || cleanText(reconciledRecord && reconciledRecord.mapName);
+      const bossNameSource = (mapMarker ? mapMarker.source : '')
+        || candidate.bossNameSource
+        || (reconciledRecord ? 'record.refresh_reconcile' : context.bossNameSource);
       const mapSource = candidate.mapName ? candidate.mapSource : (isExplicitBossSource(candidate) ? 'unknown' : context.mapSource);
       if (bossName === '未知BOSS' && !configuredCandidates().length) return null;
-      const confidence = Math.max(scoreRecordConfidence(candidate, { ...context, bossName, mapName }), Number(candidate.confidence) || 0);
+      const confidence = Math.max(
+        scoreRecordConfidence(candidate, { ...context, bossName, mapName, mapMarker }),
+        Number(candidate.confidence) || 0,
+      );
       if (confidence < 0.45) return null;
       const detectedBossName = bossName !== '未知BOSS' ? bossName : '';
       const taskbarBossNameConfirmed = isExplicitBossSource(candidate) && detectedBossName;
-      const autoNameConfirmed = taskbarBossNameConfirmed || shouldAutoConfirmNameChoice(bossName);
+      const mapMarkerNameConfirmed = Boolean(mapMarker && detectedBossName);
+      const autoNameConfirmed = taskbarBossNameConfirmed || mapMarkerNameConfirmed || shouldAutoConfirmNameChoice(bossName);
       const record = {
         id: recordKey({
           bossName,
           mapName,
+          bossCoordinate: (mapMarker && mapMarker.coordinate) || (reconciledRecord && reconciledRecord.bossCoordinate),
+          monsterId: (mapMarker && mapMarker.monsterId) || (reconciledRecord && reconciledRecord.monsterId),
           refreshAt,
         }),
         bossName,
@@ -510,6 +655,8 @@
         nameChoice: autoNameConfirmed ? 'auto' : '',
         mapName,
         mapSource,
+        bossCoordinate: cleanText((mapMarker && mapMarker.coordinate) || (reconciledRecord && reconciledRecord.bossCoordinate)),
+        monsterId: Number((mapMarker && mapMarker.monsterId) || (reconciledRecord && reconciledRecord.monsterId)) || 0,
         countdownText: candidate.text,
         detectedSeconds: candidate.seconds,
         observedAt,
@@ -527,13 +674,59 @@
       let score = 0;
       if (context.bossName) score += 0.35;
       if (context.mapName) score += 0.15;
+      if (context.mapMarker) score += 0.45;
       if (candidate.score >= 200) score += 0.25;
       if (candidate.score >= 120) score += 0.1;
       if (candidate.score >= 300) score += 0.2;
       return Math.min(1, score);
     }
 
+    function chooseMapBossMarker(context, detectedName) {
+      const markers = (context && context.mapBossMarkers) || [];
+      if (!markers.length) return null;
+      const name = cleanText(detectedName);
+      const named = name
+        ? markers.filter((marker) => cleanText(marker.name) === name)
+        : markers.slice();
+      if (!named.length) return null;
+      if (named.length === 1) return named[0];
+      const playerCoordinate = normalizeBossCoordinate(context && context.playerCoordinate);
+      if (!playerCoordinate) return null;
+      const near = named
+        .map((marker) => ({ marker, distance: coordinateDistance(playerCoordinate, marker.coordinate) }))
+        .filter((item) => Number.isFinite(item.distance))
+        .sort((a, b) => a.distance - b.distance);
+      if (!near[0] || near[0].distance > 24) return null;
+      if (near[1] && near[1].distance === near[0].distance) return null;
+      return near[0].marker;
+    }
+
+    function canAttributeRecentCombat(candidate, context) {
+      if (!candidate || !candidate.isNewObservation || !context || context.combatTargetVisible) return false;
+      const source = cleanText(context.bossNameSource);
+      return /^recent\./.test(source)
+        && Number(context.recentBossAgeMs) >= 0
+        && Number(context.recentBossAgeMs) <= RECENT_BOSS_NAME_TTL_MS;
+    }
+
+    function findUniqueRecordByRefresh(input) {
+      const mapName = cleanText(input && input.mapName);
+      if (!mapName) return null;
+      const probe = {
+        bossName: cleanText(input && input.bossName) || '未知BOSS',
+        detectedBossName: cleanText(input && input.bossName),
+      };
+      const matches = state.records.filter((record) => (
+        cleanText(record && record.mapName) === mapName
+        && recordNamesMergeable(record, probe)
+        && Number(record && record.refreshAt) > Date.now() - EXPIRED_KEEP_MS
+        && Math.abs(Number(record && record.refreshAt) - Number(input && input.refreshAt)) <= REFRESH_RECONCILE_WINDOW_MS
+      ));
+      return matches.length === 1 ? matches[0] : null;
+    }
+
     function upsertRecord(next) {
+      discardSupersededCountdownGuesses(next);
       const existingIndex = findMergeableRecordIndex(next, state.records);
       if (existingIndex >= 0) {
         const prev = state.records[existingIndex];
@@ -549,6 +742,8 @@
           nameChoice: prev.nameChoiceConfirmed ? prev.nameChoice : next.nameChoice,
           mapName: chooseBetterText(prev.mapName, next.mapName, '未知地图'),
           mapSource: next.mapName ? next.mapSource : prev.mapSource,
+          bossCoordinate: chooseBetterCoordinate(prev.bossCoordinate, next.bossCoordinate),
+          monsterId: chooseBetterMonsterId(prev.monsterId, next.monsterId),
           firstObservedAt: prev.firstObservedAt || prev.observedAt || next.observedAt,
           countdownText: preferred.countdownText,
           detectedSeconds: preferred.detectedSeconds,
@@ -571,6 +766,23 @@
       if (state.records.length > MAX_RECORDS) state.records = state.records.slice(0, MAX_RECORDS);
     }
 
+    function discardSupersededCountdownGuesses(next) {
+      if (!next || !normalizeBossCoordinate(next.bossCoordinate)) return;
+      const nextMap = cleanText(next.mapName);
+      const nextPath = cleanText(next.sourcePath);
+      if (!nextMap || !nextPath) return;
+      state.records = state.records.filter((record) => {
+        const staleGuess = !normalizeBossCoordinate(record && record.bossCoordinate)
+          && /^recent\.|^unknown$/.test(cleanText(record && record.bossNameSource));
+        const sameObservation = cleanText(record && record.mapName) === nextMap
+          && cleanText(record && record.sourcePath) === nextPath
+          && Math.abs(Number(record && record.refreshAt) - Number(next.refreshAt)) <= REFRESH_RECONCILE_WINDOW_MS;
+        const conflictingName = cleanText(record && record.bossName)
+          && cleanText(record && record.bossName) !== cleanText(next.bossName);
+        return !(staleGuess && sameObservation && conflictingName);
+      });
+    }
+
     function pruneRecords() {
       const now = Date.now();
       pruneNewRecordHighlights(now);
@@ -591,6 +803,8 @@
               nameChoice: prev.nameChoiceConfirmed ? prev.nameChoice : item.nameChoice,
               mapName: chooseBetterText(prev.mapName, item.mapName, '未知地图'),
               mapSource: item.mapName ? item.mapSource : prev.mapSource,
+              bossCoordinate: chooseBetterCoordinate(prev.bossCoordinate, item.bossCoordinate),
+              monsterId: chooseBetterMonsterId(prev.monsterId, item.monsterId),
               countdownText: preferred.countdownText,
               detectedSeconds: preferred.detectedSeconds,
               observedAt: preferred.observedAt,
@@ -616,6 +830,9 @@
     function recordKey(input) {
       const name = cleanText(input.bossName || '未知BOSS');
       const map = cleanText(input.mapName || '');
+      const coordinate = normalizeBossCoordinate(input.bossCoordinate);
+      const monsterId = Number(input.monsterId) || 0;
+      if (map && coordinate && name) return [map, coordinate, name, monsterId].join('|');
       const refreshAt = Number(input.refreshAt);
       const bucket = Number.isFinite(refreshAt) ? Math.round(refreshAt / MERGE_REFRESH_WINDOW_MS) : '';
       if (name || map || bucket) return [name, map, bucket].join('|');
@@ -631,8 +848,20 @@
       if (!recordNamesMergeable(left, right)) return false;
       if (!mapsMergeable(left.mapName, right.mapName)) return false;
       if (sameTrialTaskbarBossRecord(left, right)) return true;
-      if (Number(left.refreshAt) <= Date.now() && Number(right.refreshAt) > Date.now()) return true;
-      return Math.abs(Number(left.refreshAt) - Number(right.refreshAt)) <= MERGE_REFRESH_WINDOW_MS;
+      const leftCoordinate = normalizeBossCoordinate(left.bossCoordinate);
+      const rightCoordinate = normalizeBossCoordinate(right.bossCoordinate);
+      if (leftCoordinate && rightCoordinate) return leftCoordinate === rightCoordinate;
+      return sameCountdownSource(left, right) && withinRefreshWindow(left, right);
+    }
+
+    function sameCountdownSource(left, right) {
+      const a = cleanText(left && left.sourcePath);
+      const b = cleanText(right && right.sourcePath);
+      return Boolean(a && b && a === b);
+    }
+
+    function withinRefreshWindow(left, right) {
+      return Math.abs(Number(left && left.refreshAt) - Number(right && right.refreshAt)) <= MERGE_REFRESH_WINDOW_MS;
     }
 
     function sameTrialTaskbarBossRecord(left, right) {
@@ -698,6 +927,14 @@
     function chooseMergedBossNameSource(previous, next) {
       if (previous && previous.nameChoiceConfirmed && cleanText(previous.bossNameSource)) return cleanText(previous.bossNameSource);
       return next && next.bossName && next.bossName !== '未知BOSS' ? next.bossNameSource : previous && previous.bossNameSource;
+    }
+
+    function chooseBetterCoordinate(previous, next) {
+      return normalizeBossCoordinate(next) || normalizeBossCoordinate(previous);
+    }
+
+    function chooseBetterMonsterId(previous, next) {
+      return Number(next) || Number(previous) || 0;
     }
 
     function defaultConfig() {
@@ -787,7 +1024,13 @@
       const previous = state.records[index];
       if (!previous) return null;
       const previousKey = cleanText(previous.id);
-      const nextKey = recordKey({ bossName: targetName, mapName: previous.mapName, refreshAt: previous.refreshAt });
+      const nextKey = recordKey({
+        bossName: targetName,
+        mapName: previous.mapName,
+        bossCoordinate: previous.bossCoordinate,
+        monsterId: previous.monsterId,
+        refreshAt: previous.refreshAt,
+      });
       const highlightUntil = previousKey ? Number(state.newRecordHighlights[previousKey]) || 0 : 0;
       const previousSource = cleanText(previous.bossNameSource);
       const detectedBossName = cleanText(previous.detectedBossName)
@@ -831,9 +1074,9 @@
       const expiresAt = refreshAt + EXPIRED_KEEP_MS;
       [
         cleanText(record.id),
-        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt: refreshAt - MERGE_REFRESH_WINDOW_MS }),
-        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt }),
-        recordKey({ bossName: record.bossName, mapName: record.mapName, refreshAt: refreshAt + MERGE_REFRESH_WINDOW_MS }),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, bossCoordinate: record.bossCoordinate, monsterId: record.monsterId, refreshAt: refreshAt - MERGE_REFRESH_WINDOW_MS }),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, bossCoordinate: record.bossCoordinate, monsterId: record.monsterId, refreshAt }),
+        recordKey({ bossName: record.bossName, mapName: record.mapName, bossCoordinate: record.bossCoordinate, monsterId: record.monsterId, refreshAt: refreshAt + MERGE_REFRESH_WINDOW_MS }),
       ].forEach((key) => {
         if (key) state.dismissedRecords[key] = expiresAt;
       });
@@ -1398,7 +1641,9 @@
       title.style.flex = '1 1 auto';
 
       const place = doc.createElement('div');
-      place.textContent = record.mapName || '未知地图';
+      place.textContent = [record.mapName || '未知地图', record.bossCoordinate ? `(${record.bossCoordinate})` : '']
+        .filter(Boolean)
+        .join(' ');
       place.style.color = '#cbd7e6';
       place.style.whiteSpace = 'nowrap';
       place.style.overflow = 'hidden';
@@ -1714,6 +1959,17 @@
       return names.find((name) => value.includes(name)) || '';
     }
 
+    function extractCombatTargetName(text) {
+      const value = cleanText(text);
+      const lvIndex = value.search(/\bLv\s*\d+/i);
+      if (lvIndex < 0) return '';
+      const beforeLevel = value.slice(0, lvIndex)
+        .replace(/(?:BOSS|目标|怪物|名称)\s*[:：]?/ig, ' ')
+        .trim();
+      const chunks = beforeLevel.match(/[\u4e00-\u9fa5]{2,18}/g) || [];
+      return cleanText(chunks[chunks.length - 1] || extractBossName(value));
+    }
+
     function extractTaskbarBossName(text) {
       const value = cleanText(text);
       if (!value) return '';
@@ -1873,8 +2129,20 @@
     }
 
     function normalizeCoordinate(text) {
-      const match = cleanText(text).match(/(\d{1,3}),\s*(\d{1,3})/);
+      const match = cleanText(text).match(/(\d{1,4})\s*[,，]\s*(\d{1,4})/);
       return match ? `${match[1]},${match[2]}` : '';
+    }
+
+    function normalizeBossCoordinate(value) {
+      const match = cleanText(value).match(/^(\d{1,4})\s*(?:#|,|，)\s*(\d{1,4})$/);
+      return match ? `${Number(match[1])},${Number(match[2])}` : '';
+    }
+
+    function coordinateDistance(left, right) {
+      const a = normalizeBossCoordinate(left).split(',').map(Number);
+      const b = normalizeBossCoordinate(right).split(',').map(Number);
+      if (a.length !== 2 || b.length !== 2 || a.some((value) => !Number.isFinite(value)) || b.some((value) => !Number.isFinite(value))) return NaN;
+      return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
     }
 
     function normalizeMapName(text, nodeName) {
@@ -1920,6 +2188,8 @@
             id: cleanText(item.id) || recordKey({
               bossName,
               mapName: item.mapName,
+              bossCoordinate: item.bossCoordinate,
+              monsterId: item.monsterId,
               refreshAt,
             }),
             bossName,
@@ -1929,6 +2199,8 @@
             nameChoice: cleanText(item.nameChoice) || (nameChoiceConfirmed ? 'auto' : ''),
             mapName: cleanText(item.mapName),
             mapSource: cleanText(item.mapSource),
+            bossCoordinate: normalizeBossCoordinate(item.bossCoordinate),
+            monsterId: Number(item.monsterId) || 0,
             countdownText: cleanText(item.countdownText),
             detectedSeconds: Number(item.detectedSeconds) || null,
             observedAt: Number(item.observedAt) || Date.now(),
