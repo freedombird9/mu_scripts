@@ -338,16 +338,21 @@
       const root = window.fgui && window.fgui.GRoot && window.fgui.GRoot.inst;
       if (!root) return out;
       const targetCandidates = [];
+      const mapCandidates = [];
       walkFgui(root, (node, effectiveVisible, path) => {
         const nodeText = firstCleanText(
           safeString(() => node.text),
           safeString(() => node.title)
         );
         const nodeName = cleanText(safeString(() => node.name));
-        if (!out.mapName && nodeName === 'mapName') out.mapName = normalizeMapName(nodeText, nodeName);
         if (!effectiveVisible && nodeName !== 'mapName') return;
         const text = cleanText([nodeText, nodeName].filter(Boolean).join(' '));
         if (!text) return;
+        const mapName = normalizeMapName(nodeText, nodeName);
+        if (mapName) mapCandidates.push({
+          name: mapName,
+          score: scoreMapNameCandidate(nodeName, fguiRect(node), path),
+        });
         if (/Lv\s*\d+/i.test(text)) {
           const targetName = extractCombatTargetName(text);
           const rect = fguiRect(node);
@@ -362,11 +367,21 @@
         if (!out.coordinates && coordinate && isLikelyPlayerCoordinate(path, nodeName, fguiRect(node))) {
           out.coordinates = coordinate;
         }
-        if (!out.mapName) out.mapName = normalizeMapName(text, '');
       }, true, 0);
       targetCandidates.sort((a, b) => b.score - a.score || b.name.length - a.name.length);
       if (targetCandidates[0]) out.targetName = targetCandidates[0].name;
+      mapCandidates.sort((a, b) => b.score - a.score || a.name.length - b.name.length);
+      if (mapCandidates[0]) out.mapName = mapCandidates[0].name;
       return out;
+    }
+
+    function scoreMapNameCandidate(nodeName, rect, path) {
+      let score = 0;
+      if (nodeName === 'mapName') score += 1000;
+      if (/miniMap|MainWnd|mapName/i.test(cleanText(path))) score += 180;
+      if (rect && rect.x >= 980 && rect.y <= 150) score += 160;
+      if (rect && rect.x >= 700 && rect.y <= 220) score += 30;
+      return score;
     }
 
     function readMapBossMarkers(mapName) {
@@ -476,7 +491,7 @@
           score,
         });
       }, 'laya.stage', true, [], 0);
-      return candidates.sort((a, b) => b.score - a.score || a.seconds - b.seconds).slice(0, 3);
+      return candidates.sort((a, b) => b.score - a.score || a.seconds - b.seconds).slice(0, 1);
     }
 
     function scanTrialTaskbarCountdowns(context) {
@@ -2146,7 +2161,10 @@
     }
 
     function normalizeMapName(text, nodeName) {
-      const raw = cleanText(text).replace(/\bmapName\b/ig, '').trim();
+      const raw = cleanText(text)
+        .replace(/\bmapName\b/ig, '')
+        .replace(/\s*\d+线\s*$/, '')
+        .trim();
       if (!raw || normalizeCoordinate(raw)) return '';
       if (cleanText(nodeName) === 'mapName') return raw.slice(0, 18);
       if (!/^[\u4e00-\u9fa5A-Za-z0-9]{2,18}$/.test(raw)) return '';
