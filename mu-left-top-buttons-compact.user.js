@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 左上按钮 + 右下弹窗缩小
 // @namespace    codex.mu.ui.left-top-compact
-// @version      0.4.0
-// @description  缩小左上”升级”/”送大天使”/”限时活动”按钮(0.5)和右下”立即使用”弹窗(0.7，右下角锚定)。
+// @version      0.6.1
+// @description  缩小左上”升级”/”送大天使”/”限时活动”按钮(0.5)；右下”立即使用”卡片仅显示火龙鳞片/火龙之心(0.7，右下角锚定)。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -37,18 +37,29 @@
       tipsView: {
         packageItemName: 'TipsViewWnd',
         scale: 0.7, // 比 0.5 大一点，避免文字看不清
+        allowedItems: [
+          { id: 54010101, name: '火龙鳞片' },
+          { id: 54010201, name: '火龙之心' },
+        ],
+        autoCloseCooldownMs: 500,
       },
     };
 
     const state = {
       compacted: new WeakSet(),
       original: new WeakMap(),
+      lastTipsAutoCloseAt: 0,
+      lastTipsAutoCloseKey: '',
       lastLogAt: 0,
       lastSummary: '',
       status: {
-        version: '0.4.0',
+        version: '0.6.1',
         applyCount: 0,
         lastMatched: [],
+        lastTipsItem: '',
+        lastTipsAllowedItem: '',
+        lastTipsAllowedItemId: 0,
+        lastTipsDecision: 'waiting for tips view',
         lastReason: 'waiting for fgui',
       },
     };
@@ -60,6 +71,7 @@
       scan,
       applyOnce,
       restoreAll,
+      inspectTipsView,
     };
 
     function log(...args) {
@@ -252,10 +264,10 @@
       // 右下"立即使用"弹窗：每次都重新检查（弹窗可能动态切换物品/重建）
       const tips = findTipsView();
       if (tips) {
-        compactTipsView(tips);
+        const showTips = updateTipsView(tips);
         state.status.lastReason = targets.length
-          ? 'compacted left top buttons + tips view'
-          : 'compacted tips view';
+          ? (showTips ? 'compacted left top buttons + allowed tips view' : 'compacted left top buttons + closed non-allowed tips view')
+          : (showTips ? 'compacted allowed tips view' : 'closed non-allowed tips view');
       }
 
       return targets.length > 0 || !!tips;
@@ -280,6 +292,91 @@
         return null;
       }
       return walk(gRoot, 0);
+    }
+
+    function normalizeTipsText(value) {
+      return String(value || '')
+        .replace(/\[[^\]]*]/g, '')
+        .replace(/\s+/g, '')
+        .trim();
+    }
+
+    function describeTipsItem(node) {
+      return deepText(node).replace(/\s+/g, ' ').trim().slice(0, 240);
+    }
+
+    function getTipsItemName(node) {
+      try {
+        const label = node.getChild && node.getChild('labname');
+        const title = label && label.getChild && (label.getChild('title') || label.getChild('title2'));
+        const itemName = normalizeTipsText(title && title.text);
+        if (itemName) return itemName;
+      } catch (_) {}
+      return '';
+    }
+
+    function findAllowedTipsItem(itemName) {
+      const normalizedName = normalizeTipsText(itemName);
+      if (!normalizedName) return null;
+      return CFG.tipsView.allowedItems.find((item) => (
+        normalizedName === normalizeTipsText(item.name)
+      )) || null;
+    }
+
+    function closeTipsView(node, itemName) {
+      const now = Date.now();
+      const closeKey = itemName || '<unknown>';
+      if (
+        closeKey === state.lastTipsAutoCloseKey
+        && now - state.lastTipsAutoCloseAt < CFG.tipsView.autoCloseCooldownMs
+      ) return false;
+
+      try {
+        const closeButton = node.getChild && node.getChild('btnClose');
+        const display = closeButton && closeButton.displayObject;
+        if (!display || typeof display.event !== 'function') return false;
+        const clickType = window.Laya && window.Laya.Event && window.Laya.Event.CLICK;
+        if (!clickType) return false;
+        // fireClick() 只改变 FairyGUI 按钮状态；向 displayObject 分发 CLICK 才会进入游戏的关闭回调。
+        display.event(clickType);
+        state.lastTipsAutoCloseAt = now;
+        state.lastTipsAutoCloseKey = closeKey;
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function updateTipsView(node) {
+      const itemName = getTipsItemName(node);
+      const allowedItem = findAllowedTipsItem(itemName);
+      state.status.lastTipsItem = itemName || describeTipsItem(node);
+      state.status.lastTipsAllowedItem = allowedItem ? allowedItem.name : '';
+      state.status.lastTipsAllowedItemId = allowedItem ? allowedItem.id : 0;
+
+      if (allowedItem) {
+        try { node.visible = true; } catch (_) {}
+        compactTipsView(node);
+        state.status.lastTipsDecision = 'shown';
+        return true;
+      }
+
+      state.status.lastTipsDecision = closeTipsView(node, itemName) ? 'closed' : 'close pending';
+      return false;
+    }
+
+    function inspectTipsView() {
+      const node = findTipsView();
+      if (!node) return null;
+      const itemName = getTipsItemName(node);
+      const allowedItem = findAllowedTipsItem(itemName);
+      return {
+        itemName,
+        itemText: describeTipsItem(node),
+        allowedItemName: allowedItem ? allowedItem.name : '',
+        allowedItemId: allowedItem ? allowedItem.id : 0,
+        visible: (() => { try { return node.visible !== false; } catch (_) { return false; } })(),
+      };
     }
 
     function compactTipsView(node) {
