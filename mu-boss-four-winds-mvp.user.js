@@ -538,8 +538,12 @@
        if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
      }
 
-     // Phase 3: already clicked - close map so coordinates become visible.
+    // Phase 3: already clicked - close map so coordinates become visible.
      if (isSameNav && navCtx.clicked) {
+       if (navCtx.closeClicked) {
+         // Already clicked close — wait for map to actually close.
+         return { ok: true, reason: 'waiting_map_close' };
+       }
        return closeMapPanel(snapshot);
      }
 
@@ -585,10 +589,11 @@
        navCtx.startedAt = now;
        navCtx.lastCoordinate = '';
        navCtx.lastCoordinateAt = 0;
-       navCtx.clicked = false;
-       appendLog('navigation_retry', { kind, targetId: intent.targetId });
-       return { ok: true, reason: 'retry_pending' };
-     }
+      navCtx.clicked = false;
+      navCtx.closeClicked = false;
+      appendLog('navigation_retry', { kind, targetId: intent.targetId });
+      return { ok: true, reason: 'retry_pending' };
+    }
 
     // Coordinate stall check (only when coordinate is available).
     const currentCoord = snapshot.scene.coordinate || '';
@@ -607,8 +612,9 @@
           if (!navCtx.retried) {
             navCtx.retried = true;
             navCtx.startedAt = now;
-            navCtx.clicked = false;
-            appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
+           navCtx.clicked = false;
+           navCtx.closeClicked = false;
+           appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
             return { ok: true, reason: 'retry_pending' };
           }
           appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
@@ -633,9 +639,10 @@
      const node = findNodeByPath(root(), fresh.mapPanel.closeButton.sourcePath);
      if (!node) return { ok: false, reason: 'close_node_not_found' };
      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'close_node_hidden' };
-     const action = activateNode(node);
-     if (!action.ok) return { ok: false, reason: action.reason };
-  return { ok: true, method: action.method, reason: 'map_closed' };
+    const action = activateNode(node);
+    if (!action.ok) return { ok: false, reason: action.reason };
+    if (state.navigationContext) state.navigationContext.closeClicked = true;
+ return { ok: true, method: action.method, reason: 'map_closed' };
 }
 
 
