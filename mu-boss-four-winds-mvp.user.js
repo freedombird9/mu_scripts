@@ -33,12 +33,13 @@
       travelTimeoutMs: 180 * 1000,
     });
     const MAX_LOGS = 200;
-    const TARGET_TABLE = Object.freeze([
+    const TARGETS = Object.freeze([
       Object.freeze({ id: 'ao-left', name: '傲之煞', mapName: '四风平原', coordinate: '77,145' }),
       Object.freeze({ id: 'ao-right', name: '傲之煞', mapName: '四风平原', coordinate: '182,164' }),
       Object.freeze({ id: 'angry-ao', name: '愤怒傲之煞', mapName: '四风平原', coordinate: '179,79' }),
       Object.freeze({ id: 'rage-ao', name: '狂暴傲之煞', mapName: '四风平原', coordinate: '82,88' }),
     ]);
+    const TARGET_TABLE = TARGETS;
 
     const state = {
       enabled: false,
@@ -46,13 +47,14 @@
       phase: 'SYNC',
       currentTargetId: '',
       currentAction: null,
-      targets: TARGET_TABLE,
+      targets: TARGETS.map(createTargetState),
       logs: [],
       config: normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS)),
       paused: false,
       pauseReason: '',
       lastSnapshot: null,
       lastIntent: null,
+      currentIntent: null,
       tickId: null,
       farmTargetMissing: false,
     };
@@ -136,23 +138,237 @@
     }
 
     function reconcileTargets(snapshot) {
-      const knownTargets = snapshot && Array.isArray(snapshot.targets) ? snapshot.targets : TARGET_TABLE;
-      state.targets = knownTargets.map((target) => clone(target));
+      const now = Number(snapshot && snapshot.at) || Date.now();
+      const records = snapshot && snapshot.overlay && Array.isArray(snapshot.overlay.records)
+        ? snapshot.overlay.records
+        : [];
+      const previousById = new Map(state.targets.map((target) => [target.id, target]));
+      state.targets = TARGETS.map((definition) => {
+        const previous = previousById.get(definition.id) || createTargetState(definition);
+        const target = { ...createTargetState(definition), ...clone(previous), ...definition };
+        const matchingRecord = selectMatchingRecord(records, target);
+        const previousRefreshAt = validRefreshAt(target.refreshAt);
+
+        if (matchingRecord) {
+          const refreshAt = validRefreshAt(matchingRecord.refreshAt);
+          if (refreshAt !== null) {
+            if (refreshIdentity(previousRefreshAt) !== refreshIdentity(refreshAt)) clearCooldown(target);
+            target.refreshAt = refreshAt;
+            target.lastRefreshAt = refreshAt;
+            target.lastRecordAt = validRecordAt(matchingRecord.observedAt, now);
+          } else {
+            target.refreshAt = null;
+            target.lastRefreshAt = null;
+            target.lastRecordAt = validRecordAt(matchingRecord.observedAt, now);
+          }
+        } else {
+          target.refreshAt = null;
+          target.lastRefreshAt = null;
+          target.lastRecordAt = 0;
+        }
+
+        target.status = targetStatus(target, now);
+        return target;
+      });
       return clone(state.targets);
     }
 
     function chooseIntent(snapshot) {
-      const intent = {
-        type: 'WAIT',
-        reason: snapshot && snapshot.mapPanel && snapshot.mapPanel.open && !snapshot.mapPanel.farmTarget
-          ? 'farm_target_missing'
-          : snapshot && snapshot.fguiReady ? 'target_table_empty' : 'waiting_for_fgui',
+      let intent;
+      if (!state.config.enabled) {
+        intent = makeIntent('disabled', null, 'config disabled', 'none', 1);
+      } else if (state.paused) {
+        intent = makeIntent('safe_wait', state.currentTargetId || null, state.pauseReason || 'paused', 'none', 1);
+      } else if (!snapshot || !snapshot.fguiReady || !snapshot.overlay || !snapshot.overlay.available) {
+        intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
+      } else if (hasLockedValidTarget(snapshot)) {
+        intent = intentForLockedTarget(snapshot);
+      } else {
+        const candidate = selectHighestPriorityTarget(snapshot);
+        intent = candidate
+          ? intentForTarget(candidate, snapshot)
+          : makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
+      }
+      return applyIntent(intent);
+    }
+
+    function createTargetState(target) {
+      return {
+        ...target,
+        refreshAt: null,
+        lastRefreshAt: null,
+        lastRecordAt: 0,
+        cooldownUntil: 0,
+        cooldownRefreshAt: null,
+        status: 'UNKNOWN',
       };
+    }
+
+    function recordMatchesTarget(record, target) {
+      if (!record || !target) return false;
+      if (cleanText(record.mapName) !== target.mapName) return false;
+      if (cleanText(record.bossName) !== target.name) return false;
+      const coordinate = normalizeCoordinate(record.bossCoordinate);
+      return !coordinate || coordinate === target.coordinate;
+    }
+
+    function selectMatchingRecord(records, target) {
+      return records
+        .filter((record) => recordMatchesTarget(record, target))
+        .sort((left, right) => {
+          const coordinateDelta = Number(Boolean(normalizeCoordinate(right.bossCoordinate)))
+            - Number(Boolean(normalizeCoordinate(left.bossCoordinate)));
+          if (coordinateDelta) return coordinateDelta;
+          return validRecordAt(right.observedAt, 0) - validRecordAt(left.observedAt, 0);
+        })[0] || null;
+    }
+
+    function validRefreshAt(value) {
+      const refreshAt = Number(value);
+      return Number.isFinite(refreshAt) && refreshAt > 0 ? refreshAt : null;
+    }
+
+    function validRecordAt(value, fallback) {
+      const recordAt = Number(value);
+      return Number.isFinite(recordAt) && recordAt > 0 ? recordAt : fallback;
+    }
+
+    function clearCooldown(target) {
+      target.cooldownUntil = 0;
+      target.cooldownRefreshAt = null;
+    }
+
+    function isCooling(target, now) {
+      return Boolean(target
+        && Number(target.cooldownUntil) > now
+        && refreshIdentity(target.cooldownRefreshAt) === refreshIdentity(target.refreshAt));
+    }
+
+    function refreshIdentity(value) {
+      const refreshAt = validRefreshAt(value);
+      return refreshAt === null ? 'unknown' : String(refreshAt);
+    }
+
+    function markContested(target, now) {
+      if (!target) return;
+      const contestedAt = Number(now) || Date.now();
+      target.cooldownUntil = contestedAt + state.config.contestedCooldownMs;
+      target.cooldownRefreshAt = validRefreshAt(target.refreshAt);
+      target.status = 'COOLING';
       state.currentTargetId = '';
       state.currentAction = null;
-      state.phase = state.paused ? 'PAUSED' : 'SYNC';
-      state.lastIntent = intent;
-      return clone(intent);
+    }
+
+    function targetStatus(target, now) {
+      if (isCooling(target, now)) return 'COOLING';
+      const refreshAt = validRefreshAt(target && target.refreshAt);
+      if (refreshAt === null) return 'READY_UNKNOWN_TIMER';
+      if (refreshAt <= now) return 'READY';
+      if (refreshAt - now <= state.config.preWaitSeconds * 1000) return 'PREPARE';
+      return 'WAITING_REFRESH';
+    }
+
+    function targetById(id) {
+      return state.targets.find((target) => target.id === id) || null;
+    }
+
+    function makeIntent(type, targetId, reason, action, confidence) {
+      return {
+        type,
+        targetId: targetId || null,
+        reason: cleanText(reason),
+        action: action || 'none',
+        confidence: clampNumber(confidence, 0, 1, 0),
+      };
+    }
+
+    function applyIntent(intent) {
+      const next = clone(intent);
+      if (next.targetId) state.currentTargetId = next.targetId;
+      else if (next.type !== 'safe_wait') state.currentTargetId = '';
+      state.currentAction = next.action === 'none' ? null : next.action;
+      state.phase = next.type.toUpperCase();
+      state.lastIntent = next;
+      state.currentIntent = next;
+      return clone(next);
+    }
+
+    function hasLockedValidTarget(snapshot) {
+      const target = targetById(state.currentTargetId);
+      if (!target || isCooling(target, Number(snapshot.at) || Date.now()) || !isLockingIntent()) return false;
+      return !findVisibleAttackableTarget(snapshot, target.id);
+    }
+
+    function isLockingIntent() {
+      return state.currentIntent
+        && (state.currentIntent.type === 'travel_boss' || state.currentIntent.type === 'hold');
+    }
+
+    function findVisibleAttackableTarget(snapshot, excludedTargetId) {
+      return state.targets.find((target) => target.id !== excludedTargetId
+        && !isCooling(target, Number(snapshot.at) || Date.now())
+        && isVisibleAndAttackable(target, snapshot)) || null;
+    }
+
+    function selectHighestPriorityTarget(snapshot) {
+      const now = Number(snapshot.at) || Date.now();
+      const lockedTarget = targetById(state.currentTargetId);
+      const visibleInterrupt = lockedTarget && isLockingIntent()
+        ? findVisibleAttackableTarget(snapshot, lockedTarget.id)
+        : null;
+      if (visibleInterrupt) return visibleInterrupt;
+
+      const eligible = state.targets.filter((target) => !isCooling(target, now));
+      const unknown = eligible.filter((target) => validRefreshAt(target.refreshAt) === null);
+      if (unknown.length) return unknown[0];
+      const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
+      if (visible.length) return visible[0];
+      return eligible
+        .filter((target) => {
+          const refreshAt = validRefreshAt(target.refreshAt);
+          return refreshAt !== null && refreshAt > now && refreshAt - now <= state.config.preWaitSeconds * 1000;
+        })
+        .sort((left, right) => Number(left.refreshAt) - Number(right.refreshAt))[0] || null;
+    }
+
+    function isVisibleAndAttackable(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      if (!combat || cleanText(combat.targetName) !== target.name) return false;
+      if (Number(combat.hpPercent) === 0) return false;
+      const scene = snapshot.scene || {};
+      return !scene.mapName || scene.mapName === target.mapName;
+    }
+
+    function intentForLockedTarget(snapshot) {
+      const target = targetById(state.currentTargetId);
+      return target
+        ? intentForTarget(target, snapshot)
+        : makeIntent('sync', null, 'locked target missing', 'none', 0);
+    }
+
+    function intentForTarget(target, snapshot) {
+      if (isVisibleAndAttackable(target, snapshot)) {
+        const ownerName = cleanText(snapshot.combat && snapshot.combat.ownerName);
+        if (ownerName && ownerName !== state.config.ownerName) {
+          return makeIntent('observe_owner', target.id, 'visible boss owned by another player', 'observe_owner', 0.95);
+        }
+        return makeIntent('engage', target.id, 'visible boss is attackable', 'ensure_auto_battle', 1);
+      }
+      if (isAtTarget(target, snapshot)) {
+        return makeIntent('hold', target.id, 'at boss coordinate', 'hold_position', 0.95);
+      }
+      if (target.status === 'READY_UNKNOWN_TIMER') {
+        return makeIntent('travel_boss', target.id, 'unknown refresh timer', 'click_boss_target', 0.9);
+      }
+      if (target.status === 'READY') {
+        return makeIntent('travel_boss', target.id, 'boss refresh time reached', 'click_boss_target', 0.9);
+      }
+      return makeIntent('travel_boss', target.id, 'refresh within pre-wait window', 'click_boss_target', 0.85);
+    }
+
+    function isAtTarget(target, snapshot) {
+      const scene = snapshot && snapshot.scene;
+      return Boolean(scene && scene.mapName === target.mapName && scene.coordinate === target.coordinate);
     }
 
     function executeIntent(intent) {
