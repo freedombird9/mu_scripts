@@ -639,8 +639,11 @@
       const refreshAt = observedAt + candidate.seconds * 1000;
       const detectedName = candidate.bossName || (canAttributeRecentCombat(candidate, context) ? context.bossName : '');
       const mapMarker = chooseMapBossMarker(context, detectedName);
+      const mapMarkerNameCount = mapMarker
+        ? countMapBossMarkersByName(context.mapBossMarkers, mapMarker.name)
+        : 0;
       const initialMapName = candidate.mapName || (mapMarker && mapMarker.mapName) || (isExplicitBossSource(candidate) ? '' : context.mapName);
-      const reconciledRecord = mapMarker ? null : findUniqueRecordByRefresh({
+      const reconciledRecord = findUniqueRecordByRefresh({
         mapName: initialMapName,
         bossName: detectedName,
         refreshAt,
@@ -681,6 +684,7 @@
         mapSource,
         bossCoordinate: cleanText((mapMarker && mapMarker.coordinate) || (reconciledRecord && reconciledRecord.bossCoordinate)),
         monsterId: Number((mapMarker && mapMarker.monsterId) || (reconciledRecord && reconciledRecord.monsterId)) || 0,
+        mapMarkerNameCount,
         countdownText: candidate.text,
         detectedSeconds: candidate.seconds,
         observedAt,
@@ -723,6 +727,12 @@
       if (!near[0] || near[0].distance > 24) return null;
       if (near[1] && near[1].distance === near[0].distance) return null;
       return near[0].marker;
+    }
+
+    function countMapBossMarkersByName(markers, name) {
+      const target = cleanText(name);
+      if (!target) return 0;
+      return (markers || []).filter((marker) => cleanText(marker && marker.name) === target).length;
     }
 
     function canAttributeRecentCombat(candidate, context) {
@@ -871,11 +881,39 @@
       if (!left || !right) return false;
       if (!recordNamesMergeable(left, right)) return false;
       if (!mapsMergeable(left.mapName, right.mapName)) return false;
+      if (sameStoredRecordId(left, right)) return true;
       if (sameTrialTaskbarBossRecord(left, right)) return true;
       const leftCoordinate = normalizeBossCoordinate(left.bossCoordinate);
       const rightCoordinate = normalizeBossCoordinate(right.bossCoordinate);
       if (leftCoordinate && rightCoordinate) return leftCoordinate === rightCoordinate;
+      if (canUpgradeMissingCoordinate(left, right)) return true;
       return sameCountdownSource(left, right) && withinRefreshWindow(left, right);
+    }
+
+    function sameStoredRecordId(left, right) {
+      const a = cleanText(left && left.id);
+      const b = cleanText(right && right.id);
+      return Boolean(a && b && a === b);
+    }
+
+    function canUpgradeMissingCoordinate(left, right) {
+      const leftCoordinate = normalizeBossCoordinate(left && left.bossCoordinate);
+      const rightCoordinate = normalizeBossCoordinate(right && right.bossCoordinate);
+      if (leftCoordinate && rightCoordinate) return false;
+      const markerRecord = leftCoordinate ? left : (rightCoordinate ? right : null);
+      if (!markerRecord || !hasUniqueMapMarkerIdentity(markerRecord)) return false;
+      return withinRefreshReconcileWindow(left, right);
+    }
+
+    function hasUniqueMapMarkerIdentity(record) {
+      return cleanText(record && record.bossNameSource) === 'fgui.map_marker'
+        && normalizeBossCoordinate(record && record.bossCoordinate)
+        && Number(record && record.mapMarkerNameCount) === 1;
+    }
+
+    function withinRefreshReconcileWindow(left, right) {
+      return Math.abs(Number(left && left.refreshAt) - Number(right && right.refreshAt))
+        <= REFRESH_RECONCILE_WINDOW_MS;
     }
 
     function sameCountdownSource(left, right) {
@@ -2269,6 +2307,7 @@
             mapSource: cleanText(item.mapSource),
             bossCoordinate: normalizeBossCoordinate(item.bossCoordinate),
             monsterId: Number(item.monsterId) || 0,
+            mapMarkerNameCount: Math.max(0, Number(item.mapMarkerNameCount) || 0),
             countdownText: cleanText(item.countdownText),
             detectedSeconds: Number(item.detectedSeconds) || null,
             observedAt: Number(item.observedAt) || Date.now(),
