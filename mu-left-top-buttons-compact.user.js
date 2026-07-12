@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 左上按钮 + 右下弹窗缩小
 // @namespace    codex.mu.ui.left-top-compact
-// @version      0.6.1
+// @version      0.6.6
 // @description  缩小左上”升级”/”送大天使”/”限时活动”按钮(0.5)；右下”立即使用”卡片仅显示火龙鳞片/火龙之心(0.7，右下角锚定)。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -53,7 +53,7 @@
       lastLogAt: 0,
       lastSummary: '',
       status: {
-        version: '0.6.1',
+        version: '0.6.6',
         applyCount: 0,
         lastMatched: [],
         lastTipsItem: '',
@@ -268,6 +268,9 @@
         state.status.lastReason = targets.length
           ? (showTips ? 'compacted left top buttons + allowed tips view' : 'compacted left top buttons + closed non-allowed tips view')
           : (showTips ? 'compacted allowed tips view' : 'closed non-allowed tips view');
+      } else {
+        // 弹窗不存在，重置去重状态。下次弹窗出现时才会再次触发关闭。
+        state.lastTipsAutoCloseKey = '';
       }
 
       return targets.length > 0 || !!tips;
@@ -323,24 +326,25 @@
       )) || null;
     }
 
-    function closeTipsView(node, itemName) {
-      const now = Date.now();
-      const closeKey = itemName || '<unknown>';
-      if (
-        closeKey === state.lastTipsAutoCloseKey
-        && now - state.lastTipsAutoCloseAt < CFG.tipsView.autoCloseCooldownMs
-      ) return false;
-
+    function closeTipsView(node) {
+      // 用 display.event(CLICK) 触发游戏的关闭回调（已验证有效）。
+      // 但 FairyGUI 按钮的 __click 会播放 _sound（ui_open.mp3），
+      // 所以在点击前临时清除 _sound，点击后恢复，实现无声音关闭。
       try {
         const closeButton = node.getChild && node.getChild('btnClose');
         const display = closeButton && closeButton.displayObject;
         if (!display || typeof display.event !== 'function') return false;
         const clickType = window.Laya && window.Laya.Event && window.Laya.Event.CLICK;
         if (!clickType) return false;
-        // fireClick() 只改变 FairyGUI 按钮状态；向 displayObject 分发 CLICK 才会进入游戏的关闭回调。
+
+        // 临时静音
+        const savedSound = closeButton._sound;
+        closeButton._sound = null;
+
         display.event(clickType);
-        state.lastTipsAutoCloseAt = now;
-        state.lastTipsAutoCloseKey = closeKey;
+
+        // 恢复音效（不影响用户手动点击时的声音）
+        closeButton._sound = savedSound;
         return true;
       } catch (_) {
         return false;
@@ -357,11 +361,27 @@
       if (allowedItem) {
         try { node.visible = true; } catch (_) {}
         compactTipsView(node);
+        state.lastTipsAutoCloseKey = ''; // 重置去重，允许下次非白名单弹窗立即关闭
         state.status.lastTipsDecision = 'shown';
         return true;
       }
 
-      state.status.lastTipsDecision = closeTipsView(node, itemName) ? 'closed' : 'close pending';
+      // 非白名单物品：静音关闭 + 物品去重。
+      // 同一个物品只关闭一次，避免反复点击（即使静音也不应频繁触发）。
+      const now = Date.now();
+      const closeKey = itemName || '<unknown>';
+      if (
+        closeKey === state.lastTipsAutoCloseKey
+        && now - state.lastTipsAutoCloseAt < CFG.tipsView.autoCloseCooldownMs
+      ) {
+        state.status.lastTipsDecision = 'close dedup (same item)';
+        return false;
+      }
+
+      const closed = closeTipsView(node);
+      state.lastTipsAutoCloseAt = now;
+      state.lastTipsAutoCloseKey = closeKey;
+      state.status.lastTipsDecision = closed ? 'closed (muted)' : 'close failed';
       return false;
     }
 
