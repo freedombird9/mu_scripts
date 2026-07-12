@@ -597,38 +597,49 @@
 
     // Coordinate stall check (only when coordinate is available).
     const currentCoord = snapshot.scene.coordinate || '';
-    if (currentCoord) {
-      // If we're within arrival threshold of the target, don't stall — let chooseIntent switch to hold.
-      if (kind === 'boss' && intent.targetId) {
-        const target = targetById(intent.targetId);
-        if (target && chebyshevDistance(currentCoord, target.coordinate) <= ARRIVAL_THRESHOLD) {
-          appendLog('navigation_arrived', { kind, targetId: intent.targetId, coordinate: currentCoord, targetCoordinate: target.coordinate });
-          state.navigationContext = null;
-          return { ok: true, reason: 'arrived' };
-        }
-      }
-      if (currentCoord === navCtx.lastCoordinate) {
-        if (now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
-          if (!navCtx.retried) {
-            navCtx.retried = true;
-            navCtx.startedAt = now;
-           navCtx.clicked = false;
-           navCtx.closeClicked = false;
-           appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
-            return { ok: true, reason: 'retry_pending' };
-          }
-          appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
-          state.navigationContext = null;
-          state.currentTargetId = '';
-          state.currentAction = 'navigation_failed';
-          return { ok: false, reason: 'coordinate_stall_timeout' };
-        }
-      } else {
-        navCtx.lastCoordinate = currentCoord;
-        navCtx.lastCoordinateAt = now;
+    if (!currentCoord) return { ok: true, reason: 'navigating' };
+
+    // Update coordinate tracking if moved.
+    const moved = currentCoord !== navCtx.lastCoordinate;
+    if (moved) {
+      navCtx.lastCoordinate = currentCoord;
+      navCtx.lastCoordinateAt = now;
+    }
+
+    // Boss: check arrival by Chebyshev distance.
+    if (kind === 'boss' && intent.targetId) {
+      const target = targetById(intent.targetId);
+      if (target && chebyshevDistance(currentCoord, target.coordinate) <= ARRIVAL_THRESHOLD) {
+        appendLog('navigation_arrived', { kind, targetId: intent.targetId, coordinate: currentCoord, targetCoordinate: target.coordinate });
+        state.navigationContext = null;
+        return { ok: true, reason: 'arrived' };
       }
     }
-    // Coordinate empty or progressing - keep waiting.
+
+    // Farming: if coordinate stable for 5s, consider arrived (game auto-starts farming).
+    if (kind === 'farm' && !moved && now - navCtx.lastCoordinateAt > 5000) {
+      appendLog('navigation_arrived', { kind: 'farm', targetId: 'farm', coordinate: currentCoord });
+      state.navigationContext = null;
+      return { ok: true, reason: 'arrived' };
+    }
+
+    // Stall check: coordinate unchanged beyond arrivalStallMs.
+    if (!moved && now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
+      if (!navCtx.retried) {
+        navCtx.retried = true;
+        navCtx.startedAt = now;
+        navCtx.clicked = false;
+        navCtx.closeClicked = false;
+        appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
+        return { ok: true, reason: 'retry_pending' };
+      }
+      appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
+      state.navigationContext = null;
+      state.currentTargetId = '';
+      state.currentAction = 'navigation_failed';
+      return { ok: false, reason: 'coordinate_stall_timeout' };
+    }
+
     return { ok: true, reason: 'navigating' };
   }
 
