@@ -33,7 +33,12 @@
       travelTimeoutMs: 180 * 1000,
     });
     const MAX_LOGS = 200;
-    const TARGET_TABLE = Object.freeze([]);
+    const TARGET_TABLE = Object.freeze([
+      Object.freeze({ id: 'ao-left', name: '傲之煞', mapName: '四风平原', coordinate: '77,145' }),
+      Object.freeze({ id: 'ao-right', name: '傲之煞', mapName: '四风平原', coordinate: '182,164' }),
+      Object.freeze({ id: 'angry-ao', name: '愤怒傲之煞', mapName: '四风平原', coordinate: '179,79' }),
+      Object.freeze({ id: 'rage-ao', name: '狂暴傲之煞', mapName: '四风平原', coordinate: '82,88' }),
+    ]);
 
     const state = {
       enabled: false,
