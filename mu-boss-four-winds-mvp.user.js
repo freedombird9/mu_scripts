@@ -55,8 +55,12 @@
       lastSnapshot: null,
       lastIntent: null,
       currentIntent: null,
+      ownerObservation: null,
       tickId: null,
       farmTargetMissing: false,
+      navigationContext: null,
+      lastError: null,
+      lastActionAt: 0,
     };
     syncRuntimeFlags();
 
@@ -111,6 +115,7 @@
         }
         return intent;
       } catch (error) {
+        state.lastError = { at: Date.now(), message: error && error.message ? error.message : String(error) };
         appendLog('tick_error', { message: error && error.message ? error.message : String(error) });
         return null;
       }
@@ -176,18 +181,24 @@
     function chooseIntent(snapshot) {
       let intent;
       if (!state.config.enabled) {
+        resetOwnerObservation();
         intent = makeIntent('disabled', null, 'config disabled', 'none', 1);
       } else if (state.paused) {
+        resetOwnerObservation();
         intent = makeIntent('safe_wait', state.currentTargetId || null, state.pauseReason || 'paused', 'none', 1);
       } else if (!snapshot || !snapshot.fguiReady || !snapshot.overlay || !snapshot.overlay.available) {
+        resetOwnerObservation();
         intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
       } else if (hasLockedValidTarget(snapshot)) {
         intent = intentForLockedTarget(snapshot);
       } else {
         const candidate = selectHighestPriorityTarget(snapshot);
-        intent = candidate
-          ? intentForTarget(candidate, snapshot)
-          : makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
+        if (candidate) {
+          intent = intentForTarget(candidate, snapshot);
+        } else {
+          resetOwnerObservation();
+          intent = makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
+        }
       }
       return applyIntent(intent);
     }
@@ -208,8 +219,10 @@
       if (!record || !target) return false;
       if (cleanText(record.mapName) !== target.mapName) return false;
       if (cleanText(record.bossName) !== target.name) return false;
-      const coordinate = normalizeCoordinate(record.bossCoordinate);
-      return !coordinate || coordinate === target.coordinate;
+      const rawCoordinate = cleanText(record.bossCoordinate);
+      if (!rawCoordinate) return true;
+      const coordinate = normalizeCoordinate(rawCoordinate);
+      return coordinate !== '' && coordinate === target.coordinate;
     }
 
     function selectMatchingRecord(records, target) {
@@ -295,13 +308,34 @@
 
     function hasLockedValidTarget(snapshot) {
       const target = targetById(state.currentTargetId);
-      if (!target || isCooling(target, Number(snapshot.at) || Date.now()) || !isLockingIntent()) return false;
+      const now = Number(snapshot.at) || Date.now();
+      if (!isLockingIntent()) return false;
+      if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
+        releaseLockedTarget();
+        return false;
+      }
       return !findVisibleAttackableTarget(snapshot, target.id);
     }
 
     function isLockingIntent() {
       return state.currentIntent
         && (state.currentIntent.type === 'travel_boss' || state.currentIntent.type === 'hold');
+    }
+
+    function isLockTargetEligible(target, now) {
+      const definition = target && TARGETS.find((item) => item.id === target.id);
+      const allowedStatuses = ['READY_UNKNOWN_TIMER', 'READY', 'PREPARE'];
+      return Boolean(definition
+        && definition.name === target.name
+        && definition.coordinate === target.coordinate
+        && !isCooling(target, now)
+        && allowedStatuses.includes(target.status));
+    }
+
+    function releaseLockedTarget() {
+      state.currentTargetId = '';
+      state.currentAction = null;
+      state.currentIntent = null;
     }
 
     function findVisibleAttackableTarget(snapshot, excludedTargetId) {
@@ -334,7 +368,7 @@
     function isVisibleAndAttackable(target, snapshot) {
       const combat = snapshot && snapshot.combat;
       if (!combat || cleanText(combat.targetName) !== target.name) return false;
-      if (Number(combat.hpPercent) === 0) return false;
+      if (!hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
       const scene = snapshot.scene || {};
       return !scene.mapName || scene.mapName === target.mapName;
     }
@@ -347,6 +381,9 @@
     }
 
     function intentForTarget(target, snapshot) {
+      if (observeContestedOwner(target, snapshot)) {
+        return makeIntent('safe_wait', null, 'boss contested cooldown', 'none', 0.95);
+      }
       if (isVisibleAndAttackable(target, snapshot)) {
         const ownerName = cleanText(snapshot.combat && snapshot.combat.ownerName);
         if (ownerName && ownerName !== state.config.ownerName) {
@@ -366,18 +403,280 @@
       return makeIntent('travel_boss', target.id, 'refresh within pre-wait window', 'click_boss_target', 0.85);
     }
 
+    function observeContestedOwner(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      const ownerName = cleanText(combat && combat.ownerName);
+      const isForeignOwner = Boolean(combat
+        && cleanText(combat.targetName) === target.name
+        && hasVisibleHpBar(combat)
+        && ownerName
+        && ownerName !== state.config.ownerName);
+      if (!isForeignOwner) {
+        resetOwnerObservation();
+        return false;
+      }
+
+      const now = Number(snapshot.at) || Date.now();
+      if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
+        state.ownerObservation = { targetId: target.id, observedAt: now };
+        return false;
+      }
+      if (now - state.ownerObservation.observedAt < state.config.ownerObserveSeconds * 1000) return false;
+      resetOwnerObservation();
+      markContested(target, now);
+      return true;
+    }
+
+    function resetOwnerObservation() {
+      state.ownerObservation = null;
+    }
+
+    function hasVisibleHpBar(combat) {
+      const hpPercent = combat && combat.hpPercent;
+      return hpPercent !== null
+        && hpPercent !== undefined
+        && hpPercent !== ''
+        && Number.isFinite(Number(hpPercent));
+    }
+
     function isAtTarget(target, snapshot) {
       const scene = snapshot && snapshot.scene;
       return Boolean(scene && scene.mapName === target.mapName && scene.coordinate === target.coordinate);
     }
 
-    function executeIntent(intent) {
-      state.currentAction = intent ? intent.type : null;
-      appendLog('intent_deferred', {
-        intent: clone(intent),
-        reason: 'execution_not_implemented_in_task_1',
-      });
+    function executeIntent(intent, snapshot) {
+      if (!intent) return null;
+      state.currentAction = intent.action || intent.type;
+      const now = Date.now();
+
+      // Rate-limit: at most one action per tick, minimum 500ms between clicks.
+      if (intent.action === 'none' || intent.type === 'sync' || intent.type === 'disabled' || intent.type === 'safe_wait') {
+        appendLog('intent_' + intent.type, { reason: intent.reason, targetId: intent.targetId });
+        return clone(intent);
+      }
+
+      if (now - state.lastActionAt < 500) {
+        appendLog('action_throttled', { msSinceLast: now - state.lastActionAt });
+        return clone(intent);
+      }
+
+      let result;
+      switch (intent.type) {
+        case 'travel_boss': result = executeTravel(intent, snapshot, 'boss'); break;
+        case 'travel_farm': result = executeTravel(intent, snapshot, 'farm'); break;
+        case 'hold': result = executeHold(intent, snapshot); break;
+        case 'engage': result = executeEngage(intent, snapshot); break;
+        case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
+        case 'contested': result = { ok: true, reason: 'contested_cooldown_active' }; break;
+        default:
+          appendLog('intent_unknown', { type: intent.type });
+          return clone(intent);
+      }
+
+      state.lastActionAt = now;
+      if (result && result.ok) {
+        appendLog('action_executed', { type: intent.type, method: result.method || '', reason: result.reason || '' });
+      } else {
+        appendLog('action_blocked', { type: intent.type, reason: result ? result.reason : 'unknown' });
+        state.lastError = { at: now, message: result ? result.reason : 'unknown', type: intent.type };
+      }
       return clone(intent);
+    }
+
+    // --- Navigation (travel_boss / travel_farm) ---
+
+    function executeTravel(intent, snapshot, kind) {
+      // Step 1: if map panel not open, click open button.
+      if (!snapshot.mapPanel.open) {
+        return clickOpenMapButton(snapshot);
+      }
+
+      // Step 2: find target row in map panel.
+      let targetRow;
+      if (kind === 'boss') {
+        const target = targetById(intent.targetId);
+        if (!target) return { ok: false, reason: 'boss_target_missing' };
+        targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
+        if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
+      } else {
+        targetRow = snapshot.mapPanel.farmTarget;
+        if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
+      }
+
+      // Step 3: re-verify with fresh snapshot before clicking.
+      const fresh = readSnapshot();
+      if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
+      const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, kind === 'boss' ? intent.targetId : 'farm');
+      if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
+
+      // Step 4: check navigation context for timeout/retry logic.
+      const navCtx = state.navigationContext;
+      const now = Date.now();
+
+      if (navCtx && navCtx.kind === kind && navCtx.targetId === intent.targetId) {
+        // Check total timeout.
+        if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
+          if (navCtx.retried) {
+            appendLog('navigation_failed', { kind, targetId: intent.targetId, elapsed: now - navCtx.startedAt });
+            state.navigationContext = null;
+            state.currentTargetId = '';
+            state.currentAction = 'navigation_failed';
+            return { ok: false, reason: 'navigation_timeout' };
+          }
+          // Retry: re-click the same target.
+          navCtx.retried = true;
+          navCtx.startedAt = now;
+          navCtx.lastCoordinate = '';
+          navCtx.lastCoordinateAt = 0;
+          appendLog('navigation_retry', { kind, targetId: intent.targetId });
+        }
+
+        // Check coordinate stall (15s no movement).
+        const currentCoord = fresh.scene.coordinate || '';
+        if (currentCoord && currentCoord === navCtx.lastCoordinate) {
+          if (now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
+            if (!navCtx.retried) {
+              navCtx.retried = true;
+              navCtx.startedAt = now;
+              appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
+            } else {
+              appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
+              state.navigationContext = null;
+              state.currentTargetId = '';
+              state.currentAction = 'navigation_failed';
+              return { ok: false, reason: 'coordinate_stall_timeout' };
+            }
+          }
+        } else {
+          navCtx.lastCoordinate = currentCoord;
+          navCtx.lastCoordinateAt = now;
+        }
+      } else {
+        // New navigation context.
+        state.navigationContext = {
+          kind,
+          targetId: intent.targetId || 'farm',
+          startedAt: now,
+          lastCoordinate: fresh.scene.coordinate || '',
+          lastCoordinateAt: now,
+          retried: false,
+        };
+      }
+
+      // Step 5: click the target row.
+      const node = findNodeByPath(root(), targetRow.sourcePath);
+      if (!node) return { ok: false, reason: 'target_node_not_found' };
+      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
+      const action = activateNode(node);
+      if (!action.ok) return { ok: false, reason: action.reason };
+      return { ok: true, method: action.method, reason: kind + '_row_clicked' };
+    }
+
+    function findNodeByPathSummary(mapPanel, sourcePath, targetId) {
+      if (!sourcePath) return null;
+      const all = [...(mapPanel.bossTargets || []), mapPanel.farmTarget].filter(Boolean);
+      return all.find((row) => row.sourcePath === sourcePath) || null;
+    }
+
+    function clickOpenMapButton(snapshot) {
+      if (!snapshot.mapPanel.openButton) return { ok: false, reason: 'no_map_open_button' };
+      const fresh = readSnapshot();
+      if (!fresh.mapPanel.openButton) return { ok: false, reason: 'map_open_button_vanished' };
+      const node = findNodeByPath(root(), fresh.mapPanel.openButton.sourcePath);
+      if (!node) return { ok: false, reason: 'map_open_node_not_found' };
+      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'map_open_node_hidden' };
+      const action = activateNode(node);
+      if (!action.ok) return { ok: false, reason: action.reason };
+      return { ok: true, method: action.method, reason: 'map_opened' };
+    }
+
+    // --- Hold position + Z safety gate ---
+
+    function executeHold(intent, snapshot) {
+      const target = targetById(intent.targetId);
+      if (!target) return { ok: false, reason: 'hold_target_missing' };
+
+      // Check if we've arrived at target coordinate.
+      if (!isAtTarget(target, snapshot)) {
+        // Not there yet — delegate to travel on next tick.
+        return { ok: false, reason: 'not_at_coordinate' };
+      }
+
+      // At target coordinate: try to enable auto-battle.
+      const result = ensureAutoBattle(snapshot);
+      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
+        appendLog('auto_battle_state_unknown', { targetId: intent.targetId, coordinate: snapshot.scene.coordinate });
+      }
+      return result;
+    }
+
+    function executeEngage(intent, snapshot) {
+      const result = ensureAutoBattle(snapshot);
+      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
+        appendLog('auto_battle_state_unknown', { targetId: intent.targetId });
+      }
+      return result;
+    }
+
+    function ensureAutoBattle(snapshot) {
+      if (!snapshot.autoBattle || !snapshot.autoBattle.known) {
+        return { ok: false, reason: 'auto_battle_state_unknown' };
+      }
+      if (snapshot.autoBattle.enabled) {
+        return { ok: true, reason: 'already_enabled' };
+      }
+      // Send Z key.
+      try {
+        document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyZ', key: 'z', bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyZ', key: 'z', bubbles: true }));
+        appendLog('key_z_sent', { reason: 'auto_battle_was_off' });
+        return { ok: true, reason: 'key_z_sent' };
+      } catch (error) {
+        return { ok: false, reason: 'key_z_failed: ' + (error.message || String(error)) };
+      }
+    }
+
+    // --- Owner observation ---
+
+    function executeObserveOwner(intent, snapshot) {
+      const target = targetById(intent.targetId);
+      if (!target) return { ok: false, reason: 'observe_target_missing' };
+
+      const combat = snapshot.combat;
+      if (!combat || cleanText(combat.targetName) !== target.name) {
+        // Boss disappeared — reset observation.
+        resetOwnerObservation();
+        return { ok: true, reason: 'boss_disappeared' };
+      }
+      if (!hasVisibleHpBar(combat)) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'no_hp_bar' };
+      }
+
+      const ownerName = cleanText(combat.ownerName);
+      const now = Number(snapshot.at) || Date.now();
+
+      if (!ownerName || ownerName === state.config.ownerName) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'owner_clear_or_self' };
+      }
+
+      // Foreign owner: start or continue observation.
+      if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
+        state.ownerObservation = { targetId: target.id, observedAt: now };
+        appendLog('owner_observation_started', { targetId: target.id, ownerName });
+        return { ok: true, reason: 'observing_owner' };
+      }
+
+      const elapsed = now - state.ownerObservation.observedAt;
+      if (elapsed >= state.config.ownerObserveSeconds * 1000) {
+        markContested(target, now);
+        resetOwnerObservation();
+        appendLog('owner_contested', { targetId: target.id, ownerName, elapsedMs: elapsed });
+        return { ok: true, reason: 'contested_cooldown_set' };
+      }
+
+      return { ok: true, reason: 'observing_owner', elapsedSeconds: Math.floor(elapsed / 1000) };
     }
 
     function persist() {
@@ -419,13 +718,15 @@
         phase: state.phase,
         currentTargetId: state.currentTargetId,
         currentAction: state.currentAction,
+        ownerObserveSeconds: state.ownerObservation ? Math.floor((Date.now() - state.ownerObservation.observedAt) / 1000) : 0,
         targets: state.targets,
-        logs: state.logs,
+        logs: state.logs.slice(-100),
         paused: state.paused,
         pauseReason: state.pauseReason,
         config: state.config,
-        lastSnapshot: state.lastSnapshot,
-        lastIntent: state.lastIntent,
+        lastError: state.lastError,
+        navigationContext: clone(state.navigationContext),
+        currentIntent: clone(state.currentIntent),
       });
     }
 
@@ -666,16 +967,30 @@
       };
     }
 
-    function scanAutoBattle(nodes) {
-      const candidates = nodes.filter((item) => item.effectiveVisible && /^(?:自动)?挂机(?:中|已开启|开启|已关闭|关闭)?$/.test(cleanText(item.contentText)));
-      const active = candidates.find((item) => /中|开启/.test(item.contentText) || item.selected === true);
-      if (active) return { known: true, enabled: true, sourcePath: active.path };
-      const inactive = candidates.find((item) => /关闭/.test(item.contentText));
-      if (inactive) return { known: true, enabled: false, sourcePath: inactive.path };
-      return { known: false, enabled: false };
-    }
+function scanAutoBattle(nodes) {
+  // Detect auto-battle via autoFightDataTip > dataList > AutoStatusItem children.
+  // When Z (auto-fight) is active, the dataList contains visible AutoStatusItem nodes
+  // showing exp/damage stats. When inactive, the list is empty or the tip is hidden.
+  const tip = nodes.find((item) => item.name === 'autoFightDataTip' && item.effectiveVisible);
+  if (!tip) return { known: false, enabled: false };
+  const tipPrefix = tip.path + '/';
+  const dataList = nodes.find((item) => item.path === tipPrefix + 'dataList[0]' && item.effectiveVisible);
+  if (!dataList) return { known: true, enabled: false, sourcePath: tip.path };
+  const listPrefix = dataList.path + '/';
+  const statusItems = nodes.filter((item) =>
+    item.path !== dataList.path
+    && item.path.startsWith(listPrefix)
+    && item.effectiveVisible
+    && item.packageName === 'AutoStatusItem'
+  );
+  return {
+    known: true,
+    enabled: statusItems.length > 0,
+    sourcePath: tip.path,
+  };
+}
 
-    function normalizeCoordinate(value) {
+function normalizeCoordinate(value) {
       const match = cleanText(value).match(/^(?:坐标[:：]?\s*)?\(?([0-9]{1,3})\s*,\s*([0-9]{1,3})\)?$/);
       return match ? `${match[1]},${match[2]}` : '';
     }
