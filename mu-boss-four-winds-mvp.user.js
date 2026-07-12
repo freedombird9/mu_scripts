@@ -21,7 +21,8 @@
     if (window.__muFourWindsBossMvp) return;
 
     const STORAGE_KEY = 'mu_four_winds_boss_mvp_v1';
-    const TICK_MS = 1000;
+   const TICK_MS = 1000;
+    const ARRIVAL_THRESHOLD = 3;
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -439,9 +440,17 @@
         && Number.isFinite(Number(hpPercent));
     }
 
-    function isAtTarget(target, snapshot) {
-      const scene = snapshot && snapshot.scene;
-      return Boolean(scene && scene.mapName === target.mapName && scene.coordinate === target.coordinate);
+   function isAtTarget(target, snapshot) {
+     const scene = snapshot && snapshot.scene;
+      if (!scene || scene.mapName !== target.mapName || !scene.coordinate) return false;
+      return chebyshevDistance(scene.coordinate, target.coordinate) <= ARRIVAL_THRESHOLD;
+    }
+
+    function chebyshevDistance(coordA, coordB) {
+      const a = coordA.split(',').map(Number);
+      const b = coordB.split(',').map(Number);
+      if (a.length < 2 || b.length < 2 || !a.every(Number.isFinite) || !b.every(Number.isFinite)) return Infinity;
+      return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
     }
 
     function executeIntent(intent, snapshot) {
@@ -485,94 +494,137 @@
 
     // --- Navigation (travel_boss / travel_farm) ---
 
-    function executeTravel(intent, snapshot, kind) {
-      // Step 1: if map panel not open, click open button.
-      if (!snapshot.mapPanel.open) {
-        return clickOpenMapButton(snapshot);
-      }
+   function executeTravel(intent, snapshot, kind) {
+     const now = Date.now();
+     const targetKey = intent.targetId || 'farm';
+     const navCtx = state.navigationContext;
+     const isSameNav = navCtx && navCtx.kind === kind && navCtx.targetId === targetKey;
 
-      // Step 2: find target row in map panel.
-      let targetRow;
-      if (kind === 'boss') {
+     // Phase 1: map closed. Open it, or monitor progress if already clicked.
+     if (!snapshot.mapPanel.open) {
+       if (isSameNav && navCtx.clicked) {
+         return checkNavProgress(navCtx, snapshot, intent, kind, now);
+       }
+       return clickOpenMapButton(snapshot);
+     }
+
+     // Phase 2: map open. Find target row.
+     let targetRow;
+     if (kind === 'boss') {
+       const target = targetById(intent.targetId);
+       if (!target) return { ok: false, reason: 'boss_target_missing' };
+      targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
+      if (!targetRow || targetRow.targetId !== intent.targetId) {
+        targetRow = snapshot.mapPanel.bossTargets.find((row) => row.targetId === intent.targetId);
+      }
+      if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
+     } else {
+       targetRow = snapshot.mapPanel.farmTarget;
+       if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
+     }
+
+     // Phase 3: already clicked - close map so coordinates become visible.
+     if (isSameNav && navCtx.clicked) {
+       return closeMapPanel(snapshot);
+     }
+
+     // Phase 4: first time - click target row.
+     const fresh = readSnapshot();
+     if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
+     const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, targetKey);
+     if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
+
+     if (!isSameNav) {
+       state.navigationContext = {
+         kind,
+         targetId: targetKey,
+         startedAt: now,
+         lastCoordinate: '',
+         lastCoordinateAt: 0,
+         clicked: false,
+         retried: false,
+       };
+     }
+
+     const node = findNodeByPath(root(), targetRow.sourcePath);
+     if (!node) return { ok: false, reason: 'target_node_not_found' };
+     if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
+     const action = activateNode(node);
+     if (!action.ok) return { ok: false, reason: action.reason };
+     state.navigationContext.clicked = true;
+     appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
+     return { ok: true, method: action.method, reason: kind + '_row_clicked' };
+   }
+
+   function checkNavProgress(navCtx, snapshot, intent, kind, now) {
+     // Total timeout check.
+     if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
+       if (navCtx.retried) {
+         appendLog('navigation_failed', { kind, targetId: intent.targetId, elapsed: now - navCtx.startedAt });
+         state.navigationContext = null;
+         state.currentTargetId = '';
+         state.currentAction = 'navigation_failed';
+         return { ok: false, reason: 'navigation_timeout' };
+       }
+       navCtx.retried = true;
+       navCtx.startedAt = now;
+       navCtx.lastCoordinate = '';
+       navCtx.lastCoordinateAt = 0;
+       navCtx.clicked = false;
+       appendLog('navigation_retry', { kind, targetId: intent.targetId });
+       return { ok: true, reason: 'retry_pending' };
+     }
+
+    // Coordinate stall check (only when coordinate is available).
+    const currentCoord = snapshot.scene.coordinate || '';
+    if (currentCoord) {
+      // If we're within arrival threshold of the target, don't stall — let chooseIntent switch to hold.
+      if (kind === 'boss' && intent.targetId) {
         const target = targetById(intent.targetId);
-        if (!target) return { ok: false, reason: 'boss_target_missing' };
-        targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
-        if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
-      } else {
-        targetRow = snapshot.mapPanel.farmTarget;
-        if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
-      }
-
-      // Step 3: re-verify with fresh snapshot before clicking.
-      const fresh = readSnapshot();
-      if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
-      const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, kind === 'boss' ? intent.targetId : 'farm');
-      if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
-
-      // Step 4: check navigation context for timeout/retry logic.
-      const navCtx = state.navigationContext;
-      const now = Date.now();
-
-      if (navCtx && navCtx.kind === kind && navCtx.targetId === intent.targetId) {
-        // Check total timeout.
-        if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
-          if (navCtx.retried) {
-            appendLog('navigation_failed', { kind, targetId: intent.targetId, elapsed: now - navCtx.startedAt });
-            state.navigationContext = null;
-            state.currentTargetId = '';
-            state.currentAction = 'navigation_failed';
-            return { ok: false, reason: 'navigation_timeout' };
-          }
-          // Retry: re-click the same target.
-          navCtx.retried = true;
-          navCtx.startedAt = now;
-          navCtx.lastCoordinate = '';
-          navCtx.lastCoordinateAt = 0;
-          appendLog('navigation_retry', { kind, targetId: intent.targetId });
+        if (target && chebyshevDistance(currentCoord, target.coordinate) <= ARRIVAL_THRESHOLD) {
+          appendLog('navigation_arrived', { kind, targetId: intent.targetId, coordinate: currentCoord, targetCoordinate: target.coordinate });
+          state.navigationContext = null;
+          return { ok: true, reason: 'arrived' };
         }
-
-        // Check coordinate stall (15s no movement).
-        const currentCoord = fresh.scene.coordinate || '';
-        if (currentCoord && currentCoord === navCtx.lastCoordinate) {
-          if (now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
-            if (!navCtx.retried) {
-              navCtx.retried = true;
-              navCtx.startedAt = now;
-              appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
-            } else {
-              appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
-              state.navigationContext = null;
-              state.currentTargetId = '';
-              state.currentAction = 'navigation_failed';
-              return { ok: false, reason: 'coordinate_stall_timeout' };
-            }
+      }
+      if (currentCoord === navCtx.lastCoordinate) {
+        if (now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
+          if (!navCtx.retried) {
+            navCtx.retried = true;
+            navCtx.startedAt = now;
+            navCtx.clicked = false;
+            appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
+            return { ok: true, reason: 'retry_pending' };
           }
-        } else {
-          navCtx.lastCoordinate = currentCoord;
-          navCtx.lastCoordinateAt = now;
+          appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
+          state.navigationContext = null;
+          state.currentTargetId = '';
+          state.currentAction = 'navigation_failed';
+          return { ok: false, reason: 'coordinate_stall_timeout' };
         }
       } else {
-        // New navigation context.
-        state.navigationContext = {
-          kind,
-          targetId: intent.targetId || 'farm',
-          startedAt: now,
-          lastCoordinate: fresh.scene.coordinate || '',
-          lastCoordinateAt: now,
-          retried: false,
-        };
+        navCtx.lastCoordinate = currentCoord;
+        navCtx.lastCoordinateAt = now;
       }
-
-      // Step 5: click the target row.
-      const node = findNodeByPath(root(), targetRow.sourcePath);
-      if (!node) return { ok: false, reason: 'target_node_not_found' };
-      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
-      const action = activateNode(node);
-      if (!action.ok) return { ok: false, reason: action.reason };
-      return { ok: true, method: action.method, reason: kind + '_row_clicked' };
     }
+    // Coordinate empty or progressing - keep waiting.
+    return { ok: true, reason: 'navigating' };
+  }
 
-    function findNodeByPathSummary(mapPanel, sourcePath, targetId) {
+   function closeMapPanel(snapshot) {
+     if (!snapshot.mapPanel.closeButton) return { ok: false, reason: 'no_close_button' };
+     const fresh = readSnapshot();
+     if (!fresh.mapPanel.closeButton) return { ok: false, reason: 'close_button_vanished' };
+     const node = findNodeByPath(root(), fresh.mapPanel.closeButton.sourcePath);
+     if (!node) return { ok: false, reason: 'close_node_not_found' };
+     if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'close_node_hidden' };
+     const action = activateNode(node);
+     if (!action.ok) return { ok: false, reason: action.reason };
+  return { ok: true, method: action.method, reason: 'map_closed' };
+}
+
+
+ function findNodeByPathSummary(mapPanel, sourcePath, targetId) {
       if (!sourcePath) return null;
       const all = [...(mapPanel.bossTargets || []), mapPanel.farmTarget].filter(Boolean);
       return all.find((row) => row.sourcePath === sourcePath) || null;
@@ -747,12 +799,14 @@
       }
     }
 
-    function cleanText(value) {
-      return String(value == null ? '' : value)
-        .replace(/<[^>]+>/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
+   function cleanText(value) {
+     return String(value == null ? '' : value)
+       .replace(/<[^>]+>/g, '')
+        .replace(/\[\/?[^\]]*\]/g, '')
+        .replace(/&[a-z]+;/g, ' ')
+       .replace(/\s+/g, ' ')
+       .trim();
+   }
 
     function clampNumber(value, min, max, fallback) {
       const number = Number(value);
@@ -913,10 +967,21 @@
           .filter((item) => item.effectiveVisible && item.path !== list.path && item.path.startsWith(`${list.path}/`) && item.packageName === 'RightLift')
           .sort((left, right) => left.rect.y - right.rect.y)
         : [];
-      const bossTargets = rows
-        .map((row) => mapRowSummary(panelNodes, row))
-        .filter((row) => TARGET_TABLE.some((target) => target.name === row.name));
-      const farmRow = rows.find((row) => {
+     const bossTargets = rows
+       .map((row) => mapRowSummary(panelNodes, row))
+       .filter((row) => TARGET_TABLE.some((target) => target.name === row.name));
+     // Assign targetId by matching name + order to disambiguate same-name bosses.
+     const nameCounts = {};
+     bossTargets.forEach((row) => {
+       const sameName = TARGET_TABLE.filter((t) => t.name === row.name);
+       const idx = nameCounts[row.name] || 0;
+       if (idx < sameName.length) {
+         row.targetId = sameName[idx].id;
+         row.coordinate = sameName[idx].coordinate;
+       }
+       nameCounts[row.name] = idx + 1;
+     });
+     const farmRow = rows.find((row) => {
         const children = descendantsOf(panelNodes, row);
         const title = children.find((item) => item.name === 'n0' && cleanText(item.contentText) === '1350级怪物');
         return Boolean(title);
@@ -952,20 +1017,27 @@
     function scanCombat(nodes) {
       const target = nodes.find((item) => item.effectiveVisible && /Lv\s*\d+/i.test(item.text) && TARGET_TABLE.some((entry) => item.text.includes(entry.name)));
       if (!target) return { targetName: '', targetLevel: 0, hpPercent: null, ownerName: '' };
-      const level = target.text.match(/Lv\s*(\d+)/i);
-      const hp = target.text.match(/(\d+)%/);
-      const owner = target.text.match(/归属[:：]?\s*([^\s]+)/);
-      const targetName = TARGET_TABLE
-        .map((entry) => entry.name)
-        .sort((left, right) => right.length - left.length)
-        .find((name) => target.text.includes(name)) || '';
-      return {
-        targetName,
-        targetLevel: level ? Number(level[1]) : 0,
-        hpPercent: hp ? Number(hp[1]) : null,
-        ownerName: owner ? cleanText(owner[1]) : '',
-      };
-    }
+     const level = target.text.match(/Lv\s*(\d+)/i);
+     const targetName = TARGET_TABLE
+       .map((entry) => entry.name)
+       .sort((left, right) => right.length - left.length)
+       .find((name) => target.text.includes(name)) || '';
+      // HP percent is in a sibling percentText node, not in nameText.
+      const parentPath = target.path.replace(/\/[^/]+$/, '');
+      const pctNode = nodes.find((item) => item.path.startsWith(parentPath + '/')
+        && item.name === 'percentText' && item.effectiveVisible);
+      const hp = pctNode ? pctNode.text.match(/(\d+)%/) : null;
+      // Owner name appears in nameText after BOSS name with no prefix.
+      // e.g. "Lv1500 狂暴傲之煞 普尔赫达" -> owner = "普尔赫达"
+      const afterName = target.text.replace(/.*Lv\s*\d+/i, '').replace(targetName, '').trim();
+      const owner = afterName && afterName !== state.config.ownerName ? afterName.split(/\s+/)[0] : '';
+     return {
+       targetName,
+       targetLevel: level ? Number(level[1]) : 0,
+       hpPercent: hp ? Number(hp[1]) : null,
+        ownerName: owner ? cleanText(owner) : '',
+     };
+   }
 
 function scanAutoBattle(nodes) {
   // Detect auto-battle via autoFightDataTip > dataList > AutoStatusItem children.
