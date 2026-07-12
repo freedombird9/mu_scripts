@@ -61,8 +61,9 @@
       farmTargetMissing: false,
       navigationContext: null,
       lastError: null,
-      lastActionAt: 0,
-    };
+     lastActionAt: 0,
+      lastZSentAt: 0,
+   };
     syncRuntimeFlags();
 
     window.__muFourWindsBossMvp = {
@@ -307,21 +308,35 @@
       return clone(next);
     }
 
-    function hasLockedValidTarget(snapshot) {
-      const target = targetById(state.currentTargetId);
-      const now = Number(snapshot.at) || Date.now();
-      if (!isLockingIntent()) return false;
-      if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
-        releaseLockedTarget();
-        return false;
+   function hasLockedValidTarget(snapshot) {
+     const target = targetById(state.currentTargetId);
+     const now = Number(snapshot.at) || Date.now();
+     if (!isLockingIntent()) return false;
+     if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
+       releaseLockedTarget();
+       return false;
+     }
+     // During engage/observe_owner, never interrupt for another visible BOSS.
+     // Plan: only visible BOSSes can interrupt a *holding* target, not an engaged one.
+      // Also relax the status check: even if overlay updated the refresh timer mid-fight,
+      // we should finish the current combat before switching.
+      if (state.currentIntent.type === 'engage' || state.currentIntent.type === 'observe_owner') {
+        if (!target || isCooling(target, now)) {
+          releaseLockedTarget();
+          return false;
+        }
+        return true;
       }
-      return !findVisibleAttackableTarget(snapshot, target.id);
-    }
+     return !findVisibleAttackableTarget(snapshot, target.id);
+   }
 
-    function isLockingIntent() {
-      return state.currentIntent
-        && (state.currentIntent.type === 'travel_boss' || state.currentIntent.type === 'hold');
-    }
+   function isLockingIntent() {
+     return state.currentIntent
+        && (state.currentIntent.type === 'travel_boss'
+          || state.currentIntent.type === 'hold'
+          || state.currentIntent.type === 'engage'
+          || state.currentIntent.type === 'observe_owner');
+   }
 
     function isLockTargetEligible(target, now) {
       const definition = target && TARGETS.find((item) => item.id === target.id);
@@ -670,23 +685,15 @@
       return result;
     }
 
-    function ensureAutoBattle(snapshot) {
-      if (!snapshot.autoBattle || !snapshot.autoBattle.known) {
-        return { ok: false, reason: 'auto_battle_state_unknown' };
-      }
-      if (snapshot.autoBattle.enabled) {
-        return { ok: true, reason: 'already_enabled' };
-      }
-      // Send Z key.
-      try {
-        document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyZ', key: 'z', bubbles: true }));
-        document.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyZ', key: 'z', bubbles: true }));
-        appendLog('key_z_sent', { reason: 'auto_battle_was_off' });
-        return { ok: true, reason: 'key_z_sent' };
-      } catch (error) {
-        return { ok: false, reason: 'key_z_failed: ' + (error.message || String(error)) };
-      }
-    }
+  function ensureAutoBattle(snapshot) {
+     // The game auto-enables farming when the character arrives at a map-clicked destination.
+     // Do NOT send Z key — it's a toggle and could turn off the game's auto-farming.
+     // Just report the current auto-battle state for logging purposes.
+     if (!snapshot.autoBattle || !snapshot.autoBattle.known) {
+       return { ok: false, reason: 'auto_battle_state_unknown' };
+     }
+     return { ok: true, reason: snapshot.autoBattle.enabled ? 'already_enabled' : 'waiting_for_game_auto' };
+   }
 
     // --- Owner observation ---
 
