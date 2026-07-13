@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.2.1
+// @version      0.2.2
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -52,6 +52,8 @@
       '火焰巨人',
       '幽灵巨人',
       '地狱骑士',
+      '愤怒傲之煞',
+      '狂暴傲之煞',
     ];
     const DEFAULT_CANDIDATES = ['傲之煞', '闪电巨人'];
 
@@ -647,6 +649,7 @@
         mapName: initialMapName,
         bossName: detectedName,
         refreshAt,
+        sourcePath: candidate.sourcePath,
       });
       const bossName = cleanText(mapMarker && mapMarker.name)
         || cleanText(reconciledRecord && reconciledRecord.bossName)
@@ -756,7 +759,20 @@
         && Number(record && record.refreshAt) > Date.now() - EXPIRED_KEEP_MS
         && Math.abs(Number(record && record.refreshAt) - Number(input && input.refreshAt)) <= REFRESH_RECONCILE_WINDOW_MS
       ));
-      return matches.length === 1 ? matches[0] : null;
+      if (matches.length === 1) return matches[0];
+      // Fallback: match by same countdown source path when name attribution differs
+      // between scans (e.g., base name from combat context vs prefixed name from map marker).
+      const sourcePath = cleanText(input && input.sourcePath);
+      if (sourcePath) {
+        const sourceMatches = state.records.filter((record) => (
+          cleanText(record && record.mapName) === mapName
+          && cleanText(record && record.sourcePath) === sourcePath
+          && Number(record && record.refreshAt) > Date.now() - EXPIRED_KEEP_MS
+          && Math.abs(Number(record && record.refreshAt) - Number(input && input.refreshAt)) <= REFRESH_RECONCILE_WINDOW_MS
+        ));
+        if (sourceMatches.length === 1) return sourceMatches[0];
+      }
+      return null;
     }
 
     function upsertRecord(next) {
@@ -879,15 +895,26 @@
 
     function canMergeRecords(left, right) {
       if (!left || !right) return false;
-      if (!recordNamesMergeable(left, right)) return false;
       if (!mapsMergeable(left.mapName, right.mapName)) return false;
+      // Same countdown element (identical sourcePath) + close refresh time = same observation.
+      // Name attribution can differ between scans (map marker vs combat context), so
+      // bypass the name check when the source path matches.
+      // Guard: if both records have different coordinates, they are distinct BOSSes
+      // even if the sourcePath happened to match, so don't merge.
+      if (sameCountdownSource(left, right) && withinRefreshWindow(left, right)) {
+        const lc = normalizeBossCoordinate(left.bossCoordinate);
+        const rc = normalizeBossCoordinate(right.bossCoordinate);
+        if (lc && rc && lc !== rc) return false;
+        return true;
+      }
+      if (!recordNamesMergeable(left, right)) return false;
       if (sameStoredRecordId(left, right)) return true;
       if (sameTrialTaskbarBossRecord(left, right)) return true;
       const leftCoordinate = normalizeBossCoordinate(left.bossCoordinate);
       const rightCoordinate = normalizeBossCoordinate(right.bossCoordinate);
       if (leftCoordinate && rightCoordinate) return leftCoordinate === rightCoordinate;
       if (canUpgradeMissingCoordinate(left, right)) return true;
-      return sameCountdownSource(left, right) && withinRefreshWindow(left, right);
+      return false;
     }
 
     function sameStoredRecordId(left, right) {
@@ -2033,11 +2060,17 @@
       const value = cleanText(text);
       const lvIndex = value.search(/\bLv\s*\d+/i);
       if (lvIndex < 0) return '';
+      // Try before Lv first (legacy format: 'BossName Lv1350')
       const beforeLevel = value.slice(0, lvIndex)
         .replace(/(?:BOSS|目标|怪物|名称)\s*[:：]?/ig, ' ')
         .trim();
-      const chunks = beforeLevel.match(/[\u4e00-\u9fa5]{2,18}/g) || [];
-      return cleanText(chunks[chunks.length - 1] || extractBossName(value));
+      const beforeChunks = beforeLevel.match(/[\u4e00-\u9fa5]{2,18}/g) || [];
+      if (beforeChunks.length) return cleanText(beforeChunks[beforeChunks.length - 1]);
+      // Then try after Lv (actual format: 'Lv1350 BossName  OwnerName')
+      const afterLevel = value.slice(lvIndex).replace(/^\s*Lv\s*\d+\s*/i, '').trim();
+      const afterChunks = afterLevel.match(/[\u4e00-\u9fa5]{2,18}/g) || [];
+      if (afterChunks.length) return cleanText(afterChunks[0]);
+      return extractBossName(value);
     }
 
     function extractTaskbarBossName(text) {
@@ -2408,7 +2441,8 @@
     function cleanText(value) {
       return String(value == null ? '' : value)
         .replace(/<[^>]+>/g, '')
-        .replace(/\[\/?color(?:=[^\]]+)?\]/gi, '')
+        .replace(/\[\/?[^\]]*\]/gi, '')
+        .replace(/&[a-z]+;/gi, ' ')
         .replace(/\s+/g, ' ')
         .trim();
     }
