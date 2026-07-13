@@ -32,6 +32,8 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
+    farmTargetName: '1400级怪物',
+      rateRecheckIntervalMs: 5 * 60 * 1000,
     });
     const MAX_LOGS = 200;
     const TARGETS = Object.freeze([
@@ -62,8 +64,11 @@
       navigationContext: null,
       lastError: null,
      lastActionAt: 0,
-      lastZSentAt: 0,
-   };
+    lastZSentAt: 0,
+     farmArrivedAt: 0,
+     farmArrivedCoord: '',
+     rateCheck: { phase: 'idle', result: null, startedAt: 0, lastActionAt: 0, nextCheckAt: 0 },
+  };
     syncRuntimeFlags();
 
     window.__muFourWindsBossMvp = {
@@ -73,9 +78,29 @@
         syncRuntimeFlags();
         persist();
         appendLog('started', { dryRun: state.dryRun });
-        return getStatus();
-      },
-      pause(reason) {
+       return getStatus();
+     },
+     toggle() {
+       if (state.config.enabled && !state.dryRun) {
+         state.config.enabled = false;
+         state.config.dryRun = true;
+         syncRuntimeFlags();
+         persist();
+        state.rateCheck = { phase: 'idle', result: null, startedAt: 0, lastActionAt: 0, nextCheckAt: 0 };
+        state.farmArrivedAt = 0;
+        state.farmArrivedCoord = '';
+        releaseLockedTarget();
+         appendLog('toggled_off', {});
+       } else {
+         state.config.enabled = true;
+         state.config.dryRun = false;
+         syncRuntimeFlags();
+         persist();
+         appendLog('toggled_on', {});
+       }
+       return getStatus();
+     },
+     pause(reason) {
         state.paused = true;
         state.pauseReason = cleanText(reason) || 'manual';
         state.phase = 'PAUSED';
@@ -100,7 +125,8 @@
       scanNow: readSnapshot,
     };
 
-    scheduleTick();
+   scheduleTick();
+    setupKeyboardToggle();
 
     function scheduleTick() {
       if (state.tickId !== null) return;
@@ -130,9 +156,10 @@
         at: Date.now(),
         overlay: readOverlay(),
         scene: scanScene(nodes),
-        mapPanel: scanMapPanel(nodes),
-        combat: scanCombat(nodes),
-        autoBattle: scanAutoBattle(nodes),
+       mapPanel: scanMapPanel(nodes),
+       combat: scanCombat(nodes),
+       bossChallengePanel: scanBossChallengePanel(nodes),
+       autoBattle: scanAutoBattle(nodes),
         fguiReady: Boolean(gRoot),
       };
       const farmTargetMissing = snapshot.mapPanel.open && !snapshot.mapPanel.farmTarget;
@@ -190,17 +217,32 @@
         intent = makeIntent('safe_wait', state.currentTargetId || null, state.pauseReason || 'paused', 'none', 1);
       } else if (!snapshot || !snapshot.fguiReady || !snapshot.overlay || !snapshot.overlay.available) {
         resetOwnerObservation();
-        intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
-      } else if (hasLockedValidTarget(snapshot)) {
+       intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
+     } else if (needRateCheck(snapshot)) {
+       resetOwnerObservation();
+       intent = makeIntent('check_rate', null, 'boss rate check due', 'check_boss_rate', 0.95);
+    } else if (state.rateCheck.result === 'low') {
+      resetOwnerObservation();
+      releaseLockedTarget();
+      if (isAlreadyFarming(snapshot)) {
+        intent = makeIntent('safe_wait', null, 'boss rate low - already farming', 'none', 0.9);
+      } else {
+        intent = makeIntent('travel_farm', null, 'boss rate low - farming only', 'click_farm_target', 0.9);
+      }
+    } else if (hasLockedValidTarget(snapshot)) {
         intent = intentForLockedTarget(snapshot);
       } else {
         const candidate = selectHighestPriorityTarget(snapshot);
         if (candidate) {
           intent = intentForTarget(candidate, snapshot);
-        } else {
-          resetOwnerObservation();
-          intent = makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
-        }
+       } else {
+         resetOwnerObservation();
+         if (isAlreadyFarming(snapshot)) {
+           intent = makeIntent('safe_wait', null, 'no boss work - already farming', 'none', 0.8);
+         } else {
+           intent = makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
+         }
+       }
       }
       return applyIntent(intent);
     }
@@ -297,16 +339,20 @@
       };
     }
 
-    function applyIntent(intent) {
-      const next = clone(intent);
-      if (next.targetId) state.currentTargetId = next.targetId;
-      else if (next.type !== 'safe_wait') state.currentTargetId = '';
-      state.currentAction = next.action === 'none' ? null : next.action;
-      state.phase = next.type.toUpperCase();
-      state.lastIntent = next;
-      state.currentIntent = next;
-      return clone(next);
-    }
+   function applyIntent(intent) {
+     const next = clone(intent);
+     if (next.targetId) state.currentTargetId = next.targetId;
+     else if (next.type !== 'safe_wait') state.currentTargetId = '';
+     state.currentAction = next.action === 'none' ? null : next.action;
+     state.phase = next.type.toUpperCase();
+     if (!isLockingIntent() && state.navigationContext) {
+       appendLog('nav_context_cleared', { reason: 'intent not locking: ' + next.type, navKind: state.navigationContext.kind });
+       state.navigationContext = null;
+     }
+     state.lastIntent = next;
+     state.currentIntent = next;
+     return clone(next);
+   }
 
    function hasLockedValidTarget(snapshot) {
      const target = targetById(state.currentTargetId);
@@ -461,12 +507,21 @@
       return chebyshevDistance(scene.coordinate, target.coordinate) <= ARRIVAL_THRESHOLD;
     }
 
-    function chebyshevDistance(coordA, coordB) {
-      const a = coordA.split(',').map(Number);
-      const b = coordB.split(',').map(Number);
-      if (a.length < 2 || b.length < 2 || !a.every(Number.isFinite) || !b.every(Number.isFinite)) return Infinity;
-      return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
-    }
+   function chebyshevDistance(coordA, coordB) {
+     const a = coordA.split(',').map(Number);
+     const b = coordB.split(',').map(Number);
+     if (a.length < 2 || b.length < 2 || !a.every(Number.isFinite) || !b.every(Number.isFinite)) return Infinity;
+     return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
+   }
+
+   function isAlreadyFarming(snapshot) {
+     if (!state.farmArrivedAt || !state.farmArrivedCoord) return false;
+     if (state.navigationContext) return false;
+     if (snapshot && snapshot.mapPanel && snapshot.mapPanel.open) return false;
+     const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
+     if (!coord) return true; // coordinate hidden (e.g. map open) — assume still farming
+     return chebyshevDistance(coord, state.farmArrivedCoord) <= ARRIVAL_THRESHOLD;
+   }
 
     function executeIntent(intent, snapshot) {
       if (!intent) return null;
@@ -490,8 +545,9 @@
         case 'travel_farm': result = executeTravel(intent, snapshot, 'farm'); break;
         case 'hold': result = executeHold(intent, snapshot); break;
         case 'engage': result = executeEngage(intent, snapshot); break;
-        case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
-        case 'contested': result = { ok: true, reason: 'contested_cooldown_active' }; break;
+       case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
+       case 'check_rate': result = executeCheckRate(intent, snapshot); break;
+       case 'contested': result = { ok: true, reason: 'contested_cooldown_active' }; break;
         default:
           appendLog('intent_unknown', { type: intent.type });
           return clone(intent);
@@ -617,11 +673,13 @@
     }
 
     // Farming: if coordinate stable for 5s, consider arrived (game auto-starts farming).
-    if (kind === 'farm' && !moved && now - navCtx.lastCoordinateAt > 5000) {
-      appendLog('navigation_arrived', { kind: 'farm', targetId: 'farm', coordinate: currentCoord });
-      state.navigationContext = null;
-      return { ok: true, reason: 'arrived' };
-    }
+   if (kind === 'farm' && !moved && now - navCtx.lastCoordinateAt > 5000) {
+     appendLog('navigation_arrived', { kind: 'farm', targetId: 'farm', coordinate: currentCoord });
+     state.farmArrivedAt = now;
+     state.farmArrivedCoord = currentCoord;
+     state.navigationContext = null;
+     return { ok: true, reason: 'arrived' };
+   }
 
     // Stall check: coordinate unchanged beyond arrivalStallMs.
     if (!moved && now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
@@ -775,8 +833,10 @@
         ownerObserveSeconds: clampNumber(source.ownerObserveSeconds, 0, 3600, CONFIG_DEFAULTS.ownerObserveSeconds),
         contestedCooldownMs: clampNumber(source.contestedCooldownMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.contestedCooldownMs),
         arrivalStallMs: clampNumber(source.arrivalStallMs, 0, 60 * 60 * 1000, CONFIG_DEFAULTS.arrivalStallMs),
-        travelTimeoutMs: clampNumber(source.travelTimeoutMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.travelTimeoutMs),
-      };
+       travelTimeoutMs: clampNumber(source.travelTimeoutMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.travelTimeoutMs),
+       farmTargetName: cleanText(source.farmTargetName) || CONFIG_DEFAULTS.farmTargetName,
+       rateRecheckIntervalMs: clampNumber(source.rateRecheckIntervalMs, 60 * 1000, 60 * 60 * 1000, CONFIG_DEFAULTS.rateRecheckIntervalMs),
+     };
     }
 
     function appendLog(type, details) {
@@ -803,9 +863,10 @@
         config: state.config,
         lastError: state.lastError,
         navigationContext: clone(state.navigationContext),
-        currentIntent: clone(state.currentIntent),
-      });
-    }
+       currentIntent: clone(state.currentIntent),
+       rateCheck: clone(state.rateCheck),
+     });
+   }
 
     function readJson(key, fallback) {
       try {
@@ -893,10 +954,11 @@
         effectiveVisible: effectiveVisible !== false,
         selected: node.selected === true,
         rect: getRect(node),
-        packageName: pkg.name,
-        packageOwner: pkg.owner,
-      };
-    }
+       packageName: pkg.name,
+       packageOwner: pkg.owner,
+       url: node._url || '',
+     };
+   }
 
     function packageInfo(node) {
       const item = node && node.packageItem;
@@ -1006,11 +1068,11 @@
        }
        nameCounts[row.name] = idx + 1;
      });
-     const farmRow = rows.find((row) => {
-        const children = descendantsOf(panelNodes, row);
-        const title = children.find((item) => item.name === 'n0' && cleanText(item.contentText) === '1350级怪物');
-        return Boolean(title);
-      });
+    const farmRow = rows.find((row) => {
+       const children = descendantsOf(panelNodes, row);
+       const titleNode = children.find((item) => item.name === 'n0' && cleanText(item.contentText) === state.config.farmTargetName);
+       return Boolean(titleNode);
+     });
 
       return {
         open: true,
@@ -1089,7 +1151,252 @@ function scanAutoBattle(nodes) {
 
 function normalizeCoordinate(value) {
       const match = cleanText(value).match(/^(?:坐标[:：]?\s*)?\(?([0-9]{1,3})\s*,\s*([0-9]{1,3})\)?$/);
-      return match ? `${match[1]},${match[2]}` : '';
+     return match ? `${match[1]},${match[2]}` : '';
+   }
+
+    // --- Boss rate check (Feature 1) ---
+
+    const RATE_URL_MAP = {
+      'txt_bld': 'low',
+      'txt_blz': 'medium',
+      'txt_blg': 'high',
+    };
+    const FOUR_WINDS_BOSS_NAMES = ['傲之煞', '愤怒傲之煞', '狂暴傲之煞'];
+
+    function needRateCheck(snapshot) {
+      const now = Number(snapshot.at) || Date.now();
+     const rc = state.rateCheck;
+     if (rc.phase !== 'idle') return true;
+     if (rc.result === null) return true;
+     if (rc.result === 'low' && now >= rc.nextCheckAt) return true;
+     if (rc.result !== 'low' && now >= rc.nextCheckAt) return true;
+     return false;
+   }
+
+   function markRateCheckDone(result) {
+     const now = Date.now();
+     state.rateCheck.phase = 'idle';
+     state.rateCheck.result = result;
+     state.rateCheck.nextCheckAt = now + state.config.rateRecheckIntervalMs;
+     if (result !== 'low') {
+       state.farmArrivedAt = 0;
+       state.farmArrivedCoord = '';
+     }
+     appendLog('rate_check_done', { result, nextCheckAt: state.rateCheck.nextCheckAt });
+   }
+
+    function executeCheckRate(intent, snapshot) {
+      const now = Date.now();
+      const rc = state.rateCheck;
+      const panel = snapshot.bossChallengePanel;
+
+      if (rc.phase === 'idle') {
+        rc.phase = 'opening';
+        rc.startedAt = now;
+        rc.lastActionAt = 0;
+        appendLog('rate_check_start', {});
+      }
+
+      const MIN_ACTION_GAP = 800;
+      if (now - rc.lastActionAt < MIN_ACTION_GAP) {
+        return { ok: true, reason: 'rate_throttled' };
+      }
+
+      switch (rc.phase) {
+        case 'opening': {
+          if (panel && panel.open) {
+            rc.phase = 'select_tab';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'panel_already_open' };
+          }
+          const btn = panel && panel.openButton;
+          if (!btn) return { ok: false, reason: 'no_boss_challenge_button' };
+          const fresh = readSnapshot();
+          const freshBtn = fresh.bossChallengePanel && fresh.bossChallengePanel.openButton;
+          if (!freshBtn) return { ok: false, reason: 'open_button_vanished' };
+          const node = findNodeByPath(root(), freshBtn.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'open_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          appendLog('rate_check_opened_panel', { method: action.method });
+          return { ok: true, method: action.method, reason: 'panel_opened' };
+        }
+
+        case 'select_tab': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (panel.selectedTab === '野外BOSS') {
+            rc.phase = 'select_boss';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'tab_already_selected' };
+          }
+          const tab = panel.tabs.find((t) => t.text === '野外BOSS');
+          if (!tab) return { ok: false, reason: 'wild_tab_not_found' };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshTab = freshPanel.tabs.find((t) => t.text === '野外BOSS');
+          if (!freshTab) return { ok: false, reason: 'tab_vanished' };
+          const node = findNodeByPath(root(), freshTab.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'tab_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          appendLog('rate_check_selected_tab', { method: action.method });
+          return { ok: true, method: action.method, reason: 'tab_selected' };
+        }
+
+        case 'select_boss': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (panel.mapName.includes('四风平原')) {
+            rc.phase = 'read_rate';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_already_four_winds' };
+          }
+          const bossRow = panel.bossRows.find((r) => FOUR_WINDS_BOSS_NAMES.includes(r.name));
+          if (!bossRow) return { ok: false, reason: 'four_winds_boss_not_found' };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshRow = freshPanel.bossRows.find((r) => r.name === bossRow.name);
+          if (!freshRow) return { ok: false, reason: 'boss_row_vanished' };
+          const node = findNodeByPath(root(), freshRow.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'boss_row_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          appendLog('rate_check_selected_boss', { bossName: bossRow.name });
+          return { ok: true, method: action.method, reason: 'boss_selected' };
+        }
+
+        case 'read_rate': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (!panel.mapName.includes('四风平原')) {
+            rc.phase = 'select_boss';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_not_four_winds_retry' };
+          }
+          const rateUrl = panel.rateIconUrl || '';
+          const rateKey = rateUrl.split('/').pop() || '';
+          const rate = RATE_URL_MAP[rateKey] || null;
+          if (!rate) {
+            if (now - rc.startedAt > 10 * 1000) {
+              markRateCheckDone('unknown');
+              rc.phase = 'closing';
+              rc.lastActionAt = now;
+              return { ok: true, reason: 'rate_unknown_timeout' };
+            }
+            return { ok: true, reason: 'rate_not_ready' };
+          }
+          appendLog('rate_detected', { rate, url: rateUrl });
+          markRateCheckDone(rate);
+          rc.phase = 'closing';
+          rc.lastActionAt = now;
+          return { ok: true, reason: 'rate_read: ' + rate };
+        }
+
+        case 'closing': {
+          if (!panel || !panel.open) {
+            rc.phase = 'idle';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'panel_already_closed' };
+          }
+          const close = panel.closeButton;
+          if (!close) return { ok: false, reason: 'no_close_button' };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) {
+            rc.phase = 'idle';
+            return { ok: true, reason: 'panel_closed' };
+          }
+          if (!freshPanel.closeButton) return { ok: false, reason: 'close_vanished' };
+          const node = findNodeByPath(root(), freshPanel.closeButton.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'close_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          rc.phase = 'idle';
+          appendLog('rate_check_closed_panel', { method: action.method });
+          return { ok: true, method: action.method, reason: 'panel_closed' };
+        }
+
+        default:
+          rc.phase = 'idle';
+          return { ok: false, reason: 'unknown_rate_phase' };
+      }
+    }
+
+    function scanBossChallengePanel(nodes) {
+      const openButton = nodes.find((item) => item.effectiveVisible && item.name === 'btnBigBoss');
+      const panelRoot = nodes.find((item) => item.effectiveVisible
+        && (item.packageName === 'InstanceBossWnd' || item.packageOwner === 'InstanceBossWnd'));
+      if (!panelRoot) {
+        return { open: false, openButton: buttonSummaryWithPath(openButton) };
+      }
+      const panelNodes = descendantsOf(nodes, panelRoot);
+      const close = panelNodes.find((item) => item.effectiveVisible && item.name === 'btnClose');
+      const tabs = panelNodes
+        .filter((item) => item.effectiveVisible && /野外BOSS|福利BOSS|首饰BOSS|试炼之地|苦难炼狱/.test(item.contentText))
+        .map((item) => ({ text: item.contentText, selected: item.selected === true, rect: item.rect, sourcePath: item.path }));
+      const selectedTab = tabs.find((t) => t.selected) || null;
+      const bossRows = panelNodes
+        .filter((item) => item.effectiveVisible && item.packageName === 'BtnBoss')
+        .map((row) => {
+          const children = descendantsOf(panelNodes, row).filter((item) => item.path !== row.path);
+          const nameNode = children.find((item) => item.name === 'lab_name' && item.contentText);
+          return {
+            name: nameNode ? cleanText(nameNode.contentText) : '',
+            rect: row.rect,
+            sourcePath: row.path,
+          };
+        })
+        .filter((row) => row.name);
+      const mapNameNode = panelNodes.find((item) => item.effectiveVisible && item.name === 'lab_mapName' && item.contentText);
+      const mapName = mapNameNode ? cleanText(mapNameNode.contentText) : '';
+      const rateIcon = panelNodes.find((item) => item.effectiveVisible && item.name === 'BaolvIcon0');
+      const rateIconUrl = rateIcon ? rateIcon.url : '';
+      return {
+        open: true,
+        openButton: buttonSummaryWithPath(openButton),
+        closeButton: buttonSummaryWithPath(close),
+        selectedTab: selectedTab ? selectedTab.text : '',
+        tabs,
+        bossRows,
+        mapName,
+        rateIconUrl,
+      };
+    }
+
+    // --- Keyboard toggle (Feature 2) ---
+
+  function setupKeyboardToggle() {
+    if (window.__muBossToggleKeyBound) return;
+    window.__muBossToggleKeyBound = true;
+    window.addEventListener('keydown', function (e) {
+      if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (window.__muFourWindsBossMvp && typeof window.__muFourWindsBossMvp.toggle === 'function') {
+          var st = window.__muFourWindsBossMvp.toggle();
+          showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
+        }
+      }
+    }, true);
+  }
+ 
+    function showToast(text) {
+      var layer = document.createElement('div');
+      layer.textContent = text;
+      layer.style.cssText = 'position:fixed;top:30%;left:50%;transform:translate(-50%,-50%);z-index:99999;'
+        + 'padding:18px 48px;border-radius:12px;font-size:28px;font-weight:bold;color:#fff;'
+        + 'background:rgba(0,0,0,0.7);pointer-events:none;opacity:0;transition:opacity 0.3s ease;'
+        + 'text-shadow:0 2px 4px rgba(0,0,0,0.5);font-family:sans-serif;letter-spacing:2px;';
+      document.body.appendChild(layer);
+      requestAnimationFrame(function () { layer.style.opacity = '1'; });
+      setTimeout(function () {
+        layer.style.opacity = '0';
+        setTimeout(function () { if (layer.parentNode) layer.parentNode.removeChild(layer); }, 400);
+      }, 1500);
     }
   };
 
