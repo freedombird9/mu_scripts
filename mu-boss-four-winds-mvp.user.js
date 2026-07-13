@@ -65,10 +65,15 @@
       lastError: null,
      lastActionAt: 0,
     lastZSentAt: 0,
-     farmArrivedAt: 0,
-     farmArrivedCoord: '',
-     rateCheck: { phase: 'idle', result: null, startedAt: 0, lastActionAt: 0, nextCheckAt: 0 },
-  };
+    farmArrivedAt: 0,
+    farmArrivedCoord: '',
+   farmLastSeenFarmingAt: 0,
+  holdStartedAt: 0,
+  lastCheckedAt: {},
+  lastMapScanAt: 0,
+  mapScanContext: null,
+  rateCheck: { phase: 'idle', result: null, startedAt: 0, lastActionAt: 0, nextCheckAt: 0 },
+};
     syncRuntimeFlags();
 
     window.__muFourWindsBossMvp = {
@@ -87,10 +92,15 @@
          syncRuntimeFlags();
          persist();
         state.rateCheck = { phase: 'idle', result: null, startedAt: 0, lastActionAt: 0, nextCheckAt: 0 };
-        state.farmArrivedAt = 0;
-        state.farmArrivedCoord = '';
-        releaseLockedTarget();
-         appendLog('toggled_off', {});
+       state.farmArrivedAt = 0;
+       state.farmArrivedCoord = '';
+       state.farmLastSeenFarmingAt = 0;
+      state.holdStartedAt = 0;
+      state.lastCheckedAt = {};
+      state.lastMapScanAt = 0;
+      state.mapScanContext = null;
+      releaseLockedTarget();
+        appendLog('toggled_off', {});
        } else {
          state.config.enabled = true;
          state.config.dryRun = false;
@@ -184,10 +194,9 @@
         const previousRefreshAt = validRefreshAt(target.refreshAt);
 
         if (matchingRecord) {
-          const refreshAt = validRefreshAt(matchingRecord.refreshAt);
-          if (refreshAt !== null) {
-            if (refreshIdentity(previousRefreshAt) !== refreshIdentity(refreshAt)) clearCooldown(target);
-            target.refreshAt = refreshAt;
+         const refreshAt = validRefreshAt(matchingRecord.refreshAt);
+         if (refreshAt !== null) {
+           target.refreshAt = refreshAt;
             target.lastRefreshAt = refreshAt;
             target.lastRecordAt = validRecordAt(matchingRecord.observedAt, now);
           } else {
@@ -229,10 +238,13 @@
       } else {
         intent = makeIntent('travel_farm', null, 'boss rate low - farming only', 'click_farm_target', 0.9);
       }
-    } else if (hasLockedValidTarget(snapshot)) {
-        intent = intentForLockedTarget(snapshot);
-      } else {
-        const candidate = selectHighestPriorityTarget(snapshot);
+   } else if (hasLockedValidTarget(snapshot)) {
+       intent = intentForLockedTarget(snapshot);
+     } else if (needMapScan(snapshot)) {
+       resetOwnerObservation();
+       intent = makeIntent('scan_map', null, 'scanning map for boss refresh timers', 'open_map_scan', 0.85);
+     } else {
+       const candidate = selectHighestPriorityTarget(snapshot);
         if (candidate) {
           intent = intentForTarget(candidate, snapshot);
        } else {
@@ -296,9 +308,7 @@
     }
 
     function isCooling(target, now) {
-      return Boolean(target
-        && Number(target.cooldownUntil) > now
-        && refreshIdentity(target.cooldownRefreshAt) === refreshIdentity(target.refreshAt));
+      return Boolean(target && Number(target.cooldownUntil) > now);
     }
 
     function refreshIdentity(value) {
@@ -354,11 +364,13 @@
      return clone(next);
    }
 
-   function hasLockedValidTarget(snapshot) {
-     const target = targetById(state.currentTargetId);
-     const now = Number(snapshot.at) || Date.now();
-     if (!isLockingIntent()) return false;
-     if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
+  function hasLockedValidTarget(snapshot) {
+    const target = targetById(state.currentTargetId);
+    const now = Number(snapshot.at) || Date.now();
+    if (!isLockingIntent()) return false;
+    // travel_farm has no target ID — it locks navigation, not a boss target.
+    if (state.currentIntent.type === 'travel_farm') return false;
+    if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
        releaseLockedTarget();
        return false;
      }
@@ -376,13 +388,14 @@
      return !findVisibleAttackableTarget(snapshot, target.id);
    }
 
-   function isLockingIntent() {
-     return state.currentIntent
-        && (state.currentIntent.type === 'travel_boss'
-          || state.currentIntent.type === 'hold'
-          || state.currentIntent.type === 'engage'
-          || state.currentIntent.type === 'observe_owner');
-   }
+  function isLockingIntent() {
+    return state.currentIntent
+       && (state.currentIntent.type === 'travel_boss'
+         || state.currentIntent.type === 'travel_farm'
+         || state.currentIntent.type === 'hold'
+         || state.currentIntent.type === 'engage'
+         || state.currentIntent.type === 'observe_owner');
+  }
 
     function isLockTargetEligible(target, now) {
       const definition = target && TARGETS.find((item) => item.id === target.id);
@@ -414,10 +427,15 @@
         : null;
       if (visibleInterrupt) return visibleInterrupt;
 
-      const eligible = state.targets.filter((target) => !isCooling(target, now));
-      const unknown = eligible.filter((target) => validRefreshAt(target.refreshAt) === null);
-      if (unknown.length) return unknown[0];
-      const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
+     const eligible = state.targets.filter((target) => !isCooling(target, now));
+     const RECHECK_COOLDOWN_MS = 3 * 60 * 1000;
+     const unknown = eligible.filter((target) => {
+       if (validRefreshAt(target.refreshAt) !== null) return false;
+       const lastChecked = Number(state.lastCheckedAt[target.id]) || 0;
+       return now - lastChecked > RECHECK_COOLDOWN_MS;
+     });
+     if (unknown.length) return unknown[0];
+     const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
       if (visible.length) return visible[0];
       return eligible
         .filter((target) => {
@@ -453,9 +471,23 @@
         }
         return makeIntent('engage', target.id, 'visible boss is attackable', 'ensure_auto_battle', 1);
       }
-      if (isAtTarget(target, snapshot)) {
-        return makeIntent('hold', target.id, 'at boss coordinate', 'hold_position', 0.95);
-      }
+     if (isAtTarget(target, snapshot)) {
+       const now = Number(snapshot.at) || Date.now();
+       if (target.status === 'READY_UNKNOWN_TIMER') {
+         if (!state.holdStartedAt) state.holdStartedAt = now;
+         const HOLD_UNKNOWN_TIMEOUT_MS = 60 * 1000;
+        if (now - state.holdStartedAt > HOLD_UNKNOWN_TIMEOUT_MS) {
+          appendLog('hold_timeout_unknown', { targetId: target.id, elapsedMs: now - state.holdStartedAt });
+          state.lastCheckedAt[target.id] = now;
+          releaseLockedTarget();
+           state.holdStartedAt = 0;
+           return makeIntent('safe_wait', null, 'hold timeout - boss not refreshing', 'none', 0.7);
+         }
+       } else {
+         state.holdStartedAt = 0;
+       }
+       return makeIntent('hold', target.id, 'at boss coordinate', 'hold_position', 0.95);
+     }
       if (target.status === 'READY_UNKNOWN_TIMER') {
         return makeIntent('travel_boss', target.id, 'unknown refresh timer', 'click_boss_target', 0.9);
       }
@@ -514,14 +546,23 @@
      return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
    }
 
-   function isAlreadyFarming(snapshot) {
-     if (!state.farmArrivedAt || !state.farmArrivedCoord) return false;
-     if (state.navigationContext) return false;
+  function isAlreadyFarming(snapshot) {
+    if (!state.farmArrivedAt || !state.farmArrivedCoord) return false;
+    if (state.navigationContext) return false;
+     const autoBattle = snapshot && snapshot.autoBattle;
+     if (autoBattle && autoBattle.enabled) {
+       state.farmLastSeenFarmingAt = Date.now();
+       return true;
+     }
+     // Auto-battle flickers false during movement; tolerate brief gaps.
+     if (state.farmLastSeenFarmingAt && Date.now() - state.farmLastSeenFarmingAt < 60000) return true;
+     // Just arrived — give the game time to auto-start farming.
+     if (Date.now() - state.farmArrivedAt < 15000) return true;
      if (snapshot && snapshot.mapPanel && snapshot.mapPanel.open) return false;
      const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
-     if (!coord) return true; // coordinate hidden (e.g. map open) — assume still farming
+     if (!coord) return true;
      return chebyshevDistance(coord, state.farmArrivedCoord) <= ARRIVAL_THRESHOLD;
-   }
+  }
 
     function executeIntent(intent, snapshot) {
       if (!intent) return null;
@@ -546,8 +587,9 @@
         case 'hold': result = executeHold(intent, snapshot); break;
         case 'engage': result = executeEngage(intent, snapshot); break;
        case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
-       case 'check_rate': result = executeCheckRate(intent, snapshot); break;
-       case 'contested': result = { ok: true, reason: 'contested_cooldown_active' }; break;
+      case 'check_rate': result = executeCheckRate(intent, snapshot); break;
+      case 'scan_map': result = executeScanMap(intent, snapshot); break;
+      case 'contested': result = { ok: true, reason: 'contested_cooldown_active' }; break;
         default:
           appendLog('intent_unknown', { type: intent.type });
           return clone(intent);
@@ -1163,54 +1205,153 @@ function normalizeCoordinate(value) {
     };
     const FOUR_WINDS_BOSS_NAMES = ['傲之煞', '愤怒傲之煞', '狂暴傲之煞'];
 
-    function needRateCheck(snapshot) {
-      const now = Number(snapshot.at) || Date.now();
-     const rc = state.rateCheck;
-     if (rc.phase !== 'idle') return true;
-     if (rc.result === null) return true;
-     if (rc.result === 'low' && now >= rc.nextCheckAt) return true;
-     if (rc.result !== 'low' && now >= rc.nextCheckAt) return true;
-     return false;
-   }
+   function needRateCheck(snapshot) {
+     const now = Number(snapshot.at) || Date.now();
+    const rc = state.rateCheck;
+    if (rc.phase !== 'idle') return true;
+     // Don't start a new rate check while navigation is in progress.
+    if (state.navigationContext) return false;
+    if (state.mapScanContext) return false;
+    if (rc.result === null) return true;
+    if (rc.result === 'low' && now >= rc.nextCheckAt) return true;
+    if (rc.result !== 'low' && now >= rc.nextCheckAt) return true;
+    return false;
+ }
 
-   function markRateCheckDone(result) {
+  const MAP_SCAN_COOLDOWN_MS = 60 * 1000;
+  const MAP_SCAN_OPEN_WAIT_MS = 2000;
+
+  function needMapScan(snapshot) {
+    const now = Number(snapshot.at) || Date.now();
+    if (state.mapScanContext) return true;
+    if (state.navigationContext) return false;
+    if (state.rateCheck.phase !== 'idle') return false;
+    const eligible = state.targets.filter((target) => !isCooling(target, now));
+    if (!eligible.length) return false;
+    const allUnknown = eligible.every((target) => validRefreshAt(target.refreshAt) === null);
+   if (!allUnknown) return false;
+    if (now - state.lastMapScanAt < MAP_SCAN_COOLDOWN_MS) return false;
+    return true;
+  }
+
+  function markRateCheckDone(result) {
      const now = Date.now();
      state.rateCheck.phase = 'idle';
      state.rateCheck.result = result;
      state.rateCheck.nextCheckAt = now + state.config.rateRecheckIntervalMs;
-     if (result !== 'low') {
-       state.farmArrivedAt = 0;
-       state.farmArrivedCoord = '';
-     }
+    if (result !== 'low') {
+      state.farmArrivedAt = 0;
+      state.farmArrivedCoord = '';
+      state.farmLastSeenFarmingAt = 0;
+    }
      appendLog('rate_check_done', { result, nextCheckAt: state.rateCheck.nextCheckAt });
    }
 
-    function executeCheckRate(intent, snapshot) {
-      const now = Date.now();
-      const rc = state.rateCheck;
-      const panel = snapshot.bossChallengePanel;
+  function executeScanMap(intent, snapshot) {
+    const now = Date.now();
+    const ctx = state.mapScanContext;
 
-      if (rc.phase === 'idle') {
-        rc.phase = 'opening';
-        rc.startedAt = now;
-        rc.lastActionAt = 0;
-        appendLog('rate_check_start', {});
+    if (!ctx) {
+      state.mapScanContext = { startedAt: now, opened: false, closeClicked: false, openedAt: 0 };
+      appendLog('map_scan_start', {});
+    }
+
+    const scan = state.mapScanContext;
+
+    // Phase 1: open map if not already open.
+    if (!snapshot.mapPanel.open) {
+      if (!scan.opened) {
+        const result = clickOpenMapButton(snapshot);
+        if (result.ok) {
+          scan.opened = true;
+          scan.openedAt = now;
+          appendLog('map_scan_opened', { method: result.method });
+        }
+        return result;
       }
+      // Map was opened then closed (or closed by game), scan is done.
+      // Give overlay a moment to process, then finish.
+     appendLog('map_scan_complete', {});
+     state.lastMapScanAt = now;
+     state.mapScanContext = null;
+      return { ok: true, reason: 'map_scan_done' };
+    }
+
+    // Phase 2: map is open. Wait a bit for overlay to scan markers.
+    if (scan.opened && !scan.closeClicked && now - scan.openedAt >= MAP_SCAN_OPEN_WAIT_MS) {
+      // Time to close the map.
+      const result = closeMapPanel(snapshot);
+      if (result.ok) {
+        scan.closeClicked = true;
+        appendLog('map_scan_closing', {});
+      }
+      return result;
+    }
+
+    // Still waiting for overlay to collect data.
+    return { ok: true, reason: 'map_scan_waiting' };
+  }
+
+  function executeCheckRate(intent, snapshot) {
+     const now = Date.now();
+     const rc = state.rateCheck;
+     const panel = snapshot.bossChallengePanel;
+
+      // Safety timeout: never get stuck in rate check forever.
+      if (rc.phase !== 'idle' && now - rc.startedAt > 60 * 1000) {
+        appendLog('rate_check_timeout', { phase: rc.phase, elapsed: now - rc.startedAt });
+        markRateCheckDone('unknown');
+        return { ok: false, reason: 'rate_check_timeout' };
+      }
+
+     if (rc.phase === 'idle') {
+       rc.phase = 'opening';
+       rc.startedAt = now;
+       rc.lastActionAt = 0;
+       appendLog('rate_check_start', {});
+     }
 
       const MIN_ACTION_GAP = 800;
       if (now - rc.lastActionAt < MIN_ACTION_GAP) {
         return { ok: true, reason: 'rate_throttled' };
       }
 
-      switch (rc.phase) {
-        case 'opening': {
-          if (panel && panel.open) {
-            rc.phase = 'select_tab';
+     switch (rc.phase) {
+       case 'closing_map': {
+         // Close any open map panel before trying to open the BOSS challenge panel.
+         // The game only allows one panel open at a time; if the map is open,
+         // btnBigBoss is hidden and clicking it will silently fail.
+         const freshSnap = readSnapshot();
+         if (!freshSnap.mapPanel.open) {
+           rc.phase = 'opening';
+           rc.lastActionAt = now;
+           return { ok: true, reason: 'map_closed_proceed' };
+         }
+         const closeBtn = freshSnap.mapPanel.closeButton;
+         if (!closeBtn) return { ok: false, reason: 'no_map_close_button' };
+         const closeNode = findNodeByPath(root(), closeBtn.sourcePath);
+         if (!closeNode || !nodeIsEffectivelyVisible(closeNode)) return { ok: false, reason: 'map_close_node_unavailable' };
+         const closeAction = activateNode(closeNode);
+         if (!closeAction.ok) return { ok: false, reason: closeAction.reason };
+         rc.lastActionAt = now;
+         appendLog('rate_check_closed_map', { method: closeAction.method });
+         return { ok: true, method: closeAction.method, reason: 'map_closed_for_rate_check' };
+       }
+
+       case 'opening': {
+         if (panel && panel.open) {
+           rc.phase = 'select_tab';
+           rc.lastActionAt = now;
+           return { ok: true, reason: 'panel_already_open' };
+         }
+          // If another panel (e.g. map) is open, close it first — game only allows one panel at a time.
+          if (snapshot.mapPanel && snapshot.mapPanel.open) {
+            rc.phase = 'closing_map';
             rc.lastActionAt = now;
-            return { ok: true, reason: 'panel_already_open' };
+            return { ok: true, reason: 'need_close_map_first' };
           }
-          const btn = panel && panel.openButton;
-          if (!btn) return { ok: false, reason: 'no_boss_challenge_button' };
+         const btn = panel && panel.openButton;
+         if (!btn) return { ok: false, reason: 'no_boss_challenge_button' };
           const fresh = readSnapshot();
           const freshBtn = fresh.bossChallengePanel && fresh.bossChallengePanel.openButton;
           if (!freshBtn) return { ok: false, reason: 'open_button_vanished' };
