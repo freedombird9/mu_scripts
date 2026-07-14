@@ -33,7 +33,7 @@
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
     farmTargetName: '1400级怪物',
-      rateRecheckIntervalMs: 5 * 60 * 1000,
+      rateRecheckIntervalMs: 15 * 60 * 1000,
     });
     const MAX_LOGS = 200;
     const TARGETS = Object.freeze([
@@ -61,9 +61,12 @@
       ownerObservation: null,
       tickId: null,
       farmTargetMissing: false,
-      navigationContext: null,
-      lastError: null,
-     lastActionAt: 0,
+     navigationContext: null,
+     lastError: null,
+     lastCombatTargetId: '',
+     lastCombatHpPercent: null,
+     lastCombatSeenAt: 0,
+    lastActionAt: 0,
     lastZSentAt: 0,
     farmArrivedAt: 0,
     farmArrivedCoord: '',
@@ -143,11 +146,12 @@
       state.tickId = window.setInterval(tick, TICK_MS);
     }
 
-    function tick() {
-      try {
-        const snapshot = readSnapshot();
-        reconcileTargets(snapshot);
-        const intent = chooseIntent(snapshot);
+   function tick() {
+     try {
+       const snapshot = readSnapshot();
+       reconcileTargets(snapshot);
+       trackCombat(snapshot);
+       const intent = chooseIntent(snapshot);
         if (state.enabled && !state.dryRun && !state.paused) {
           return executeIntent(intent, snapshot);
         }
@@ -213,10 +217,29 @@
         target.status = targetStatus(target, now);
         return target;
       });
-      return clone(state.targets);
-    }
+     return clone(state.targets);
+   }
 
-    function chooseIntent(snapshot) {
+   function trackCombat(snapshot) {
+     const combat = snapshot && snapshot.combat;
+     const targetName = combat && cleanText(combat.targetName);
+     const hp = combat && combat.hpPercent;
+     if (targetName && hasVisibleHpBar(combat) && Number(hp) > 0) {
+       const target = TARGETS.find((t) => t.name === targetName);
+       if (target) {
+         state.lastCombatTargetId = target.id;
+         state.lastCombatHpPercent = Number(hp);
+         state.lastCombatSeenAt = Number(snapshot.at) || Date.now();
+       }
+     }
+   }
+
+   function isCombatRecentlyActive(now) {
+     if (!state.lastCombatTargetId || !state.lastCombatSeenAt) return false;
+     return now - state.lastCombatSeenAt < 30000;
+   }
+
+   function chooseIntent(snapshot) {
       let intent;
       if (!state.config.enabled) {
         resetOwnerObservation();
@@ -355,10 +378,10 @@
      else if (next.type !== 'safe_wait') state.currentTargetId = '';
      state.currentAction = next.action === 'none' ? null : next.action;
      state.phase = next.type.toUpperCase();
-     if (!isLockingIntent() && state.navigationContext) {
-       appendLog('nav_context_cleared', { reason: 'intent not locking: ' + next.type, navKind: state.navigationContext.kind });
-       state.navigationContext = null;
-     }
+    if (!isLockingIntentOf(next) && state.navigationContext) {
+      appendLog('nav_context_cleared', { reason: 'intent not locking: ' + next.type, navKind: state.navigationContext.kind });
+      state.navigationContext = null;
+    }
      state.lastIntent = next;
      state.currentIntent = next;
      return clone(next);
@@ -374,27 +397,41 @@
        releaseLockedTarget();
        return false;
      }
-     // During engage/observe_owner, never interrupt for another visible BOSS.
-     // Plan: only visible BOSSes can interrupt a *holding* target, not an engaged one.
-      // Also relax the status check: even if overlay updated the refresh timer mid-fight,
-      // we should finish the current combat before switching.
-      if (state.currentIntent.type === 'engage' || state.currentIntent.type === 'observe_owner') {
-        if (!target || isCooling(target, now)) {
-          releaseLockedTarget();
-          return false;
-        }
-        return true;
-      }
+    // During engage/observe_owner, never interrupt for another visible BOSS.
+    // Plan: only visible BOSSes can interrupt a *holding* target, not an engaged one.
+     // Also relax the status check: even if overlay updated the refresh timer mid-fight,
+     // we should finish the current combat before switching.
+     if (state.currentIntent.type === 'engage'
+        || state.currentIntent.type === 'observe_owner'
+        || (state.currentIntent.type === 'travel_boss'
+            && target
+            && target.id === state.lastCombatTargetId
+            && isCombatRecentlyActive(now))) {
+       if (!target || isCooling(target, now)) {
+         releaseLockedTarget();
+         return false;
+       }
+       return true;
+     }
      return !findVisibleAttackableTarget(snapshot, target.id);
    }
 
-  function isLockingIntent() {
-    return state.currentIntent
-       && (state.currentIntent.type === 'travel_boss'
-         || state.currentIntent.type === 'travel_farm'
-         || state.currentIntent.type === 'hold'
-         || state.currentIntent.type === 'engage'
-         || state.currentIntent.type === 'observe_owner');
+ function isLockingIntent() {
+   return state.currentIntent
+      && (state.currentIntent.type === 'travel_boss'
+        || state.currentIntent.type === 'travel_farm'
+        || state.currentIntent.type === 'hold'
+        || state.currentIntent.type === 'engage'
+        || state.currentIntent.type === 'observe_owner');
+ }
+  function isLockingIntentOf(intent) {
+    const i = intent || state.currentIntent;
+    return i
+      && (i.type === 'travel_boss'
+        || i.type === 'travel_farm'
+        || i.type === 'hold'
+        || i.type === 'engage'
+        || i.type === 'observe_owner');
   }
 
     function isLockTargetEligible(target, now) {
