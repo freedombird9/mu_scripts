@@ -1580,103 +1580,87 @@
       }
     }
 
-    // --- Z key safety net ---
+   // --- Z key safety net ---
 
-  function ensureZKey(snapshot) {
-    const now = Date.now();
-    const autoBattle = snapshot.autoBattle;
+ function ensureZKey(snapshot) {
+   const now = Date.now();
+   const autoBattle = snapshot.autoBattle;
 
-    if (autoBattle && autoBattle.enabled) {
-      state.zKeyRetryCount = 0;
-      return { ok: true, reason: 'auto_battle_enabled' };
-    }
+   if (autoBattle && autoBattle.enabled) {
+     state.zKeyRetryCount = 0;
+     return { ok: true, reason: 'auto_battle_enabled' };
+   }
 
-    if (!state.arrivalConfirmedAt) return { ok: true, reason: 'not_arrived_yet' };
+   if (!state.arrivalConfirmedAt) return { ok: true, reason: 'not_arrived_yet' };
 
-    // Reduce initial delay: when character is blocked by other players and can't
-    // reach the exact BOSS coordinate, the game's built-in auto-activation won't
-    // trigger, so waiting 3s is pointless. 1.5s is enough for the edge case where
-    // the character does reach the exact coordinate and the game auto-activates.
-    if (now - state.arrivalConfirmedAt < 1500) return { ok: true, reason: 'waiting_post_arrival' };
+   // Reduce initial delay: when character is blocked by other players and can't
+   // reach the exact BOSS coordinate, the game's built-in auto-activation won't
+   // trigger, so waiting 3s is pointless. 1.5s is enough for the edge case where
+   // the character does reach the exact coordinate and the game auto-activates.
+   if (now - state.arrivalConfirmedAt < 1500) return { ok: true, reason: 'waiting_post_arrival' };
 
-    // No hard retry limit — reset counter after 15s cooldown so the script keeps
-    // trying. This handles: Z key fails initially (no targets nearby) → BOSS spawns
-    // later → retry count was exhausted → script never re-activates auto-battle.
-    if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
-      state.zKeyRetryCount = 0;
-    }
+   // No hard retry limit — reset counter after 15s cooldown so the script keeps
+   // trying. This handles: Z key fails initially (no targets nearby) → BOSS spawns
+   // later → retry count was exhausted → script never re-activates auto-battle.
+   if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
+     state.zKeyRetryCount = 0;
+   }
 
-    // 5s throttle (was 2s): Z key is a toggle. After sending Z, the game needs
-    // time to update the autoBattle UI (AutoStatusItem). If we re-send too fast
-    // while the snapshot hasn't caught up, we risk toggling auto-battle back off.
-    if (now - state.zKeySentAt < 5000) return { ok: true, reason: 'z_key_throttled' };
+   // 5s throttle (was 2s): Z key is a toggle. After sending Z, the game needs
+   // time to update the autoBattle UI (AutoStatusItem). If we re-send too fast
+   // while the snapshot hasn't caught up, we risk toggling auto-battle back off.
+   if (now - state.zKeySentAt < 5000) return { ok: true, reason: 'z_key_throttled' };
 
-    // Method 1 (primary): Direct call caller.vm.onBtnAttack() from btnAutoFight click listener.
-    // CDP verified: caller.vm.onBtnAttack() toggles auto-battle state reliably.
-    const gRoot = root();
-    if (gRoot) {
-      const nodes = collectNodes(gRoot);
-      const btnItem = nodes.find((item) => item.effectiveVisible && item.name === 'btnAutoFight');
-      if (btnItem) {
-        const node = findNodeByPath(gRoot, btnItem.path);
-        if (node && node.displayObject) {
-          const evts = node.displayObject._events;
-          if (evts && evts.click && Array.isArray(evts.click)) {
-            for (let i = 0; i < evts.click.length; i++) {
-              const listener = evts.click[i];
-              const caller = listener && listener.caller;
-              if (caller && caller.vm && typeof caller.vm.onBtnAttack === 'function') {
-                try {
-                  caller.vm.onBtnAttack();
-                  state.zKeySentAt = now;
-                  state.zKeyRetryCount++;
-                  appendLog('z_key_sent', { method: 'vm_onBtnAttack', retry: state.zKeyRetryCount });
-                  return { ok: true, method: 'vm_onBtnAttack', reason: 'z_key_sent' };
-                } catch (e) {
-                  appendLog('z_key_vm_error', { error: e.message });
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Method 2 (fallback): Keyboard event
-    try {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', code: 'KeyZ', keyCode: 90, bubbles: true }));
-      window.dispatchEvent(new KeyboardEvent('keyup', { key: 'z', code: 'KeyZ', keyCode: 90, bubbles: true }));
+    // Send Z key via Laya stage event system (CDP verified 2026-07-14).
+    // fireClick(), vm.onBtnAttack(), and DOM KeyboardEvent do NOT work.
+    // Only directly calling the Laya stage keydown listener triggers the toggle.
+    if (toggleAutoFight()) {
       state.zKeySentAt = now;
       state.zKeyRetryCount++;
-      appendLog('z_key_sent', { method: 'keyboard', retry: state.zKeyRetryCount });
-      return { ok: true, method: 'keyboard', reason: 'z_key_sent' };
-    } catch (e) {
-      appendLog('z_key_keyboard_error', { error: e.message });
-    }
-
-    // Method 3 (last resort): activateNode click on btnAutoFight
-    if (gRoot) {
-      const nodes = collectNodes(gRoot);
-      const btnItem2 = nodes.find((item) => item.effectiveVisible && item.name === 'btnAutoFight');
-      if (btnItem2) {
-        const node2 = findNodeByPath(gRoot, btnItem2.path);
-        if (node2 && nodeIsEffectivelyVisible(node2)) {
-          const action = activateNode(node2);
-          if (action.ok) {
-            state.zKeySentAt = now;
-            state.zKeyRetryCount++;
-            appendLog('z_key_sent', { method: 'btn_click', retry: state.zKeyRetryCount });
-            return { ok: true, method: 'btn_click', reason: 'z_key_sent' };
-          }
-        }
-      }
+      appendLog('z_key_sent', { method: 'laya_keydown', retry: state.zKeyRetryCount });
+      return { ok: true, method: 'laya_keydown', reason: 'z_key_sent' };
     }
 
     state.zKeyRetryCount++;
     return { ok: true, reason: 'z_key_pending' };
   }
 
-    // --- Hold / Engage with Z key safety net ---
+    // toggleAutoFight: send Z key via Laya stage keydown event (CDP verified 2026-07-14)
+    function toggleAutoFight() {
+      try {
+        if (typeof Laya === 'undefined' || !Laya.stage || !Laya.stage._events || !Laya.stage._events.keydown) return false;
+        const ev = new Laya.Event();
+        ev.type = Laya.Event.KEYDOWN;
+        ev.keyCode = 90;
+        ev.nativeEvent = { keyCode: 90, key: 'z', code: 'KeyZ', preventDefault: function(){}, stopPropagation: function(){} };
+        ev.target = Laya.stage;
+        ev.currentTarget = Laya.stage;
+        const listener = Laya.stage._events.keydown[0];
+        if (!listener || !listener.method || !listener.caller) return false;
+        listener.method.call(listener.caller, ev);
+        return true;
+      } catch (e) {
+        appendLog('toggle_auto_fight_error', { error: e.message });
+        return false;
+      }
+    }
+
+    // isAutoFightOn: read autoFightState controller selectedIndex (CDP verified 2026-07-14)
+    // selectedIndex 0 = manual (off), 2 = auto (on)
+    function isAutoFightOn() {
+      try {
+        const gRoot = root();
+        if (!gRoot || typeof gRoot.getChildAt !== 'function') return false;
+        const mainWnd = gRoot.getChildAt(0);
+        if (!mainWnd || !mainWnd.mMainBottom) return false;
+        const state = mainWnd.mMainBottom.autoFightState;
+        return !!state && state.selectedIndex === 2;
+      } catch (_) {
+        return false;
+      }
+    }
+
+   // --- Hold / Engage with Z key safety net ---
 
     function executeHold(intent, snapshot) {
       const target = targetById(intent.targetId);
@@ -2287,28 +2271,16 @@
         targetLevel: level ? Number(level[1]) : 0,
         hpPercent: hp ? Number(hp[1]) : null,
         ownerName: owner ? cleanText(owner) : '',
-      };
-    }
+     };
+  }
 
-    function scanAutoBattle(nodes) {
-      const tip = nodes.find((item) => item.name === 'autoFightDataTip' && item.effectiveVisible);
-      if (!tip) return { known: false, enabled: false };
-      const tipPrefix = tip.path + '/';
-      const dataList = nodes.find((item) => item.path === tipPrefix + 'dataList[0]' && item.effectiveVisible);
-      if (!dataList) return { known: true, enabled: false, sourcePath: tip.path };
-      const listPrefix = dataList.path + '/';
-      const statusItems = nodes.filter((item) =>
-        item.path !== dataList.path
-        && item.path.startsWith(listPrefix)
-        && item.effectiveVisible
-        && item.packageName === 'AutoStatusItem'
-      );
-      return {
-        known: true,
-        enabled: statusItems.length > 0,
-        sourcePath: tip.path,
-      };
-    }
+  function scanAutoBattle(nodes) {
+    // CDP verified 2026-07-14: AutoStatusItem count is unreliable (stays 0
+    // even when auto-battle is on). Use autoFightState controller selectedIndex
+    // instead: 0 = manual (off), 2 = auto (on).
+    const on = isAutoFightOn();
+    return { known: true, enabled: on };
+  }
 
     // 子任务 4: scanTrialTaskbar — scan left taskbar BOSS entries
     function scanTrialTaskbar(nodes) {
