@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.1
+// @version      0.1.2
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1366,10 +1366,30 @@
           // Close any open panels first (single-panel constraint)
           const closeResult = closePanelIfExists('Instance_BossUI');
           closePanelIfExists('MapDetialWnd');
-          ctx.phase = 'click_exit';
+          ctx.phase = 'waiting_for_close';
           ctx.lastActionAt = now;
           appendLog('exit_trial_panels_closed', { reason: closeResult.reason });
-          return { ok: true, reason: 'panels_closed' };
+          return { ok: true, reason: 'panels_closing' };
+        }
+
+        case 'waiting_for_close': {
+          // 面板关闭是异步的,btnExit 在场景 UI(Damage list)内,
+          // BOSS 面板/大地图未关完时 effectiveVisible=false 会导致 click_exit
+          // 返回 exit_button_not_found。等待两者都关闭后再进 click_exit。
+          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
+          const mapOpen = snapshot.mapPanel && snapshot.mapPanel.open;
+          if (!bossOpen && !mapOpen) {
+            ctx.phase = 'click_exit';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'panels_closed' };
+          }
+          if (now - ctx.lastActionAt > 3000) {
+            ctx.phase = 'closing_panels';
+            ctx.lastActionAt = now;
+            appendLog('exit_trial_close_retry', {});
+            return { ok: true, reason: 'close_retry' };
+          }
+          return { ok: true, reason: 'waiting_for_panels_close' };
         }
 
         case 'click_exit': {
@@ -2082,6 +2102,10 @@
         }
 
         case 'closing': {
+          // 等待面板真正关闭后再置 idle(异步关闭约束)。
+          // closePanelIfExists 点击 btnClose 是异步,同 tick 内面板还没消失;
+          // 若立即置 idle,下一 tick 其他状态机(needMapScan 等)会读到
+          // bossChallengePanel.open === true,触发单面板冲突。
           if (!panel || !panel.open) {
             rc.phase = 'idle';
             rc.lastActionAt = now;
@@ -2089,9 +2113,9 @@
           }
           const result = closePanelIfExists('Instance_BossUI');
           rc.lastActionAt = now;
-          rc.phase = 'idle';
           appendLog('rate_check_closed_panel', { reason: result.reason });
-          return { ok: true, reason: 'panel_closed' };
+          // 保留在 closing 阶段,下一 tick 重新进入此 case 验证面板已关闭
+          return { ok: true, reason: 'panel_closing' };
         }
 
         default:
