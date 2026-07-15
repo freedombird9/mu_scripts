@@ -384,13 +384,30 @@
        const st = targetStatus(t, now);
        return st === 'READY' || st === 'READY_UNKNOWN_TIMER';
      });
-     if (trialHasReady) return true;
-     // Both sides have only PREPARE bosses — compare refresh times
-     const trialEarliest = Math.min(...trialAttackable.map((t) => Number(t.refreshAt) || now));
-     const fourWindsEarliest = Math.min(...fourWindsAttackable.map((t) => Number(t.refreshAt) || now));
-     const diff = Math.abs(trialEarliest - fourWindsEarliest);
-     if (diff <= state.config.trialPriorityWindowMs) return true;
-     return trialEarliest <= fourWindsEarliest;
+    if (trialHasReady) return true;
+    // Trial land has PREPARE bosses (within pre-wait window) — need travel time, prioritize
+    const trialHasPrepare = trialAttackable.some((t) => {
+      const st = targetStatus(t, now);
+      return st === 'PREPARE';
+    });
+    if (trialHasPrepare) {
+      // Defer only if four winds also has a PREPARE boss refreshing sooner
+      const fourWindsPrepare = fourWindsAttackable.filter((t) =>
+        targetStatus(t, now) === 'PREPARE');
+      if (!fourWindsPrepare.length) return true;
+      const trialEarliestPrepare = Math.min(...trialAttackable
+        .filter((t) => targetStatus(t, now) === 'PREPARE')
+        .map((t) => Number(t.refreshAt)));
+      const fourWindsEarliestPrepare = Math.min(...fourWindsPrepare
+        .map((t) => Number(t.refreshAt)));
+      return trialEarliestPrepare <= fourWindsEarliestPrepare;
+    }
+    // Both sides have only PREPARE bosses — compare refresh times
+    const trialEarliest = Math.min(...trialAttackable.map((t) => Number(t.refreshAt) || now));
+    const fourWindsEarliest = Math.min(...fourWindsAttackable.map((t) => Number(t.refreshAt) || now));
+    const diff = Math.abs(trialEarliest - fourWindsEarliest);
+    if (diff <= state.config.trialPriorityWindowMs) return true;
+    return trialEarliest <= fourWindsEarliest;
    }
 
     // --- Target state & matching ---
@@ -1196,15 +1213,19 @@
         return { ok: true, reason: 'trial_taskbar_entry_not_found_retry' };
       }
 
+     // Taskbar 在 cooling 倒计时阶段也允许点击导航(游戏行为:点击 cooling
+     // entry 会寻路到 BOSS 坐标,不必等 BOSS 真正刷新)。先同步 refreshAt 让
+     // chooseIntent 跟踪实际倒计时,然后 fall through 到下面的点击逻辑。
      if (entry.status === 'cooling') {
-       // Update target refreshAt from taskbar countdown so chooseIntent stops selecting this boss
        const parsedMs = parseCountdownMs(entry.desText);
        if (parsedMs > 0) {
          target.refreshAt = Date.now() + parsedMs;
-         target.status = 'WAITING_REFRESH';
          appendLog('trial_boss_cooling_update', { name: target.name, desText: entry.desText, refreshAt: target.refreshAt });
        }
-       return { ok: false, reason: 'trial_boss_cooling_in_taskbar' };
+       // 不 return —— 让下面的 navCtx 建立与点击逻辑执行。
+       // 不再硬设 target.status = 'WAITING_REFRESH':reconcileTargets 下 tick
+       // 会用 targetStatus() 基于 refreshAt 自然重算(<90s 内为 PREPARE),
+       // 硬设 WAITING_REFRESH 会与 isLockTargetEligible 的 allowedStatuses 冲突。
      }
 
       // Set up navigation context
@@ -1247,8 +1268,8 @@
         navCtx.lastCoordinateAt = now;
       }
 
-      // Coordinate stable for 5s → arrived
-      if (!moved && now - navCtx.lastCoordinateAt > 5000) {
+      // Coordinate stable for 3s → arrived
+      if (!moved && now - navCtx.lastCoordinateAt > 3000) {
         state.arrivalConfirmedAt = now;
         state.navigationContext = null;
         appendLog('trial_nav_arrived', { coordinate: currentCoord });
@@ -1299,7 +1320,7 @@
       const now = Date.now();
       if (!state.exitTrialContext) {
         state.exitTrialContext = {
-          phase: 'click_exit',
+          phase: 'closing_panels',
           startedAt: now,
           lastActionAt: 0,
           retried: false,
@@ -1313,7 +1334,7 @@
       if (now - ctx.startedAt > 30 * 1000) {
         if (!ctx.retried) {
           ctx.retried = true;
-          ctx.phase = 'click_exit';
+          ctx.phase = 'closing_panels';
           ctx.startedAt = now;
           ctx.lastActionAt = 0;
           appendLog('exit_trial_retry_timeout', {});
@@ -1341,6 +1362,16 @@
       const nodes = gRoot ? collectNodes(gRoot) : [];
 
       switch (ctx.phase) {
+        case 'closing_panels': {
+          // Close any open panels first (single-panel constraint)
+          const closeResult = closePanelIfExists('Instance_BossUI');
+          closePanelIfExists('MapDetialWnd');
+          ctx.phase = 'click_exit';
+          ctx.lastActionAt = now;
+          appendLog('exit_trial_panels_closed', { reason: closeResult.reason });
+          return { ok: true, reason: 'panels_closed' };
+        }
+
         case 'click_exit': {
           // Exit button is btnExit (pkgName 'btnLeave') inside Damage list, visible in trial land.
           const exitNode = nodes.find((item) =>
