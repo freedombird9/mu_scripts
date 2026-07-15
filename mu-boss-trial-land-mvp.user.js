@@ -1666,7 +1666,9 @@
         ev.nativeEvent = { keyCode: 90, key: 'z', code: 'KeyZ', preventDefault: function(){}, stopPropagation: function(){} };
         ev.target = Laya.stage;
         ev.currentTarget = Laya.stage;
-        const listener = Laya.stage._events.keydown[0];
+        // keydown can be a single listener object (M class) or an array of listeners
+        const kd = Laya.stage._events.keydown;
+        const listener = Array.isArray(kd) ? kd[0] : kd;
         if (!listener || !listener.method || !listener.caller) return false;
         listener.method.call(listener.caller, ev);
         return true;
