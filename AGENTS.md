@@ -214,3 +214,11 @@ delete window.__muFourWindsBossMvp;  // 清除旧实例
 - ENGAGE 期间不应被其他可见 BOSS 打断(plan 规定只有守点状态可被打断)。
 - `isLockTargetEligible` 的 `allowedStatuses` 不包含 `WAITING_REFRESH`,如果在战斗中 overlay 更新了刷新时间导致状态变化,会释放锁定。ENGAGE 期间应放宽状态检查,只看 `isCooling`。
 - 日志缓冲区(200 条)容易被高频事件(如 `key_z_sent`、`map_closed`)填满,把关键日志挤掉。应避免每 tick 产生日志,或增大缓冲区。
+
+## 11. 版本号管理
+
+- **每次修改脚本后,必须升级该脚本的版本号**(Tampermonkey metadata 中的 `@version` 字段),以便区分不同版本。
+- 版本号格式遵循语义化版本: `主版本.次版本.修订号` (如 `1.0.0` → `1.0.1`)。
+  - 修订号: bug 修复、小调整。
+  - 次版本: 新功能、行为变更。
+  - 主版本: 重大重构或架构变更。

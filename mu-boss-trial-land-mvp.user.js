@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.0
+// @version      0.1.1
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
