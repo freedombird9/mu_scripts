@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.2
+// @version      0.1.4
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1160,6 +1160,14 @@
        return { ok: true, reason: 'closing_blocking_panel' };
      }
 
+     // 大地图打开时试炼之地左侧任务栏(bossinfoitem 节点)被遮挡、
+     // effectiveVisible=false,scanTrialTaskbar 返回空数组。不主动关地图
+     // 会走 3 次 fallback 才退到 executeTravel,浪费 tick 且走错恢复路径。
+     if (snapshot.mapPanel && snapshot.mapPanel.open) {
+       closePanelIfExists('MapDetialWnd');
+       return { ok: true, reason: 'closing_map_panel' };
+     }
+
      if (state.arrivalConfirmedAt) {
         const zResult = ensureZKey(snapshot);
         if (zResult.ok) {
@@ -1268,8 +1276,15 @@
         navCtx.lastCoordinateAt = now;
       }
 
-      // Coordinate stable for 3s → arrived
-      if (!moved && now - navCtx.lastCoordinateAt > 3000) {
+      // Coordinate stable for 5s AND close to target → arrived
+      // 5s 窗口过滤寻路中途避障的短暂停顿;距离校验防止稳定停在中途被误判到达,
+      // 否则角色会停在离 BOSS 3-5 格处,ensureZKey 开挂后打不到 BOSS,
+      // 状态机重选 intent 再次进入 travel_trial_boss 再次误判 → 周期性停顿。
+      if (!moved && now - navCtx.lastCoordinateAt > 5000) {
+        if (target.coordinate !== 'TBD'
+          && chebyshevDistance(currentCoord, target.coordinate) > ARRIVAL_THRESHOLD) {
+          return { ok: true, reason: 'navigating_stable_but_far' };
+        }
         state.arrivalConfirmedAt = now;
         state.navigationContext = null;
         appendLog('trial_nav_arrived', { coordinate: currentCoord });
@@ -1507,8 +1522,16 @@
 
       switch (ctx.phase) {
         case 'opening_map': {
-          // Close any other panels first (single-panel constraint)
-          closePanelIfExists('Instance_BossUI');
+          // 先关闭其他面板(单面板约束)。BOSS 面板关闭是异步的,
+          // 若同 tick 内调用 clickOpenMapButton,btn_map 会被 BOSS 面板遮挡
+          // 导致 map_open_button_vanished。先关闭,等下一 tick 验证后再开地图。
+          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
+          if (bossOpen) {
+            closePanelIfExists('Instance_BossUI');
+            ctx.phase = 'waiting_for_close';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'closing_blocking_panel' };
+          }
           if (snapshot.mapPanel && snapshot.mapPanel.open) {
             ctx.phase = 'select_map';
             ctx.lastActionAt = now;
@@ -1521,6 +1544,23 @@
             appendLog('teleport_opened_map', { method: result.method });
           }
           return result;
+        }
+
+        case 'waiting_for_close': {
+          // 等待 BOSS 面板真正关闭后再进 opening_map 开地图。
+          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
+          if (!bossOpen) {
+            ctx.phase = 'opening_map';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'panel_closed' };
+          }
+          if (now - ctx.lastActionAt > 3000) {
+            ctx.phase = 'opening_map';
+            ctx.lastActionAt = now;
+            appendLog('teleport_close_retry', {});
+            return { ok: true, reason: 'close_retry' };
+          }
+          return { ok: true, reason: 'waiting_for_panel_close' };
         }
 
         case 'select_map': {
@@ -2154,6 +2194,14 @@
       }
 
       const scan = state.mapScanContext;
+
+      // 单面板守卫:BOSS 挑战面板打开时 btn_map 被遮挡,必须先关闭。
+      // 这尤其会在 executeCheckRate.closing 刚把 rc.phase 置 idle 但 BOSS 面板
+      // 还在异步关闭时发生 — needMapScan 只看 context 互斥,不检查面板状态。
+      if (snapshot.bossChallengePanel && snapshot.bossChallengePanel.open) {
+        closePanelIfExists('Instance_BossUI');
+        return { ok: true, reason: 'closing_blocking_panel' };
+      }
 
       if (!snapshot.mapPanel.open) {
         if (!scan.opened) {
