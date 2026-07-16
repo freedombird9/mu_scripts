@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.4
+// @version      0.1.6
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -504,9 +504,19 @@
 
     function applyIntent(intent) {
       const next = clone(intent);
+      const previousTargetId = state.currentTargetId;
       if (next.targetId) state.currentTargetId = next.targetId;
       else if (next.type !== 'safe_wait' && next.type !== 'enter_trial'
         && next.type !== 'exit_trial' && next.type !== 'teleport_four_winds') state.currentTargetId = '';
+      // target 切换时清空到达相关派生状态。
+      // 否则击杀 BOSS A 后切到 BOSS B 时,executeTravelTrialBoss 会误用 A 的
+      // arrivalConfirmedAt,在 line 1171 提前 return,跳过任务栏点击导致角色卡死。
+      if (state.currentTargetId && state.currentTargetId !== previousTargetId) {
+        state.arrivalConfirmedAt = 0;
+        state.zKeySentAt = 0;
+        state.zKeyRetryCount = 0;
+        state.holdStartedAt = 0;
+      }
       state.currentAction = next.action === 'none' ? null : next.action;
       state.phase = next.type.toUpperCase();
       if (!isLockingIntent() && state.navigationContext) {
@@ -582,24 +592,30 @@
         target.mapName === '四风平原' && !isCooling(target, now) && !isMapRateLow(target.mapName));
       // 1. Visible and attackable bosses
       const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
-      if (visible.length) return visible[0];
-      // 2. Bosses refreshing within pre-wait window (farm <90s to refresh)
-      const soonToRefresh = eligible
-        .filter((target) => {
-          const refreshAt = validRefreshAt(target.refreshAt);
-          return refreshAt !== null && refreshAt > now && refreshAt - now <= state.config.preWaitSeconds * 1000;
-        })
-        .sort((left, right) => Number(left.refreshAt) - Number(right.refreshAt));
-      if (soonToRefresh.length) return soonToRefresh[0];
-      // 3. Lowest priority: targets with unknown refresh time (need to walk there to get timer)
-      const RECHECK_COOLDOWN_MS = 3 * 60 * 1000;
-      const unknown = eligible.filter((target) => {
-        if (validRefreshAt(target.refreshAt) !== null) return false;
-        const lastChecked = Number(state.lastCheckedAt[target.id]) || 0;
-        return now - lastChecked > RECHECK_COOLDOWN_MS;
-      });
-      if (unknown.length) return unknown[0];
-      return null;
+     if (visible.length) return visible[0];
+     // 2. Bosses refreshing within pre-wait window (farm <90s to refresh)
+     const soonToRefresh = eligible
+       .filter((target) => {
+         const refreshAt = validRefreshAt(target.refreshAt);
+         return refreshAt !== null && refreshAt > now && refreshAt - now <= state.config.preWaitSeconds * 1000;
+       })
+       .sort((left, right) => Number(left.refreshAt) - Number(right.refreshAt));
+     if (soonToRefresh.length) return soonToRefresh[0];
+     // 3. Already refreshed bosses (refreshAt <= now) — go fight them
+     const ready = eligible.filter((target) => {
+       const refreshAt = validRefreshAt(target.refreshAt);
+       return refreshAt !== null && refreshAt <= now;
+     });
+     if (ready.length) return ready[0];
+     // 4. Lowest priority: targets with unknown refresh time (need to walk there to get timer)
+     const RECHECK_COOLDOWN_MS = 3 * 60 * 1000;
+     const unknown = eligible.filter((target) => {
+       if (validRefreshAt(target.refreshAt) !== null) return false;
+       const lastChecked = Number(state.lastCheckedAt[target.id]) || 0;
+       return now - lastChecked > RECHECK_COOLDOWN_MS;
+     });
+     if (unknown.length) return unknown[0];
+     return null;
     }
 
     function isVisibleAndAttackable(target, snapshot) {
