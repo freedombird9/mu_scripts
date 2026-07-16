@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.6
+// @version      0.1.7
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -805,7 +805,7 @@
    function executeTravel(intent, snapshot, kind) {
      const now = Date.now();
      const targetKey = intent.targetId || 'farm';
-     const navCtx = state.navigationContext;
+     let navCtx = state.navigationContext;
      const isSameNav = navCtx && navCtx.kind === kind && navCtx.targetId === targetKey;
 
      // Close any blocking panels before attempting map navigation
@@ -814,60 +814,106 @@
        return { ok: true, reason: 'closing_blocking_panel' };
      }
 
+     // 提前建立 navigationContext 以便跟踪 mapOpenedAt(地图渲染等待窗口)。
+     // 原逻辑只在找到 targetRow 后才建 context,导致地图已开但行未渲染时
+     // 没有 5s 计时基准,卡死在 boss_row_not_found 循环里直到游戏自身刷新。
+     if (!isSameNav) {
+       state.navigationContext = {
+         kind,
+         targetId: targetKey,
+         startedAt: now,
+         lastCoordinate: '',
+         lastCoordinateAt: 0,
+         clicked: false,
+         retried: false,
+         mapOpenedAt: 0,
+         reopenClicked: false,
+       };
+       navCtx = state.navigationContext;
+     }
+
      if (!snapshot.mapPanel.open) {
-       if (isSameNav && navCtx.clicked) {
+       if (navCtx.clicked) {
          return checkNavProgress(navCtx, snapshot, intent, kind, now);
-        }
-        return clickOpenMapButton(snapshot);
-      }
+       }
+       return clickOpenMapButton(snapshot);
+     }
 
-      let targetRow;
-      if (kind === 'boss') {
-        const target = targetById(intent.targetId);
-        if (!target) return { ok: false, reason: 'boss_target_missing' };
-        targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
-        if (!targetRow || targetRow.targetId !== intent.targetId) {
-          targetRow = snapshot.mapPanel.bossTargets.find((row) => row.targetId === intent.targetId);
-        }
-        if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
-      } else {
-        targetRow = snapshot.mapPanel.farmTarget;
-        if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
-      }
+     // 地图已开 — 记录首次打开时间(用于行渲染超时判定)
+     if (!navCtx.mapOpenedAt) navCtx.mapOpenedAt = now;
 
-      if (isSameNav && navCtx.clicked) {
-        if (navCtx.closeClicked) {
-          return { ok: true, reason: 'waiting_map_close' };
-        }
-        return closeMapPanel(snapshot);
-      }
+     let targetRow;
+     if (kind === 'boss') {
+       const target = targetById(intent.targetId);
+       if (!target) return { ok: false, reason: 'boss_target_missing' };
+       targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
+       if (!targetRow || targetRow.targetId !== intent.targetId) {
+         targetRow = snapshot.mapPanel.bossTargets.find((row) => row.targetId === intent.targetId);
+       }
+       if (!targetRow) {
+         return handleMapRowNotRendered(navCtx, kind, targetKey, 'boss_row_not_found', now);
+       }
+     } else {
+       targetRow = snapshot.mapPanel.farmTarget;
+       if (!targetRow) {
+         return handleMapRowNotRendered(navCtx, kind, targetKey, 'farm_target_missing', now);
+       }
+     }
 
-      const fresh = readSnapshot();
-      if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
-      const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, targetKey);
-      if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
+     // 行已找到 — 重置 reopenClicked,下次卡住可再次重开地图
+     navCtx.reopenClicked = false;
 
-      if (!isSameNav) {
-        state.navigationContext = {
-          kind,
-          targetId: targetKey,
-          startedAt: now,
-          lastCoordinate: '',
-          lastCoordinateAt: 0,
-          clicked: false,
-          retried: false,
-        };
-      }
+     if (navCtx.clicked) {
+       if (navCtx.closeClicked) {
+         return { ok: true, reason: 'waiting_map_close' };
+       }
+       return closeMapPanel(snapshot);
+     }
 
-      const node = findNodeByPath(root(), targetRow.sourcePath);
-      if (!node) return { ok: false, reason: 'target_node_not_found' };
-      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
-      const action = activateNode(node);
-      if (!action.ok) return { ok: false, reason: action.reason };
-      state.navigationContext.clicked = true;
-      appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
-      return { ok: true, method: action.method, reason: kind + '_row_clicked' };
-    }
+     const fresh = readSnapshot();
+     if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
+     const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, targetKey);
+     if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
+
+     const node = findNodeByPath(root(), targetRow.sourcePath);
+     if (!node) return { ok: false, reason: 'target_node_not_found' };
+     if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
+     const action = activateNode(node);
+     if (!action.ok) return { ok: false, reason: action.reason };
+     navCtx.clicked = true;
+     appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
+     return { ok: true, method: action.method, reason: kind + '_row_clicked' };
+   }
+
+   // 地图已开但目标行未渲染时的兜底:5s 内等待,5s 后关地图重开一次,
+   // 仍失败则放弃目标让 chooseIntent 选其他目标。
+   // 间歇性卡死场景:大地图打开是异步的,mapPanel.open === true 但 List_right
+   // 里的 RightLift 行还没渲染完成 → bossTargets 为空 → 原逻辑每 tick 返回
+   // boss_row_not_found 但永远不关地图也不超时 → 角色站死直到游戏自身刷新。
+   function handleMapRowNotRendered(navCtx, kind, targetKey, reason, now) {
+     const RENDER_WAIT_MS = 5000;
+     if (!navCtx.mapOpenedAt) navCtx.mapOpenedAt = now;
+
+     if (now - navCtx.mapOpenedAt < RENDER_WAIT_MS) {
+       return { ok: true, reason: 'waiting_for_rows_render' };
+     }
+
+     if (!navCtx.reopenClicked) {
+       // 用 closePanelIfExists 而非 closeMapPanel — 后者依赖 btnClose 节点,
+       // 而卡住场景下 btnClose 可能和行一起没渲染。closePanelIfExists 有
+       // hideImmediately/removeFromParent 兜底,强制移除面板。
+       const closeResult = closePanelIfExists('MapDetialWnd');
+       navCtx.reopenClicked = true;
+       navCtx.mapOpenedAt = 0;
+       appendLog('map_reopen_for_retry', { kind, targetId: targetKey, reason, closeReason: closeResult.reason });
+       return { ok: true, reason: 'map_reopen_for_retry' };
+     }
+
+     appendLog('travel_give_up', { kind, targetId: targetKey, reason: 'row_render_timeout' });
+     state.navigationContext = null;
+     releaseLockedTarget();
+     return { ok: false, reason: 'target_row_render_timeout' };
+   }
 
     function checkNavProgress(navCtx, snapshot, intent, kind, now) {
       if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
@@ -884,6 +930,8 @@
         navCtx.lastCoordinateAt = 0;
         navCtx.clicked = false;
         navCtx.closeClicked = false;
+        navCtx.mapOpenedAt = 0;
+        navCtx.reopenClicked = false;
         appendLog('navigation_retry', { kind, targetId: intent.targetId });
         return { ok: true, reason: 'retry_pending' };
       }
@@ -923,6 +971,8 @@
           navCtx.startedAt = now;
           navCtx.clicked = false;
           navCtx.closeClicked = false;
+          navCtx.mapOpenedAt = 0;
+          navCtx.reopenClicked = false;
           appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
           return { ok: true, reason: 'retry_pending' };
         }
