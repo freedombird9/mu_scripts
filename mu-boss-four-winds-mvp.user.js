@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原 BOSS MVP
 // @namespace    codex.mu.four-winds-boss-mvp
-// @version      0.1.0
+// @version      0.1.1
 // @description  四风平原 BOSS 自动化 MVP 骨架。默认仅干跑，必须从控制台显式 start() 才会允许执行。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -32,7 +32,7 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
-    farmTargetName: '1400级怪物',
+    farmTargetName: '1500级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
     });
     const MAX_LOGS = 200;

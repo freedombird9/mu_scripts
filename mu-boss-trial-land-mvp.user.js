@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 四风平原+试炼之地 BOSS MVP
 // @namespace    codex.mu.trial-land-boss-mvp
-// @version      0.1.7
+// @version      0.1.9
 // @description  四风平原 + 试炼之地 BOSS 自动化。跨地图调度，自动进出试炼之地打 BOSS，打完返回四风平原挂机。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -32,7 +32,7 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
-      farmTargetName: '1400级怪物',
+      farmTargetName: '1500级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
       trialBossFallbackAttempts: 3,
@@ -832,16 +832,40 @@
        navCtx = state.navigationContext;
      }
 
-     if (!snapshot.mapPanel.open) {
-       if (navCtx.clicked) {
-         return checkNavProgress(navCtx, snapshot, intent, kind, now);
+     // 已点击行导航 → 进寻路进度检查(地图此时通常会自动关或保持开)
+     if (navCtx.clicked) {
+       if (snapshot.mapPanel.open) {
+         if (navCtx.closeClicked) return { ok: true, reason: 'waiting_map_close' };
+         return closeMapPanel(snapshot);
        }
-       return clickOpenMapButton(snapshot);
+       return checkNavProgress(navCtx, snapshot, intent, kind, now);
      }
 
-     // 地图已开 — 记录首次打开时间(用于行渲染超时判定)
-     if (!navCtx.mapOpenedAt) navCtx.mapOpenedAt = now;
+     // contentReady: 目标行已渲染就位
+     const contentReady = (snap) => {
+       if (kind === 'boss') {
+         const t = targetById(intent.targetId);
+         if (!t) return false;
+         const rows = snap.mapPanel.bossTargets || [];
+         return Boolean(rows.find((r) => r.name === t.name)
+           || rows.find((r) => r.targetId === intent.targetId));
+       }
+       return Boolean(snap.mapPanel.farmTarget);
+     };
 
+     // ensureMapReady 负责打开地图 + 等行渲染 + 5s 后重开 + 仍失败放弃
+     const mapResult = ensureMapReady(snapshot, navCtx, contentReady, 'travel');
+     if (!mapResult.ok) {
+       appendLog('travel_give_up', { kind, targetId: targetKey, reason: mapResult.reason });
+       state.navigationContext = null;
+       releaseLockedTarget();
+       return { ok: false, reason: 'target_row_render_timeout' };
+     }
+     if (mapResult.reason !== 'ready') {
+       return mapResult;  // waiting_for_open / waiting_for_content / map_reopen_for_retry
+     }
+
+     // ready — 行已就位,继续点击行导航
      let targetRow;
      if (kind === 'boss') {
        const target = targetById(intent.targetId);
@@ -850,24 +874,10 @@
        if (!targetRow || targetRow.targetId !== intent.targetId) {
          targetRow = snapshot.mapPanel.bossTargets.find((row) => row.targetId === intent.targetId);
        }
-       if (!targetRow) {
-         return handleMapRowNotRendered(navCtx, kind, targetKey, 'boss_row_not_found', now);
-       }
+       if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
      } else {
        targetRow = snapshot.mapPanel.farmTarget;
-       if (!targetRow) {
-         return handleMapRowNotRendered(navCtx, kind, targetKey, 'farm_target_missing', now);
-       }
-     }
-
-     // 行已找到 — 重置 reopenClicked,下次卡住可再次重开地图
-     navCtx.reopenClicked = false;
-
-     if (navCtx.clicked) {
-       if (navCtx.closeClicked) {
-         return { ok: true, reason: 'waiting_map_close' };
-       }
-       return closeMapPanel(snapshot);
+       if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
      }
 
      const fresh = readSnapshot();
@@ -883,36 +893,6 @@
      navCtx.clicked = true;
      appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
      return { ok: true, method: action.method, reason: kind + '_row_clicked' };
-   }
-
-   // 地图已开但目标行未渲染时的兜底:5s 内等待,5s 后关地图重开一次,
-   // 仍失败则放弃目标让 chooseIntent 选其他目标。
-   // 间歇性卡死场景:大地图打开是异步的,mapPanel.open === true 但 List_right
-   // 里的 RightLift 行还没渲染完成 → bossTargets 为空 → 原逻辑每 tick 返回
-   // boss_row_not_found 但永远不关地图也不超时 → 角色站死直到游戏自身刷新。
-   function handleMapRowNotRendered(navCtx, kind, targetKey, reason, now) {
-     const RENDER_WAIT_MS = 5000;
-     if (!navCtx.mapOpenedAt) navCtx.mapOpenedAt = now;
-
-     if (now - navCtx.mapOpenedAt < RENDER_WAIT_MS) {
-       return { ok: true, reason: 'waiting_for_rows_render' };
-     }
-
-     if (!navCtx.reopenClicked) {
-       // 用 closePanelIfExists 而非 closeMapPanel — 后者依赖 btnClose 节点,
-       // 而卡住场景下 btnClose 可能和行一起没渲染。closePanelIfExists 有
-       // hideImmediately/removeFromParent 兜底,强制移除面板。
-       const closeResult = closePanelIfExists('MapDetialWnd');
-       navCtx.reopenClicked = true;
-       navCtx.mapOpenedAt = 0;
-       appendLog('map_reopen_for_retry', { kind, targetId: targetKey, reason, closeReason: closeResult.reason });
-       return { ok: true, reason: 'map_reopen_for_retry' };
-     }
-
-     appendLog('travel_give_up', { kind, targetId: targetKey, reason: 'row_render_timeout' });
-     state.navigationContext = null;
-     releaseLockedTarget();
-     return { ok: false, reason: 'target_row_render_timeout' };
    }
 
     function checkNavProgress(navCtx, snapshot, intent, kind, now) {
@@ -1015,6 +995,55 @@
       const action = activateNode(node);
       if (!action.ok) return { ok: false, reason: action.reason };
       return { ok: true, method: action.method, reason: 'map_opened' };
+    }
+
+    // ensureMapReady: 打开大地图 + 等待内容渲染 + 兜底重开 + 超时放弃。
+    // 收拢 executeTravel / executeTeleportFourWinds 共有的"地图打开后内容
+    // 间歇性不渲染导致卡死"问题。调用方持 ctx 状态(mapOpenedAt/reopenClicked),
+    // 通过 contentReady 谓词表达"内容已就绪"。
+    //
+    // 返回:
+    //   { ok: true, reason: 'ready' }                — 地图开 + 内容就绪,调用方可继续后续操作
+    //   { ok: true, reason: 'waiting_for_open' }     — 已点 btn_map,等下一 tick 验证地图打开
+    //   { ok: true, reason: 'waiting_for_content' }  — 地图已开但内容未渲染,5s 内重试
+    //   { ok: true, reason: 'map_reopen_for_retry' } — 5s 超时,已关地图,下 tick 重开
+    //   { ok: false, reason: 'map_give_up' }         — 重开过一次仍失败,调用方应放弃
+    //   { ok: false, reason: '<clickOpenMapButton 失败原因>' }
+    //
+    // 调用方需要在 context 里预留两个字段:
+    //   ctx.mapOpenedAt   — 首次检测到 mapPanel.open=true 的时间戳,0 表示尚未记录
+    //   ctx.reopenClicked — 是否已执行过一次关地图重开
+    function ensureMapReady(snapshot, ctx, contentReady, label) {
+      const now = Date.now();
+      const RENDER_WAIT_MS = 5000;
+
+      if (snapshot.mapPanel.open) {
+        if (!ctx.mapOpenedAt) ctx.mapOpenedAt = now;
+        if (contentReady(snapshot)) {
+          ctx.reopenClicked = false;
+          return { ok: true, reason: 'ready' };
+        }
+        if (now - ctx.mapOpenedAt < RENDER_WAIT_MS) {
+          return { ok: true, reason: 'waiting_for_content' };
+        }
+        if (!ctx.reopenClicked) {
+          closePanelIfExists('MapDetialWnd');
+          ctx.reopenClicked = true;
+          ctx.mapOpenedAt = 0;
+          appendLog(label + '_map_reopen_for_retry', {});
+          return { ok: true, reason: 'map_reopen_for_retry' };
+        }
+        appendLog(label + '_map_give_up', {});
+        return { ok: false, reason: 'map_give_up' };
+      }
+
+      const result = clickOpenMapButton(snapshot);
+      if (result.ok) {
+        ctx.mapOpenedAt = 0;
+        ctx.reopenClicked = false;
+        return { ok: true, reason: 'waiting_for_open' };
+      }
+      return { ok: false, reason: result.reason };
     }
 
     // --- enter_trial: open challenge panel -> switch tab -> select boss -> click enter ---
@@ -1558,6 +1587,8 @@
           phase: 'opening_map',
           startedAt: now,
           lastActionAt: 0,
+          mapOpenedAt: 0,
+          reopenClicked: false,
         };
         appendLog('teleport_start', {});
       }
@@ -1594,65 +1625,45 @@
           const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
           if (bossOpen) {
             closePanelIfExists('Instance_BossUI');
-            ctx.phase = 'waiting_for_close';
             ctx.lastActionAt = now;
             return { ok: true, reason: 'closing_blocking_panel' };
           }
-          if (snapshot.mapPanel && snapshot.mapPanel.open) {
-            ctx.phase = 'select_map';
-            ctx.lastActionAt = now;
-            return { ok: true, reason: 'map_already_open' };
-          }
-          const result = clickOpenMapButton(snapshot);
-          if (result.ok) {
-            ctx.lastActionAt = now;
-            ctx.phase = 'select_map';
-            appendLog('teleport_opened_map', { method: result.method });
-          }
-          return result;
-        }
-
-        case 'waiting_for_close': {
-          // 等待 BOSS 面板真正关闭后再进 opening_map 开地图。
-          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
-          if (!bossOpen) {
-            ctx.phase = 'opening_map';
-            ctx.lastActionAt = now;
-            return { ok: true, reason: 'panel_closed' };
-          }
-          if (now - ctx.lastActionAt > 3000) {
-            ctx.phase = 'opening_map';
-            ctx.lastActionAt = now;
-            appendLog('teleport_close_retry', {});
-            return { ok: true, reason: 'close_retry' };
-          }
-          return { ok: true, reason: 'waiting_for_panel_close' };
+          // 进入 select_map — ensureMapReady 会在那里统一处理
+          // 开地图 + 等 mapEntries 渲染 + 重开兜底
+          ctx.phase = 'select_map';
+          ctx.lastActionAt = now;
+          return { ok: true, reason: 'proceed_to_select_map' };
         }
 
         case 'select_map': {
-          if (!snapshot.mapPanel.open) {
-            ctx.phase = 'opening_map';
-            ctx.lastActionAt = now;
-            return { ok: true, reason: 'map_closed_retry' };
+          // contentReady: 左侧 mapEntries 中包含"四风平原"行
+          const contentReady = (snap) => {
+            const entries = (snap.mapPanel && snap.mapPanel.mapEntries) || [];
+            return entries.some((e) => cleanText(e.name) === '四风平原'
+              || /四风平原/.test(e.name));
+          };
+          const mapResult = ensureMapReady(snapshot, ctx, contentReady, 'teleport');
+          if (!mapResult.ok) {
+            appendLog('teleport_give_up', { reason: mapResult.reason });
+            state.teleportContext = null;
+            return { ok: false, reason: 'teleport_map_give_up' };
           }
-          // Find 四风平原 in the left-side map list
-          const mapEntries = snapshot.mapPanel.mapEntries || [];
-          const fourWindsEntry = mapEntries.find((e) => cleanText(e.name) === '四风平原'
-            || /四风平原/.test(e.name));
-          if (!fourWindsEntry) {
-            appendLog('teleport_four_winds_not_in_list', { entries: mapEntries.map((e) => e.name) });
-            return { ok: false, reason: 'four_winds_not_in_map_list' };
+          if (mapResult.reason !== 'ready') {
+            return mapResult;  // waiting_for_open / waiting_for_content / map_reopen_for_retry
           }
+
+          // ready — mapEntries 已含四风平原,点击行
           const fresh = readSnapshot();
           if (!fresh.mapPanel.open) {
             ctx.phase = 'opening_map';
             ctx.lastActionAt = now;
             return { ok: true, reason: 'map_closed_retry' };
           }
-          const freshEntry = (fresh.mapPanel.mapEntries || []).find((e) => e.sourcePath === fourWindsEntry.sourcePath);
-          if (!freshEntry) return { ok: false, reason: 'map_entry_vanished' };
+          const fourWindsEntry = (fresh.mapPanel.mapEntries || []).find((e) =>
+            cleanText(e.name) === '四风平原' || /四风平原/.test(e.name));
+          if (!fourWindsEntry) return { ok: false, reason: 'four_winds_not_in_map_list' };
           const gRoot = root();
-          const node = findNodeByPath(gRoot, freshEntry.sourcePath);
+          const node = findNodeByPath(gRoot, fourWindsEntry.sourcePath);
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'map_entry_node_unavailable' };
           // CDP verified: clicking leftlist bigBtn opens a List_tree sub-popup
           // The actual teleport requires a second click on the sub-popup item.
