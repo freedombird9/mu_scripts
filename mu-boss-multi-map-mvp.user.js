@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.3.0
+// @version      0.3.1
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -149,6 +149,37 @@
       currentModuleId: '',
       instanceCheckCooldown: {},
     };
+
+    // --- Rate-check maps (Task 5) ---
+    // 声明必须早于下方 rebuildRateCheckMaps() 调用,否则 const TDZ 会抛 ReferenceError。
+
+    const RATE_URL_MAP = {
+      'txt_bld': 'low',
+      'txt_blz': 'medium',
+      'txt_blg': 'high',
+    };
+
+    // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,傲之煞=txt_bld=low)
+    // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
+    const PURGATORY_RATE_CHECK_ENABLED = true;
+
+    // RATE_CHECK_MAPS 从 MAP_MODULES 动态生成;在 state.config 初始化后调用 rebuildRateCheckMaps()
+    const RATE_CHECK_MAPS = {};
+
+    function rebuildRateCheckMaps() {
+      for (const key in RATE_CHECK_MAPS) delete RATE_CHECK_MAPS[key];
+      for (const module of MAP_MODULES) {
+        if (!isModuleEnabled(module)) continue;
+        // 跳过 Task 0 决定不做爆率检查的模块
+        if (module.id === 'purgatory' && !PURGATORY_RATE_CHECK_ENABLED) continue;
+        RATE_CHECK_MAPS[module.mapName] = {
+          tab: module.bossRowTab,
+          bossNames: module.bosses.map((b) => b.name),
+          mapMatch: module.mapName.replace(/\d+$/, ''),
+          moduleId: module.id,
+        };
+      }
+    }
 
     state.config = normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS));
     syncRuntimeFlags();  // re-sync after normalizeConfig
@@ -987,36 +1018,6 @@
       },
     };
 
-    // --- Rate-check maps (Task 5) ---
-
-    const RATE_URL_MAP = {
-      'txt_bld': 'low',
-      'txt_blz': 'medium',
-      'txt_blg': 'high',
-    };
-
-    // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,傲之煞=txt_bld=low)
-    // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
-    const PURGATORY_RATE_CHECK_ENABLED = true;
-
-    // RATE_CHECK_MAPS 从 MAP_MODULES 动态生成;在 state.config 初始化后调用 rebuildRateCheckMaps()
-    const RATE_CHECK_MAPS = {};
-
-    function rebuildRateCheckMaps() {
-      for (const key in RATE_CHECK_MAPS) delete RATE_CHECK_MAPS[key];
-      for (const module of MAP_MODULES) {
-        if (!isModuleEnabled(module)) continue;
-        // 跳过 Task 0 决定不做爆率检查的模块
-        if (module.id === 'purgatory' && !PURGATORY_RATE_CHECK_ENABLED) continue;
-        RATE_CHECK_MAPS[module.mapName] = {
-          tab: module.bossRowTab,
-          bossNames: module.bosses.map((b) => b.name),
-          mapMatch: module.mapName.replace(/\d+$/, ''),
-          moduleId: module.id,
-        };
-      }
-    }
-
     function nextRateResetTimestamp() {
       const now = Date.now();
       const utc8Ms = now + 8 * 3600 * 1000;
@@ -1255,7 +1256,7 @@
         return makeIntent('hold', target.id, 'at boss coordinate', 'hold_position', 0.95);
       }
       // 4. 副本模块且当前不在该副本内 → enter_instance
-      if (module.type === 'instance' && snapshot.scene.mapName !== module.mapName) {
+      if (module.type === 'instance' && (snapshot.scene && snapshot.scene.mapName) !== module.mapName) {
         state.currentModuleId = module.id;
         return makeIntent('enter_instance', null, module.id + ' has boss, need enter', 'enter_instance', 0.95);
       }
@@ -1418,6 +1419,7 @@
       }
       // 兜底:传送四风平原(默认)
       const fw = moduleById('four_winds');
+      state.currentModuleId = fw ? fw.id : 'four_winds';
       return makeIntent('teleport_to_module', null, 'fallback to four winds', 'teleport_wild', 0.8);
     }
 
