@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.1.0
+// @version      0.2.0
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -26,7 +26,7 @@
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
     const MAX_LOGS = 200;
-    const KNOWN_MAP_NAMES = ['四风平原', '试炼之地1', '苦难炼狱2', '勇者大陆'];
+    const KNOWN_MAP_NAMES = ['四风平原', '试炼之地1', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -39,9 +39,9 @@
       farmTargetName: '1500级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
-      enabledMaps: ['four_winds', 'trial_land', 'purgatory'],
-      mapPriorities: { four_winds: 10, trial_land: 20, purgatory: 30 },
-      enabledBosses: ['ao-left','ao-right','angry-ao','rage-ao','lobster-1','lobster-2','lobster-3','magic-crystal'],
+      enabledMaps: ['four_winds', 'trial_land', 'purgatory', 'accessory'],
+      mapPriorities: { four_winds: 10, trial_land: 20, purgatory: 30, accessory: 40 },
+      enabledBosses: ['ao-left','ao-right','angry-ao','rage-ao','lobster-1','lobster-2','lobster-3','magic-crystal','phantom-giant'],
       purgatoryMapChoice: '苦难炼狱2',
       instanceEmptyCooldownMs: 15 * 60 * 1000,
     });
@@ -105,7 +105,29 @@
       ],
     });
 
-    const MAP_MODULES = [fourWindsModule, trialLandModule, purgatoryModule];
+    const accessoryModule = Object.freeze({
+      id: 'accessory',
+      mapName: '幻术秘境4',
+      type: 'instance',
+      priority: 40,
+      enabled: true,
+      farmTarget: null,
+      bossRowTab: '首饰BOSS',
+      // TODO CDP 验证:首饰BOSS tab 下 BOSS 行 scroll 容器名(占位与 purgatory 一致)
+      bossRowScroll: 'wildlevelScroll',
+      enterButtonTog: 'wildtog_mapName',
+      enterButtonTextRegex: /^幻术秘境4/,
+      hasTaskbar: false,
+      hasIntermediatePopup: true,
+      intermediatePopupTitle: '卓越之境',         // TODO CDP 验证弹窗标题
+      intermediatePopupButtonText: '进入',       // TODO CDP 验证按钮文字
+      bosses: [
+        // TODO CDP 探查幽灵巨人 BOSS 坐标后回填 coordinate
+        { id: 'phantom-giant', name: '幽灵巨人', coordinate: 'TBD' },
+      ],
+    });
+
+    const MAP_MODULES = [fourWindsModule, trialLandModule, purgatoryModule, accessoryModule];
 
     // Derived from MAP_MODULES; needed by scanMapPanel and scanCombat to filter BOSS rows
     // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
@@ -164,6 +186,7 @@
     // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,傲之煞=txt_bld=low)
     // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
     const PURGATORY_RATE_CHECK_ENABLED = true;
+    const ACCESSORY_RATE_CHECK_ENABLED = true;
 
     // RATE_CHECK_MAPS 从 MAP_MODULES 动态生成;在 state.config 初始化后调用 rebuildRateCheckMaps()
     const RATE_CHECK_MAPS = {};
@@ -174,6 +197,7 @@
         if (!isModuleEnabled(module)) continue;
         // 跳过 Task 0 决定不做爆率检查的模块
         if (module.id === 'purgatory' && !PURGATORY_RATE_CHECK_ENABLED) continue;
+        if (module.id === 'accessory' && !ACCESSORY_RATE_CHECK_ENABLED) continue;
         RATE_CHECK_MAPS[module.mapName] = {
           tab: module.bossRowTab,
           bossNames: module.bosses.map((b) => b.name),
@@ -2331,6 +2355,35 @@
 
     // --- enter_instance / exit_instance / teleport_to_module (Task 7) ---
 
+    // --- Intermediate popup helpers (accessory module) ---
+    // CDP 探查前用宽松匹配:在 gRoot 全树找含 module.intermediatePopupTitle 文本的弹窗节点。
+    // CDP 探查后回填精确 name/packageName 匹配条件(替换宽松匹配)。
+    function findIntermediatePopup(nodes, module) {
+      if (!nodes || !module || !module.intermediatePopupTitle) return null;
+      const title = module.intermediatePopupTitle;
+      // 精确匹配优先(CDP 探查后填):name/packageName/packageOwner 包含 '卓越之境' 或指定值
+      const exact = nodes.find((item) => item.effectiveVisible
+        && (item.name === title || item.packageName === title || item.packageOwner === title));
+      if (exact) return exact;
+      // 兜底:AlertWnd 或类似弹窗,且 contentText/text 含标题文本
+      const fallback = nodes.find((item) => item.effectiveVisible
+        && (item.name === 'AlertWnd' || /Alert|Popup|Tip|Wnd/i.test(item.name || ''))
+        && (cleanText(item.text).includes(title) || cleanText(item.contentText).includes(title)));
+      return fallback || null;
+    }
+
+    // CDP 探查前用宽松匹配:在弹窗户子树找 text 含 module.intermediatePopupButtonText 的可点击节点。
+    // CDP 探查后回填精确 name 匹配条件。
+    function findPopupEnterButton(popupChildren, module) {
+      if (!popupChildren || !module || !module.intermediatePopupButtonText) return null;
+      const buttonText = module.intermediatePopupButtonText;
+      // 兜底:text/contentText 含按钮文字且可点击(常见按钮名:btn_ok/btn_enter/btnSure/btnOk)
+      const candidate = popupChildren.find((item) => item.effectiveVisible
+        && (cleanText(item.text).includes(buttonText) || cleanText(item.contentText).includes(buttonText))
+        && /^(btn|button)/i.test(item.name || ''));
+      return candidate || null;
+    }
+
     function executeEnterInstance(intent, snapshot) {
       const now = Date.now();
       if (!state.enterInstanceCtx) {
@@ -2354,6 +2407,7 @@
           startedAt: now,
           selectedBossId: state.currentTargetId || null,
           lastActionAt: 0,
+          retried: false,
         };
         appendLog('enter_instance_start', { moduleId: state.enterInstanceCtx.moduleId });
       }
@@ -2513,8 +2567,69 @@
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
           appendLog('enter_instance_clicked_enter', { text: enterBtn.text, method: action.method });
-          ctx.phase = 'waiting';
+          ctx.phase = currentModule.hasIntermediatePopup ? 'waiting_for_intermediate' : 'waiting';
           return { ok: true, method: action.method, reason: 'enter_clicked' };
+        }
+
+        case 'waiting_for_intermediate': {
+          const sceneMap = (snapshot.scene || {}).mapName || '';
+          if (!sceneMap) return { ok: true, reason: 'waiting_for_teleport' };
+          const gRoot = root();
+          const allNodes = gRoot ? collectNodes(gRoot) : [];
+          const popup = findIntermediatePopup(allNodes, currentModule);
+          if (!popup) {
+            if (now - ctx.lastActionAt > 10 * 1000) {
+              if (!ctx.retried) {
+                ctx.retried = true;
+                ctx.phase = 'click_enter';
+                ctx.lastActionAt = 0;  // 让下一 tick 节流通过后重新点 enter
+                appendLog('intermediate_popup_timeout_retry', { moduleId: currentModule.id });
+                return { ok: true, reason: 'retry_click_enter' };
+              }
+              appendLog('intermediate_popup_failed', { moduleId: currentModule.id });
+              closePanelIfExists('Instance_BossUI');
+              state.enterInstanceCtx = null;
+              releaseLockedTarget();
+              return { ok: false, reason: 'intermediate_popup_timeout' };
+            }
+            return { ok: true, reason: 'waiting_for_popup' };
+          }
+          ctx.phase = 'click_popup_enter';
+          // lastActionAt 不重置:click_popup_enter 内 5s 超时基准沿用本时刻
+          appendLog('intermediate_popup_appeared', { moduleId: currentModule.id });
+          return { ok: true, reason: 'popup_detected' };
+        }
+
+        case 'click_popup_enter': {
+          const gRoot = root();
+          const allNodes = gRoot ? collectNodes(gRoot) : [];
+          const popup = findIntermediatePopup(allNodes, currentModule);
+          if (!popup) {
+            // 弹窗消失(可能已被自动点击或加载抖动)
+            ctx.phase = 'waiting_for_intermediate';
+            ctx.lastActionAt = now;
+            appendLog('popup_vanished_back_to_wait', { moduleId: currentModule.id });
+            return { ok: true, reason: 'popup_vanished_back_to_wait' };
+          }
+          const popupChildren = descendantsOf(allNodes, popup).filter((item) => item.path !== popup.path);
+          const btnNode = findPopupEnterButton(popupChildren, currentModule);
+          if (!btnNode) {
+            if (now - ctx.lastActionAt > 5 * 1000) {
+              ctx.phase = 'waiting_for_intermediate';
+              ctx.lastActionAt = now;
+              appendLog('popup_enter_button_not_found_retry', { moduleId: currentModule.id });
+              return { ok: true, reason: 'button_not_found_back_to_wait' };
+            }
+            return { ok: true, reason: 'waiting_for_button' };
+          }
+          const node = findNodeByPath(gRoot, btnNode.path);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'button_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          ctx.phase = 'waiting';
+          appendLog('enter_instance_clicked_popup_enter', { method: action.method, moduleId: currentModule.id });
+          return { ok: true, method: action.method, reason: 'popup_enter_clicked' };
         }
 
         case 'waiting': {
