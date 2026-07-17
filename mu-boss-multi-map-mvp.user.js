@@ -1314,8 +1314,9 @@
       }
       // 5. 副本内:游戏内置"进副本自动寻路到 BOSS"机制,角色从入口跑向 BOSS 需要时间。
       //    此期间 isAtTarget=false,但不应主动开 M 大地图导航(会跟游戏寻路冲突 + 大地图卡开不关)。
-      //    直接 hold 等待游戏寻路把角色送到 BOSS 坐标;到坐标后 isAtTarget=true 走分支 3 正常 hold+战斗。
+      //    用 safe_wait 等待游戏寻路把角色送到 BOSS 坐标;到坐标后 isAtTarget=true 走分支 3 正常 hold+战斗。
       //    超时(travelTimeoutMs 180s)未到达则放弃:副本可能卡了,退出重进。
+      //    注意:不能用 hold intent,因为 executeHold 检查 isAtTarget 会拒绝(not_at_coordinate)。
       if (module.type === 'instance' && (snapshot.scene && snapshot.scene.mapName) === module.mapName) {
         if (!state.holdStartedAt) state.holdStartedAt = Number(snapshot.at) || Date.now();
         const now = Number(snapshot.at) || Date.now();
@@ -1326,7 +1327,7 @@
           state.holdStartedAt = 0;
           return makeIntent('exit_instance', null, 'instance travel timeout - exit retry', 'exit_instance', 0.7);
         }
-        return makeIntent('hold', target.id, 'in instance, waiting for game auto-route to boss', 'hold_position', 0.85);
+        return makeIntent('safe_wait', target.id, 'in instance, waiting for game auto-route to boss', 'none', 0.85);
       }
       // 6. 野外地图:已在正确地图但未到坐标 → travel_boss(M 大地图导航)
       return makeIntent('travel_boss', target.id, 'go to boss coord', 'click_boss_target', 0.9);
