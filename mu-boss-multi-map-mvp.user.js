@@ -49,6 +49,12 @@
 
     const MAP_MODULES = [];
 
+    // Derived from MAP_MODULES; needed by scanMapPanel and scanCombat to filter BOSS rows
+    // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
+    // Note: this is computed once at injection time. If MAP_MODULES were ever mutated at
+    // runtime (it is not — Task 3 freezes it), this would go stale. Keep this constraint.
+    const TARGET_TABLE = MAP_MODULES.flatMap((m) => m.bosses.map((b) => ({ name: b.name, mapName: m.mapName })));
+
     const state = {
       enabled: false,
       dryRun: true,
@@ -424,7 +430,6 @@
     }
 
     function scanCombat(nodes) {
-      const TARGET_TABLE = MAP_MODULES.flatMap(m => m.bosses.map(b => ({ name: b.name, mapName: m.mapName })));
       const target = nodes.find((item) => item.effectiveVisible && /Lv\s*\d+/i.test(item.text) && TARGET_TABLE.some((entry) => item.text.includes(entry.name)));
       if (!target) return { targetName: '', targetLevel: 0, hpPercent: null, ownerName: '' };
       const level = target.text.match(/Lv\s*(\d+)/i);
