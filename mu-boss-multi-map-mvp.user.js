@@ -92,7 +92,6 @@
       currentModuleId: '',
       instanceCheckCooldown: {},
     };
-    syncRuntimeFlags();
 
     state.config = normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS));
     syncRuntimeFlags();  // re-sync after normalizeConfig
@@ -387,6 +386,7 @@
       state.enterInstanceCtx = null;
       state.exitInstanceCtx = null;
       state.teleportCtx = null;
+      state.currentModuleId = '';
       state.zKeySentAt = 0;
       state.zKeyRetryCount = 0;
       state.arrivalConfirmedAt = 0;
