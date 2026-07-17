@@ -1593,10 +1593,9 @@
         case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
         case 'check_rate': result = executeCheckRate(intent, snapshot); break;
         case 'scan_map': result = executeScanMap(intent, snapshot); break;
-        // enter_instance / exit_instance / teleport_to_module 在 Task 7 实现
-        case 'enter_instance': result = { ok: true, reason: 'task7_pending' }; break;
-        case 'exit_instance': result = { ok: true, reason: 'task7_pending' }; break;
-        case 'teleport_to_module': result = { ok: true, reason: 'task7_pending' }; break;
+        case 'enter_instance': result = executeEnterInstance(intent, snapshot); break;
+        case 'exit_instance': result = executeExitInstance(intent, snapshot); break;
+        case 'teleport_to_module': result = executeTeleportToModule(intent, snapshot); break;
         default:
           appendLog('intent_unknown', { type: intent.type });
           return clone(intent);
@@ -2243,6 +2242,528 @@
         default:
           rc.phase = 'idle';
           return { ok: false, reason: 'unknown_rate_phase' };
+      }
+    }
+
+    // --- enter_instance / exit_instance / teleport_to_module (Task 7) ---
+
+    function executeEnterInstance(intent, snapshot) {
+      const now = Date.now();
+      if (!state.enterInstanceCtx) {
+        // Recover target module from state.currentModuleId or currentTargetId
+        const moduleId = state.currentModuleId;
+        let targetModule = moduleId ? moduleById(moduleId) : null;
+        if (!targetModule) {
+          // Fallback: try from currentTargetId
+          const target = state.currentTargetId ? targetById(state.currentTargetId) : null;
+          targetModule = target ? moduleById(target.moduleId) : null;
+        }
+        if (!targetModule) {
+          // Last fallback: first instance module that shouldEnterInstance
+          const inst = MAP_MODULES.find((m) => m.type === 'instance' && shouldEnterInstance(m, snapshot, now));
+          if (!inst) return { ok: false, reason: 'no instance to enter' };
+          targetModule = inst;
+        }
+        state.enterInstanceCtx = {
+          moduleId: targetModule.id,
+          phase: 'closing_panels',
+          startedAt: now,
+          selectedBossId: state.currentTargetId || null,
+          lastActionAt: 0,
+        };
+        appendLog('enter_instance_start', { moduleId: state.enterInstanceCtx.moduleId });
+      }
+
+      const ctx = state.enterInstanceCtx;
+      const currentModule = moduleById(ctx.moduleId);
+      if (!currentModule) {
+        state.enterInstanceCtx = null;
+        return { ok: false, reason: 'module_missing: ' + ctx.moduleId };
+      }
+
+      if (now - ctx.startedAt > 60 * 1000) {
+        appendLog('enter_instance_timeout', { phase: ctx.phase, elapsed: now - ctx.startedAt });
+        closePanelIfExists('Instance_BossUI');
+        closePanelIfExists('MapDetialWnd');
+        state.enterInstanceCtx = null;
+        releaseLockedTarget();
+        return { ok: false, reason: 'enter_instance_timeout' };
+      }
+
+      const MIN_ACTION_GAP = 800;
+      if (now - ctx.lastActionAt < MIN_ACTION_GAP) {
+        return { ok: true, reason: 'enter_instance_throttled' };
+      }
+
+      const panel = snapshot.bossChallengePanel;
+
+      switch (ctx.phase) {
+        case 'closing_panels': {
+          const closeResult = closePanelIfExists('MapDetialWnd');
+          closePanelIfExists('Instance_BossUI');
+          ctx.phase = 'opening';
+          ctx.lastActionAt = now;
+          appendLog('enter_instance_panels_closed', { reason: closeResult.reason });
+          return { ok: true, reason: 'panels_closed' };
+        }
+
+        case 'opening': {
+          if (panel && panel.open) {
+            ctx.phase = 'select_tab';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'panel_already_open' };
+          }
+          if (snapshot.mapPanel && snapshot.mapPanel.open) {
+            ctx.phase = 'closing_panels';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'need_close_map_first' };
+          }
+          const btn = panel && panel.openButton;
+          if (!btn) return { ok: false, reason: 'no_boss_challenge_button' };
+          const fresh = readSnapshot();
+          const freshBtn = fresh.bossChallengePanel && fresh.bossChallengePanel.openButton;
+          if (!freshBtn) return { ok: false, reason: 'open_button_vanished' };
+          const node = findNodeByPath(root(), freshBtn.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'open_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          ctx.phase = 'waiting_for_open';
+          appendLog('enter_instance_opened_panel', { method: action.method });
+          return { ok: true, method: action.method, reason: 'panel_opening' };
+        }
+
+        case 'waiting_for_open': {
+          if (panel && panel.open) {
+            ctx.phase = 'select_tab';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'panel_opened' };
+          }
+          if (now - ctx.lastActionAt > 3000) {
+            ctx.phase = 'opening';
+            ctx.lastActionAt = now;
+            appendLog('enter_instance_panel_open_retry', {});
+            return { ok: true, reason: 'panel_open_timeout_retry' };
+          }
+          return { ok: true, reason: 'waiting_for_panel_open' };
+        }
+
+        case 'select_tab': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (panel.selectedTab === currentModule.bossRowTab) {
+            ctx.phase = 'select_boss';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'tab_already_selected' };
+          }
+          const tab = panel.tabs.find((t) => t.text === currentModule.bossRowTab);
+          if (!tab) return { ok: false, reason: 'tab_not_found:' + currentModule.bossRowTab };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshTab = freshPanel.tabs.find((t) => t.text === currentModule.bossRowTab);
+          if (!freshTab) return { ok: false, reason: 'tab_vanished' };
+          const node = findNodeByPath(root(), freshTab.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'tab_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          appendLog('enter_instance_selected_tab', { method: action.method, tab: currentModule.bossRowTab });
+          return { ok: true, method: action.method, reason: 'tab_selected' };
+        }
+
+        case 'select_boss': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          const now2 = Date.now();
+          const attackable = getAttackableTargets(currentModule, now2);
+          if (!attackable.length) {
+            appendLog('enter_instance_no_attackable', { moduleId: currentModule.id });
+            state.enterInstanceCtx = null;
+            return { ok: false, reason: 'no_attackable_boss' };
+          }
+          const candidate = selectInstanceTarget(attackable, snapshot);
+          if (!candidate) return { ok: false, reason: 'no_selectable_boss' };
+          ctx.selectedBossId = candidate.id;
+          state.currentTargetId = candidate.id;
+
+          // Find boss row filtered by module.bossRowScroll
+          const bossRow = panel.bossRows.find((r) => r.name === candidate.name
+            && (!currentModule.bossRowScroll || r.scrollName === currentModule.bossRowScroll));
+          if (!bossRow) return { ok: false, reason: 'boss_row_not_found' };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshRow = freshPanel.bossRows.find((r) => r.name === candidate.name
+            && (!currentModule.bossRowScroll || r.scrollName === currentModule.bossRowScroll));
+          if (!freshRow) return { ok: false, reason: 'boss_row_vanished' };
+          const node = findNodeByPath(root(), freshRow.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'boss_row_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          appendLog('enter_instance_selected_boss', { bossName: candidate.name, moduleId: currentModule.id });
+          ctx.phase = 'click_enter';
+          return { ok: true, method: action.method, reason: 'boss_selected' };
+        }
+
+        case 'click_enter': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          // Find enter button by module.enterButtonTog + module.enterButtonTextRegex
+          const enterButtons = (panel.enterButtons || []).filter((b) =>
+            (!currentModule.enterButtonTog || b.togName === currentModule.enterButtonTog)
+            && currentModule.enterButtonTextRegex && currentModule.enterButtonTextRegex.test(b.text));
+          if (!enterButtons.length) {
+            appendLog('enter_instance_no_enter_button', { moduleId: currentModule.id });
+            ctx.phase = 'waiting';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'no_enter_button_proceed_to_wait' };
+          }
+          const enterBtn = enterButtons[0];
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshBtn = (freshPanel.enterButtons || []).find((b) => b.sourcePath === enterBtn.sourcePath);
+          if (!freshBtn) return { ok: false, reason: 'enter_button_vanished' };
+          const node = findNodeByPath(root(), freshBtn.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'enter_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          appendLog('enter_instance_clicked_enter', { text: enterBtn.text, method: action.method });
+          ctx.phase = 'waiting';
+          return { ok: true, method: action.method, reason: 'enter_clicked' };
+        }
+
+        case 'waiting': {
+          const mapName = (snapshot.scene || {}).mapName || '';
+          if (mapName === currentModule.mapName) {
+            appendLog('enter_instance_arrived', { mapName, moduleId: currentModule.id });
+            closePanelIfExists('Instance_BossUI');
+            state.enterInstanceCtx = null;
+            state.currentTargetId = ctx.selectedBossId || '';
+            state.arrivalConfirmedAt = 0;
+            state.zKeyRetryCount = 0;
+            return { ok: true, reason: 'arrived_instance' };
+          }
+          if (panel && panel.open && now - ctx.lastActionAt > 3000) {
+            return { ok: true, reason: 'waiting_for_teleport' };
+          }
+          return { ok: true, reason: 'waiting_for_teleport' };
+        }
+
+        default:
+          state.enterInstanceCtx = null;
+          return { ok: false, reason: 'unknown_enter_phase' };
+      }
+    }
+
+    function executeExitInstance(intent, snapshot) {
+      const now = Date.now();
+      if (!state.exitInstanceCtx) {
+        const currentMap = (snapshot.scene || {}).mapName || '';
+        const module = moduleByMapName(currentMap) || MAP_MODULES.find((m) => m.type === 'instance' && m.mapName === currentMap);
+        if (!module) {
+          return { ok: false, reason: 'not_in_instance' };
+        }
+        state.exitInstanceCtx = {
+          moduleId: module.id,
+          phase: 'closing_panels',
+          startedAt: now,
+          lastActionAt: 0,
+          retried: false,
+        };
+        appendLog('exit_instance_start', { moduleId: module.id });
+      }
+
+      const ctx = state.exitInstanceCtx;
+      const module = moduleById(ctx.moduleId);
+      if (!module) {
+        state.exitInstanceCtx = null;
+        return { ok: false, reason: 'module_missing' };
+      }
+
+      if (now - ctx.startedAt > 30 * 1000) {
+        if (!ctx.retried) {
+          ctx.retried = true;
+          ctx.phase = 'closing_panels';
+          ctx.startedAt = now;
+          ctx.lastActionAt = 0;
+          appendLog('exit_instance_retry_timeout', {});
+          return { ok: true, reason: 'retry_pending' };
+        }
+        appendLog('exit_instance_failed_timeout', {});
+        state.exitInstanceCtx = null;
+        return { ok: false, reason: 'exit_instance_timeout' };
+      }
+
+      const mapName = (snapshot.scene || {}).mapName || '';
+      if (mapName !== module.mapName) {
+        appendLog('exit_instance_done', { mapName });
+        state.exitInstanceCtx = null;
+        return { ok: true, reason: 'exited_instance' };
+      }
+
+      const MIN_ACTION_GAP = 800;
+      if (now - ctx.lastActionAt < MIN_ACTION_GAP) {
+        return { ok: true, reason: 'exit_instance_throttled' };
+      }
+
+      const gRoot = root();
+      const nodes = gRoot ? collectNodes(gRoot) : [];
+
+      switch (ctx.phase) {
+        case 'closing_panels': {
+          const closeResult = closePanelIfExists('Instance_BossUI');
+          closePanelIfExists('MapDetialWnd');
+          ctx.phase = 'waiting_for_close';
+          ctx.lastActionAt = now;
+          appendLog('exit_instance_panels_closed', { reason: closeResult.reason });
+          return { ok: true, reason: 'panels_closing' };
+        }
+
+        case 'waiting_for_close': {
+          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
+          const mapOpen = snapshot.mapPanel && snapshot.mapPanel.open;
+          if (!bossOpen && !mapOpen) {
+            ctx.phase = 'click_exit';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'panels_closed' };
+          }
+          if (now - ctx.lastActionAt > 3000) {
+            ctx.phase = 'closing_panels';
+            ctx.lastActionAt = now;
+            appendLog('exit_instance_close_retry', {});
+            return { ok: true, reason: 'close_retry' };
+          }
+          return { ok: true, reason: 'waiting_for_panels_close' };
+        }
+
+        case 'click_exit': {
+          // btnExit in Damage list (Task 0 项 3 verified: same as trial land)
+          const exitNode = nodes.find((item) =>
+            item.effectiveVisible && item.name === 'btnExit'
+            && /Damage list/i.test(item.path))
+            || nodes.find((item) =>
+            item.effectiveVisible && /退出/.test(item.contentText))
+            || nodes.find((item) =>
+            item.effectiveVisible && /btnExit|btn_exit|exitBtn/i.test(item.name));
+          if (!exitNode) return { ok: false, reason: 'exit_button_not_found' };
+          const node = findNodeByPath(gRoot, exitNode.path);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'exit_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          ctx.phase = 'confirm';
+          appendLog('exit_instance_clicked_exit', { method: action.method });
+          return { ok: true, method: action.method, reason: 'exit_clicked' };
+        }
+
+        case 'confirm': {
+          const alertNode = nodes.find((item) =>
+            item.effectiveVisible && item.name === 'AlertWnd');
+          if (!alertNode) {
+            if (now - ctx.lastActionAt > 3000) {
+              ctx.phase = 'click_exit';
+              ctx.lastActionAt = now;
+              appendLog('exit_instance_popup_timeout_retry', {});
+              return { ok: true, reason: 'popup_not_found_retry' };
+            }
+            return { ok: true, reason: 'waiting_for_popup' };
+          }
+          const alertObj = findNodeByPath(gRoot, alertNode.path);
+          if (!alertObj || !nodeIsEffectivelyVisible(alertObj)) {
+            return { ok: false, reason: 'alert_node_unavailable' };
+          }
+          try {
+            const params = alertObj.params;
+            if (params && typeof params.rightCallback === 'function') {
+              params.rightCallback();
+            } else if (params && typeof params.leftCallback === 'function') {
+              params.leftCallback();
+            }
+            if (typeof alertObj.hideImmediately === 'function') {
+              alertObj.hideImmediately();
+            }
+          } catch (error) {
+            return { ok: false, reason: 'alert_callback_error: ' + (error && error.message ? error.message : String(error)) };
+          }
+          ctx.lastActionAt = now;
+          ctx.phase = 'waiting';
+          appendLog('exit_instance_confirmed', { method: 'params.rightCallback + hideImmediately' });
+          return { ok: true, method: 'params.rightCallback', reason: 'confirmed' };
+        }
+
+        case 'waiting': {
+          if (mapName !== module.mapName) {
+            appendLog('exit_instance_arrived', { mapName });
+            state.exitInstanceCtx = null;
+            return { ok: true, reason: 'exited' };
+          }
+          return { ok: true, reason: 'waiting_for_exit' };
+        }
+
+        default:
+          state.exitInstanceCtx = null;
+          return { ok: false, reason: 'unknown_exit_phase' };
+      }
+    }
+
+    function executeTeleportToModule(intent, snapshot) {
+      const now = Date.now();
+      let targetModule = state.teleportCtx ? moduleById(state.teleportCtx.moduleId) : null;
+      if (!state.teleportCtx) {
+        const moduleId = state.currentModuleId || 'four_winds';
+        targetModule = moduleById(moduleId) || moduleById('four_winds');
+        if (!targetModule) return { ok: false, reason: 'no_target_module' };
+        state.teleportCtx = {
+          moduleId: targetModule.id,
+          phase: 'opening_map',
+          startedAt: now,
+          lastActionAt: 0,
+          mapOpenedAt: 0,
+          reopenClicked: false,
+        };
+        appendLog('teleport_start', { moduleId: targetModule.id });
+      }
+
+      const ctx = state.teleportCtx;
+      const module = targetModule || moduleById(ctx.moduleId);
+      if (!module) {
+        state.teleportCtx = null;
+        return { ok: false, reason: 'module_missing' };
+      }
+
+      if (now - ctx.startedAt > 60 * 1000) {
+        appendLog('teleport_timeout', { phase: ctx.phase, elapsed: now - ctx.startedAt });
+        closePanelIfExists('MapDetialWnd');
+        state.teleportCtx = null;
+        return { ok: false, reason: 'teleport_timeout' };
+      }
+
+      const MIN_ACTION_GAP = 800;
+      if (now - ctx.lastActionAt < MIN_ACTION_GAP) {
+        return { ok: true, reason: 'teleport_throttled' };
+      }
+
+      const mapName = (snapshot.scene || {}).mapName || '';
+      if (mapName === module.mapName) {
+        appendLog('teleport_arrived', { mapName });
+        state.teleportCtx = null;
+        state.farmArrivedAt = 0;
+        state.farmArrivedCoord = '';
+        return { ok: true, reason: 'arrived_module_map' };
+      }
+
+      switch (ctx.phase) {
+        case 'opening_map': {
+          const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
+          if (bossOpen) {
+            closePanelIfExists('Instance_BossUI');
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'closing_blocking_panel' };
+          }
+          ctx.phase = 'select_map';
+          ctx.lastActionAt = now;
+          return { ok: true, reason: 'proceed_to_select_map' };
+        }
+
+        case 'select_map': {
+          const contentReady = (snap) => {
+            const entries = (snap.mapPanel && snap.mapPanel.mapEntries) || [];
+            return entries.some((e) => cleanText(e.name) === module.mapName
+              || cleanText(e.name).includes(module.mapName));
+          };
+          const mapResult = ensureMapReady(snapshot, ctx, contentReady, 'teleport');
+          if (!mapResult.ok) {
+            appendLog('teleport_give_up', { reason: mapResult.reason });
+            state.teleportCtx = null;
+            return { ok: false, reason: 'teleport_map_give_up' };
+          }
+          if (mapResult.reason !== 'ready') {
+            return mapResult;
+          }
+          const fresh = readSnapshot();
+          if (!fresh.mapPanel.open) {
+            ctx.phase = 'opening_map';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'map_closed_retry' };
+          }
+          const targetEntry = (fresh.mapPanel.mapEntries || []).find((e) =>
+            cleanText(e.name) === module.mapName || cleanText(e.name).includes(module.mapName));
+          if (!targetEntry) return { ok: false, reason: 'map_not_in_list: ' + module.mapName };
+          const gRoot = root();
+          const node = findNodeByPath(gRoot, targetEntry.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'map_entry_node_unavailable' };
+          const bigBtn = findBigBtnChild(gRoot, node);
+          const clickTarget = bigBtn || node;
+          const action = activateNode(clickTarget);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          ctx.phase = 'select_submap';
+          appendLog('teleport_clicked_module', { method: action.method, module: module.id });
+          return { ok: true, method: action.method, reason: 'module_clicked' };
+        }
+
+        case 'select_submap': {
+          const gRoot = root();
+          const allNodes = gRoot ? collectNodes(gRoot) : [];
+          const listTree = allNodes.find((item) =>
+            item.effectiveVisible && item.name === 'List_tree');
+          if (!listTree) {
+            if (now - ctx.lastActionAt > 3000) {
+              ctx.phase = 'closing_map';
+              ctx.lastActionAt = now;
+              appendLog('teleport_submap_timeout', {});
+              return { ok: true, reason: 'submap_not_found_retry' };
+            }
+            return { ok: true, reason: 'waiting_for_submap' };
+          }
+          const treeChildren = allNodes.filter((item) =>
+            item.effectiveVisible && item.path !== listTree.path
+            && item.path.startsWith(listTree.path + '/')
+            && item.packageName === 'smallitemBtn');
+          const targetSubItem = treeChildren.find((row) => {
+            const kids = descendantsOf(allNodes, row).filter((item) => item.path !== row.path);
+            const titleNode = kids.find((item) => item.name === 'title' && item.contentText);
+            return titleNode && cleanText(titleNode.contentText) === module.mapName;
+          });
+          if (!targetSubItem) return { ok: false, reason: 'submap_not_found: ' + module.mapName };
+          const subNode = findNodeByPath(gRoot, targetSubItem.path);
+          if (!subNode || !nodeIsEffectivelyVisible(subNode)) return { ok: false, reason: 'submap_node_unavailable' };
+          const action = activateNode(subNode);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          ctx.lastActionAt = now;
+          ctx.phase = 'closing_map';
+          appendLog('teleport_clicked_submap', { method: action.method });
+          return { ok: true, method: action.method, reason: 'submap_clicked' };
+        }
+
+        case 'closing_map': {
+          if (!snapshot.mapPanel.open) {
+            ctx.phase = 'waiting';
+            ctx.lastActionAt = now;
+            return { ok: true, reason: 'map_closed_proceed' };
+          }
+          const result = closePanelIfExists('MapDetialWnd');
+          ctx.lastActionAt = now;
+          ctx.phase = 'waiting';
+          appendLog('teleport_closing_map', { reason: result.reason });
+          return { ok: true, reason: 'map_closed' };
+        }
+
+        case 'waiting': {
+          if (mapName === module.mapName) {
+            appendLog('teleport_arrived', { mapName });
+            state.teleportCtx = null;
+            state.farmArrivedAt = 0;
+            state.farmArrivedCoord = '';
+            return { ok: true, reason: 'arrived' };
+          }
+          return { ok: true, reason: 'waiting_for_teleport' };
+        }
+
+        default:
+          state.teleportCtx = null;
+          return { ok: false, reason: 'unknown_teleport_phase' };
       }
     }
 
