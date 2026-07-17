@@ -452,13 +452,9 @@
         farmTargetName: cleanText(source.farmTargetName) || CONFIG_DEFAULTS.farmTargetName,
         rateRecheckIntervalMs: clampNumber(source.rateRecheckIntervalMs, 60 * 1000, 60 * 60 * 1000, CONFIG_DEFAULTS.rateRecheckIntervalMs),
         trialPriorityWindowMs: clampNumber(source.trialPriorityWindowMs, 0, 10 * 60 * 1000, CONFIG_DEFAULTS.trialPriorityWindowMs),
-        enabledMaps: Array.isArray(source.enabledMaps) && source.enabledMaps.length
-          ? source.enabledMaps.map(cleanText).filter(Boolean)
-          : clone(CONFIG_DEFAULTS.enabledMaps),
+        enabledMaps: mergeWithDefaults(source.enabledMaps, CONFIG_DEFAULTS.enabledMaps),
         mapPriorities: normalizeMapPriorities(source.mapPriorities),
-        enabledBosses: Array.isArray(source.enabledBosses) && source.enabledBosses.length
-          ? source.enabledBosses.map(cleanText).filter(Boolean)
-          : clone(CONFIG_DEFAULTS.enabledBosses),
+        enabledBosses: mergeWithDefaults(source.enabledBosses, CONFIG_DEFAULTS.enabledBosses),
         purgatoryMapChoice: cleanText(source.purgatoryMapChoice) || CONFIG_DEFAULTS.purgatoryMapChoice,
         instanceEmptyCooldownMs: clampNumber(source.instanceEmptyCooldownMs, 60 * 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.instanceEmptyCooldownMs),
       };
@@ -471,6 +467,18 @@
       for (const module of MAP_MODULES) {
         const v = source[module.id];
         out[module.id] = (typeof v === 'number' && Number.isFinite(v)) ? v : module.priority;
+      }
+      return out;
+    }
+
+    // mergeWithDefaults: 保留 source 中的项,并追加 CONFIG_DEFAULTS 中存在但 source 缺失的项。
+    // 用于 enabledMaps/enabledBosses 升级兼容:旧 localStorage 缺新加的 module/boss 时自动补齐,
+    // 用户用 setConfig 显式删掉的项仍会被加回(array schema 无法表达"关闭意图")。
+    function mergeWithDefaults(sourceList, defaultList) {
+      const source = Array.isArray(sourceList) ? sourceList.map(cleanText).filter(Boolean) : [];
+      const out = source.slice();
+      for (const item of defaultList) {
+        if (!out.includes(item)) out.push(item);
       }
       return out;
     }
