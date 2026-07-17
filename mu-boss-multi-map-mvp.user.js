@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.2.0
+// @version      0.3.0
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -734,6 +734,185 @@
         mapName,
         rateIconUrl,
       };
+    }
+
+    // --- Snapshot & reconciliation (Task 4) ---
+
+    function readSnapshot() {
+      const gRoot = root();
+      const nodes = gRoot ? collectNodes(gRoot) : [];
+      const snapshot = {
+        at: Date.now(),
+        overlay: readOverlay(),
+        scene: scanScene(nodes),
+        mapPanel: scanMapPanel(nodes),
+        combat: scanCombat(nodes),
+        bossChallengePanel: scanBossChallengePanel(nodes),
+        autoBattle: scanAutoBattle(nodes),
+        fguiReady: Boolean(gRoot),
+      };
+      // 注:scanTrialTaskbar 已删除,不读
+      const farmTargetMissing = snapshot.mapPanel.open && !snapshot.mapPanel.farmTarget;
+      if (farmTargetMissing && !state.farmTargetMissing) {
+        appendLog('farm_target_missing', { reason: snapshot.mapPanel.farmTargetReason });
+      }
+      state.farmTargetMissing = farmTargetMissing;
+      state.lastSnapshot = snapshot;
+      return clone(snapshot);
+    }
+
+    function reconcileTargets(snapshot) {
+      const now = Number(snapshot && snapshot.at) || Date.now();
+      const records = snapshot && snapshot.overlay && Array.isArray(snapshot.overlay.records)
+        ? snapshot.overlay.records
+        : [];
+      const previousById = new Map(state.targets.map((target) => [target.id, target]));
+      state.targets = MAP_MODULES.flatMap((module) => {
+        if (!state.config.enabledMaps.includes(module.id)) return [];
+        return module.bosses.map((definition) => {
+          const previous = previousById.get(definition.id) || createTargetState(definition);
+          const target = { ...createTargetState(definition), ...clone(previous), ...definition, moduleId: module.id, mapName: module.mapName };
+          const matchingRecord = selectMatchingRecord(records, target);
+          if (matchingRecord) {
+            const refreshAt = validRefreshAt(matchingRecord.refreshAt);
+            if (refreshAt !== null) {
+              target.refreshAt = refreshAt;
+              target.lastRefreshAt = refreshAt;
+              target.lastRecordAt = validRecordAt(matchingRecord.observedAt, now);
+              // 有新 overlay 刷新记录 → 清除副本空场冷却(防折返解除条件)
+              if (state.instanceCheckCooldown[module.id] && state.instanceCheckCooldown[module.id] > now) {
+                delete state.instanceCheckCooldown[module.id];
+                appendLog('instance_cooldown_lifted', { moduleId: module.id, reason: 'overlay got refresh record' });
+              }
+            } else {
+              target.refreshAt = null;
+              target.lastRefreshAt = null;
+              target.lastRecordAt = validRecordAt(matchingRecord.observedAt, now);
+            }
+          } else {
+            if (!validRefreshAt(target.refreshAt)) {
+              target.refreshAt = null;
+              target.lastRefreshAt = null;
+            }
+            target.lastRecordAt = 0;
+          }
+          target.status = targetStatus(target, now);
+          return target;
+        });
+      });
+      return clone(state.targets);
+    }
+
+    function recordMatchesTarget(record, target) {
+      if (!record || !target) return false;
+      if (cleanText(record.mapName) !== target.mapName) return false;
+      if (cleanText(record.bossName) !== target.name) return false;
+      const rawCoordinate = cleanText(record.bossCoordinate);
+      if (!rawCoordinate) return true;
+      const coordinate = normalizeCoordinate(rawCoordinate);
+      if (!coordinate || !target.coordinate || target.coordinate === 'TBD') return true;
+      return chebyshevDistance(coordinate, target.coordinate) <= 3;
+    }
+
+    function selectMatchingRecord(records, target) {
+      return records
+        .filter((record) => recordMatchesTarget(record, target))
+        .sort((left, right) => {
+          const coordinateDelta = Number(Boolean(normalizeCoordinate(right.bossCoordinate)))
+            - Number(Boolean(normalizeCoordinate(left.bossCoordinate)));
+          if (coordinateDelta) return coordinateDelta;
+          return validRecordAt(right.observedAt, 0) - validRecordAt(left.observedAt, 0);
+        })[0] || null;
+    }
+
+    function validRefreshAt(value) {
+      const refreshAt = Number(value);
+      return Number.isFinite(refreshAt) && refreshAt > 0 ? refreshAt : null;
+    }
+
+    function validRecordAt(value, fallback) {
+      const recordAt = Number(value);
+      return Number.isFinite(recordAt) && recordAt > 0 ? recordAt : fallback;
+    }
+
+    function clearCooldown(target) {
+      target.cooldownUntil = 0;
+      target.cooldownRefreshAt = null;
+    }
+
+    function isCooling(target, now) {
+      return Boolean(target && Number(target.cooldownUntil) > now);
+    }
+
+    function markContested(target, now) {
+      if (!target) return;
+      const contestedAt = Number(now) || Date.now();
+      target.cooldownUntil = contestedAt + state.config.contestedCooldownMs;
+      target.cooldownRefreshAt = validRefreshAt(target.refreshAt);
+      target.status = 'COOLING';
+      state.currentTargetId = '';
+      state.currentAction = null;
+    }
+
+    function targetStatus(target, now) {
+      if (isCooling(target, now)) return 'COOLING';
+      const refreshAt = validRefreshAt(target && target.refreshAt);
+      if (refreshAt === null) return 'READY_UNKNOWN_TIMER';
+      if (refreshAt <= now) return 'READY';
+      if (refreshAt - now <= state.config.preWaitSeconds * 1000) return 'PREPARE';
+      return 'WAITING_REFRESH';
+    }
+
+    function targetById(id) {
+      return state.targets.find((target) => target.id === id) || null;
+    }
+
+    function chebyshevDistance(coordA, coordB) {
+      const a = String(coordA).split(',').map(Number);
+      const b = String(coordB).split(',').map(Number);
+      if (a.length < 2 || b.length < 2 || !a.every(Number.isFinite) || !b.every(Number.isFinite)) return Infinity;
+      return Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]));
+    }
+
+    function releaseLockedTarget() {
+      state.currentTargetId = '';
+      state.currentAction = null;
+      state.currentIntent = null;
+    }
+
+    // --- Module helpers (Task 4) ---
+
+    function moduleByMapName(mapName) {
+      if (!mapName) return null;
+      return MAP_MODULES.find((m) => m.mapName === mapName && state.config.enabledMaps.includes(m.id)) || null;
+    }
+
+    function moduleById(moduleId) {
+      return MAP_MODULES.find((m) => m.id === moduleId) || null;
+    }
+
+    function effectiveModulePriority(module) {
+      if (!module) return 0;
+      const override = state.config.mapPriorities && state.config.mapPriorities[module.id];
+      return (typeof override === 'number' && Number.isFinite(override)) ? override : module.priority;
+    }
+
+    function isModuleEnabled(module) {
+      return Boolean(module && module.enabled && state.config.enabledMaps.includes(module.id));
+    }
+
+    function isBossEnabled(target) {
+      return Boolean(target && state.config.enabledBosses.includes(target.id));
+    }
+
+    function setInstanceCheckCooldown(moduleId, until) {
+      state.instanceCheckCooldown[moduleId] = until;
+      appendLog('instance_cooldown_set', { moduleId, until });
+    }
+
+    function isInstanceInCooldown(moduleId, now) {
+      const until = Number(state.instanceCheckCooldown[moduleId]) || 0;
+      return until > now;
     }
 
     // --- API exposure (Task 2) ---
