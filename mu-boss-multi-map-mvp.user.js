@@ -152,6 +152,7 @@
 
     state.config = normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS));
     syncRuntimeFlags();  // re-sync after normalizeConfig
+    rebuildRateCheckMaps();
 
     state.targets = MAP_MODULES.flatMap((module) =>
       module.bosses.map((boss) => createTargetState({
@@ -986,7 +987,542 @@
       },
     };
 
+    // --- Rate-check maps (Task 5) ---
+
+    const RATE_URL_MAP = {
+      'txt_bld': 'low',
+      'txt_blz': 'medium',
+      'txt_blg': 'high',
+    };
+
+    // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,傲之煞=txt_bld=low)
+    // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
+    const PURGATORY_RATE_CHECK_ENABLED = true;
+
+    // RATE_CHECK_MAPS 从 MAP_MODULES 动态生成;在 state.config 初始化后调用 rebuildRateCheckMaps()
+    const RATE_CHECK_MAPS = {};
+
+    function rebuildRateCheckMaps() {
+      for (const key in RATE_CHECK_MAPS) delete RATE_CHECK_MAPS[key];
+      for (const module of MAP_MODULES) {
+        if (!isModuleEnabled(module)) continue;
+        // 跳过 Task 0 决定不做爆率检查的模块
+        if (module.id === 'purgatory' && !PURGATORY_RATE_CHECK_ENABLED) continue;
+        RATE_CHECK_MAPS[module.mapName] = {
+          tab: module.bossRowTab,
+          bossNames: module.bosses.map((b) => b.name),
+          mapMatch: module.mapName.replace(/\d+$/, ''),
+          moduleId: module.id,
+        };
+      }
+    }
+
+    function nextRateResetTimestamp() {
+      const now = Date.now();
+      const utc8Ms = now + 8 * 3600 * 1000;
+      const utc8Date = new Date(utc8Ms);
+      // UTC+8 凌晨 8am 重置 = UTC 0am 重置
+      const utcMidnight = Date.UTC(utc8Date.getUTCFullYear(), utc8Date.getUTCMonth(), utc8Date.getUTCDate());
+      return utcMidnight + 24 * 3600 * 1000;
+    }
+
+    function getRateResult(mapName) {
+      if (!mapName) return null;
+      const r = state.rateResults[mapName];
+      if (!r) return null;
+      const now = Date.now();
+      if (r.result === 'low') {
+        if (r.skipUntil && now < r.skipUntil) return r;
+        return null;
+      }
+      if (r.nextCheckAt && now < r.nextCheckAt) return r;
+      return null;
+    }
+
+    function isMapRateLow(mapName) {
+      const r = getRateResult(mapName);
+      return r && r.result === 'low' ? true : false;
+    }
+
+    function needRateCheck(snapshot) {
+      // Task 6 完整实现,这里占位返回 false
+      return false;
+    }
+
+    function needMapScan(snapshot, module) {
+      // Task 6 完整实现,这里占位返回 false
+      return false;
+    }
+
+    function parseCountdownMs(text) {
+      const s = cleanText(text);
+      let totalMs = 0;
+      let matched = false;
+      const hourMatch = s.match(/(\d+)\s*小时/);
+      const minMatch = s.match(/(\d+)\s*分/);
+      const secMatch = s.match(/(\d+)\s*秒/);
+      if (hourMatch) { totalMs += parseInt(hourMatch[1], 10) * 3600 * 1000; matched = true; }
+      if (minMatch) { totalMs += parseInt(minMatch[1], 10) * 60 * 1000; matched = true; }
+      if (secMatch) { totalMs += parseInt(secMatch[1], 10) * 1000; matched = true; }
+      if (!matched) {
+        const m = s.match(/(\d{1,2}):([0-5]\d)/);
+        if (m) { totalMs = (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) * 1000; matched = true; }
+      }
+      return matched ? totalMs : 0;
+    }
+
+    // --- Intent helpers (Task 5) ---
+
+    function makeIntent(type, targetId, reason, action, confidence) {
+      return {
+        type,
+        targetId: targetId || null,
+        reason: cleanText(reason),
+        action: action || 'none',
+        confidence: clampNumber(confidence, 0, 1, 0),
+      };
+    }
+
+    function applyIntent(intent) {
+      const next = clone(intent);
+      const previousTargetId = state.currentTargetId;
+      if (next.targetId) state.currentTargetId = next.targetId;
+      else if (next.type !== 'safe_wait' && next.type !== 'enter_instance'
+        && next.type !== 'exit_instance' && next.type !== 'teleport_to_module'
+        && next.type !== 'scan_map') state.currentTargetId = '';
+      if (state.currentTargetId && state.currentTargetId !== previousTargetId) {
+        state.arrivalConfirmedAt = 0;
+        state.zKeySentAt = 0;
+        state.zKeyRetryCount = 0;
+        state.holdStartedAt = 0;
+      }
+      state.currentAction = next.action === 'none' ? null : next.action;
+      state.phase = next.type.toUpperCase();
+      if (!isLockingIntent() && state.navigationContext) {
+        appendLog('nav_context_cleared', { reason: 'intent not locking: ' + next.type });
+        state.navigationContext = null;
+      }
+      state.lastIntent = next;
+      state.currentIntent = next;
+      return clone(next);
+    }
+
+    function isLockingIntent() {
+      return state.currentIntent
+        && (state.currentIntent.type === 'travel_boss'
+          || state.currentIntent.type === 'travel_farm'
+          || state.currentIntent.type === 'hold'
+          || state.currentIntent.type === 'engage'
+          || state.currentIntent.type === 'observe_owner'
+          || state.currentIntent.type === 'enter_instance'
+          || state.currentIntent.type === 'exit_instance'
+          || state.currentIntent.type === 'teleport_to_module');
+    }
+
+    function hasLockedValidTarget(snapshot) {
+      const target = targetById(state.currentTargetId);
+      const now = Number(snapshot.at) || Date.now();
+      if (!isLockingIntent()) return false;
+      if (state.currentIntent.type === 'travel_farm') return false;
+      if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
+        releaseLockedTarget();
+        return false;
+      }
+      if (state.currentIntent.type === 'engage' || state.currentIntent.type === 'observe_owner') {
+        if (!target || isCooling(target, now)) {
+          releaseLockedTarget();
+          return false;
+        }
+        return true;
+      }
+      return !findVisibleAttackableTarget(snapshot, target.id);
+    }
+
+    function isLockTargetEligible(target, now) {
+      if (!target) return false;
+      const definition = MAP_MODULES.flatMap((m) => m.bosses).find((item) => item.id === target.id);
+      const allowedStatuses = ['READY_UNKNOWN_TIMER', 'READY', 'PREPARE'];
+      return Boolean(definition
+        && definition.name === target.name
+        && !isCooling(target, now)
+        && allowedStatuses.includes(target.status));
+    }
+
+    function findVisibleAttackableTarget(snapshot, excludedTargetId) {
+      return state.targets.find((target) => target.id !== excludedTargetId
+        && !isCooling(target, Number(snapshot.at) || Date.now())
+        && isVisibleAndAttackable(target, snapshot)) || null;
+    }
+
+    function isVisibleAndAttackable(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      if (!combat || cleanText(combat.targetName) !== target.name) return false;
+      if (!hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
+      const scene = snapshot.scene || {};
+      return !scene.mapName || scene.mapName === target.mapName;
+    }
+
+    function isAtTarget(target, snapshot) {
+      const scene = snapshot && snapshot.scene;
+      if (!scene || scene.mapName !== target.mapName || !scene.coordinate) return false;
+      if (target.coordinate === 'TBD') return false;
+      return chebyshevDistance(scene.coordinate, target.coordinate) <= ARRIVAL_THRESHOLD;
+    }
+
+    function isAlreadyFarming(snapshot) {
+      if (!state.farmArrivedAt || !state.farmArrivedCoord) return false;
+      if (state.navigationContext) return false;
+      const autoBattle = snapshot && snapshot.autoBattle;
+      if (autoBattle && autoBattle.enabled) {
+        state.farmLastSeenFarmingAt = Date.now();
+        return true;
+      }
+      if (state.farmLastSeenFarmingAt && Date.now() - state.farmLastSeenFarmingAt < 60000) return true;
+      if (Date.now() - state.farmArrivedAt < 15000) return true;
+      if (snapshot && snapshot.mapPanel && snapshot.mapPanel.open) return false;
+      const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
+      if (!coord) return true;
+      return chebyshevDistance(coord, state.farmArrivedCoord) <= ARRIVAL_THRESHOLD;
+    }
+
+    function observeContestedOwner(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      const ownerName = cleanText(combat && combat.ownerName);
+      const isForeignOwner = Boolean(combat
+        && cleanText(combat.targetName) === target.name
+        && hasVisibleHpBar(combat)
+        && ownerName
+        && ownerName !== state.config.ownerName);
+      if (!isForeignOwner) {
+        resetOwnerObservation();
+        return false;
+      }
+      const now = Number(snapshot.at) || Date.now();
+      if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
+        state.ownerObservation = { targetId: target.id, observedAt: now };
+        return false;
+      }
+      if (now - state.ownerObservation.observedAt < state.config.ownerObserveSeconds * 1000) return false;
+      resetOwnerObservation();
+      markContested(target, now);
+      return true;
+    }
+
+    function resetOwnerObservation() {
+      state.ownerObservation = null;
+    }
+
+    function hasVisibleHpBar(combat) {
+      const hpPercent = combat && combat.hpPercent;
+      return hpPercent !== null
+        && hpPercent !== undefined
+        && hpPercent !== ''
+        && Number.isFinite(Number(hpPercent));
+    }
+
+    // --- Intent selection (Task 5) ---
+
+    function intentForTarget(target, module, snapshot) {
+      if (!target) return makeIntent('sync', null, 'target missing', 'none', 0);
+      // 1. 被他人占据 → 观察
+      if (observeContestedOwner(target, snapshot)) {
+        return makeIntent('safe_wait', null, 'boss contested cooldown', 'none', 0.95);
+      }
+      // 2. 在视野内可攻击
+      if (isVisibleAndAttackable(target, snapshot)) {
+        const ownerName = cleanText(snapshot.combat && snapshot.combat.ownerName);
+        if (ownerName && ownerName !== state.config.ownerName) {
+          return makeIntent('observe_owner', target.id, 'visible boss owned by another player', 'observe_owner', 0.95);
+        }
+        return makeIntent('engage', target.id, 'visible boss is attackable', 'ensure_auto_battle', 1);
+      }
+      // 3. 已到坐标 → hold
+      if (isAtTarget(target, snapshot)) {
+        if (target.status === 'READY_UNKNOWN_TIMER') {
+          if (!state.holdStartedAt) state.holdStartedAt = Number(snapshot.at) || Date.now();
+          const HOLD_UNKNOWN_TIMEOUT_MS = 60 * 1000;
+          const now = Number(snapshot.at) || Date.now();
+          if (now - state.holdStartedAt > HOLD_UNKNOWN_TIMEOUT_MS) {
+            appendLog('hold_timeout_unknown', { targetId: target.id, elapsedMs: now - state.holdStartedAt });
+            state.lastCheckedAt[target.id] = now;
+            releaseLockedTarget();
+            state.holdStartedAt = 0;
+            return makeIntent('safe_wait', null, 'hold timeout - boss not refreshing', 'none', 0.7);
+          }
+        } else {
+          state.holdStartedAt = 0;
+        }
+        return makeIntent('hold', target.id, 'at boss coordinate', 'hold_position', 0.95);
+      }
+      // 4. 副本模块且当前不在该副本内 → enter_instance
+      if (module.type === 'instance' && snapshot.scene.mapName !== module.mapName) {
+        state.currentModuleId = module.id;
+        return makeIntent('enter_instance', null, module.id + ' has boss, need enter', 'enter_instance', 0.95);
+      }
+      // 5. 已在正确地图但未到坐标 → travel_boss
+      return makeIntent('travel_boss', target.id, 'go to boss coord', 'click_boss_target', 0.9);
+    }
+
+    function intentForLockedTarget(snapshot) {
+      const target = targetById(state.currentTargetId);
+      if (!target) return makeIntent('sync', null, 'locked target missing', 'none', 0);
+      const module = moduleById(target.moduleId);
+      if (!module) return makeIntent('sync', null, 'module missing', 'none', 0);
+      return intentForTarget(target, module, snapshot);
+    }
+
+    function shouldEnterInstance(module, snapshot, now) {
+      if (!isModuleEnabled(module)) return false;
+      if (module.type !== 'instance') return false;
+      if (isInstanceInCooldown(module.id, now)) return false;
+      // 已在该副本内不算"应进入"(由 chooseInstanceIntent 处理)
+      if (snapshot.scene && snapshot.scene.mapName === module.mapName) return false;
+      // 至少有 1 个可打 BOSS
+      const attackable = getAttackableTargets(module, now);
+      if (!attackable.length) return false;
+      // 爆率非 low(若该模块纳入爆率检查)
+      if (RATE_CHECK_MAPS[module.mapName] && isMapRateLow(module.mapName)) return false;
+      // 不在另一个 instance ctx 内
+      if (state.enterInstanceCtx || state.exitInstanceCtx) return false;
+      return true;
+    }
+
+    function shouldPrioritizeInstance(module, snapshot, now) {
+      if (!isModuleEnabled(module) || module.type !== 'instance') return false;
+      if (isInstanceInCooldown(module.id, now)) return false;
+      const attackable = getAttackableTargets(module, now);
+      if (!attackable.length) return false;
+      return attackable.some((t) => {
+        const st = targetStatus(t, now);
+        return st === 'READY' || st === 'READY_UNKNOWN_TIMER';
+      });
+    }
+
+    function getAttackableTargets(module, now) {
+      if (!module) return [];
+      if (isMapRateLow(module.mapName)) return [];
+      if (!isModuleEnabled(module)) return [];
+      return state.targets.filter((t) => {
+        if (t.moduleId !== module.id) return false;
+        if (!isBossEnabled(t)) return false;
+        if (isCooling(t, now)) return false;
+        const status = targetStatus(t, now);
+        return status === 'READY' || status === 'READY_UNKNOWN_TIMER' || status === 'PREPARE';
+      });
+    }
+
+    function selectInstanceTarget(attackable, snapshot) {
+      const now = Number(snapshot.at) || Date.now();
+      const visible = attackable.filter((t) => isVisibleAndAttackable(t, snapshot));
+      if (visible.length) return visible[0];
+      const knownTimer = attackable
+        .filter((t) => validRefreshAt(t.refreshAt) !== null)
+        .sort((a, b) => Number(a.refreshAt) - Number(b.refreshAt));
+      if (knownTimer.length) return knownTimer[0];
+      return attackable[0] || null;
+    }
+
+    function selectHighestPriorityTarget(snapshot, module) {
+      const now = Number(snapshot.at) || Date.now();
+      if (!module) return null;
+      const lockedTarget = targetById(state.currentTargetId);
+      const visibleInterrupt = lockedTarget && isLockingIntent()
+        ? findVisibleAttackableTarget(snapshot, lockedTarget.id)
+        : null;
+      if (visibleInterrupt) return visibleInterrupt;
+      const eligible = state.targets.filter((target) =>
+        target.moduleId === module.id
+        && isBossEnabled(target)
+        && !isCooling(target, now)
+        && !isMapRateLow(module.mapName));
+      const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
+      if (visible.length) return visible[0];
+      const soonToRefresh = eligible
+        .filter((target) => {
+          const refreshAt = validRefreshAt(target.refreshAt);
+          return refreshAt !== null && refreshAt > now && refreshAt - now <= state.config.preWaitSeconds * 1000;
+        })
+        .sort((left, right) => Number(left.refreshAt) - Number(right.refreshAt));
+      if (soonToRefresh.length) return soonToRefresh[0];
+      const ready = eligible.filter((target) => {
+        const refreshAt = validRefreshAt(target.refreshAt);
+        return refreshAt !== null && refreshAt <= now;
+      });
+      if (ready.length) return ready[0];
+      const RECHECK_COOLDOWN_MS = 3 * 60 * 1000;
+      const unknown = eligible.filter((target) => {
+        if (validRefreshAt(target.refreshAt) !== null) return false;
+        const lastChecked = Number(state.lastCheckedAt[target.id]) || 0;
+        return now - lastChecked > RECHECK_COOLDOWN_MS;
+      });
+      if (unknown.length) return unknown[0];
+      return null;
+    }
+
+    function chooseInstanceIntent(snapshot, module) {
+      const now = Number(snapshot.at) || Date.now();
+      const attackable = getAttackableTargets(module, now);
+      if (attackable.length) {
+        const target = selectInstanceTarget(attackable, snapshot);
+        return intentForTarget(target, module, snapshot);
+      }
+      // 本副本 BOSS 状态未知 → 先 scan 判空
+      if (needMapScan(snapshot, module)) {
+        return makeIntent('scan_map', null, 'scan instance for boss presence', 'open_map_scan', 0.85);
+      }
+      // scan 后确认无 BOSS → 写副本空场冷却 + 退出
+      setInstanceCheckCooldown(module.id, now + state.config.instanceEmptyCooldownMs);
+      return makeIntent('exit_instance', null, 'no boss in instance, cooldown set', 'exit_instance', 0.85);
+    }
+
+    function chooseWildIntent(snapshot, module) {
+      const now = Number(snapshot.at) || Date.now();
+      // 优先:实例模块可进
+      const instances = MAP_MODULES
+        .filter((m) => m.type === 'instance' && isModuleEnabled(m))
+        .sort((a, b) => effectiveModulePriority(b) - effectiveModulePriority(a));
+      for (const instModule of instances) {
+        if (shouldEnterInstance(instModule, snapshot, now)) {
+          state.currentModuleId = instModule.id;
+          return makeIntent('enter_instance', null, instModule.id + ' has boss', 'enter_instance', 0.92);
+        }
+      }
+      // 本野外地图 BOSS
+      if (!isMapRateLow(module.mapName)) {
+        const candidate = selectHighestPriorityTarget(snapshot, module);
+        if (candidate) return intentForTarget(candidate, module, snapshot);
+      }
+      // farming
+      resetOwnerObservation();
+      if (isAlreadyFarming(snapshot)) return makeIntent('safe_wait', null, 'no boss work - already farming', 'none', 0.8);
+      return makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
+    }
+
+    function chooseUnknownMapIntent(snapshot) {
+      const now = Number(snapshot.at) || Date.now();
+      // 优先:实例模块可进(经挑战 BOSS 面板,不需要先传送野外)
+      const instances = MAP_MODULES
+        .filter((m) => m.type === 'instance' && isModuleEnabled(m))
+        .sort((a, b) => effectiveModulePriority(b) - effectiveModulePriority(a));
+      for (const instModule of instances) {
+        if (shouldEnterInstance(instModule, snapshot, now)) {
+          state.currentModuleId = instModule.id;
+          return makeIntent('enter_instance', null, instModule.id + ' has boss', 'enter_instance', 0.92);
+        }
+      }
+      // 否则:传送回优先级最高的野外模块
+      const wildModule = selectHighestPriorityWildModule(snapshot);
+      if (wildModule) {
+        state.currentModuleId = wildModule.id;
+        return makeIntent('teleport_to_module', null, 'go to wild map: ' + wildModule.id, 'teleport_wild', 0.85);
+      }
+      // 兜底:传送四风平原(默认)
+      const fw = moduleById('four_winds');
+      return makeIntent('teleport_to_module', null, 'fallback to four winds', 'teleport_wild', 0.8);
+    }
+
+    function selectHighestPriorityWildModule(snapshot) {
+      const now = Number(snapshot.at) || Date.now();
+      const wilds = MAP_MODULES
+        .filter((m) => m.type === 'wild' && isModuleEnabled(m))
+        .sort((a, b) => effectiveModulePriority(b) - effectiveModulePriority(a));
+      // 优先选有可打 BOSS 的野外图
+      for (const m of wilds) {
+        if (!isMapRateLow(m.mapName)) {
+          const attackable = getAttackableTargets(m, now);
+          if (attackable.length) return m;
+        }
+      }
+      // 否则默认四风平原
+      return wilds.find((m) => m.id === 'four_winds') || wilds[0] || null;
+    }
+
+    function chooseIntent(snapshot) {
+      let intent;
+      if (!state.config.enabled) {
+        resetOwnerObservation();
+        intent = makeIntent('disabled', null, 'config disabled', 'none', 1);
+      } else if (state.paused) {
+        resetOwnerObservation();
+        intent = makeIntent('safe_wait', state.currentTargetId || null, state.pauseReason || 'paused', 'none', 1);
+      } else if (!snapshot || !snapshot.fguiReady || !snapshot.overlay || !snapshot.overlay.available) {
+        resetOwnerObservation();
+        intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
+      } else if (state.enterInstanceCtx) {
+        intent = makeIntent('enter_instance', state.enterInstanceCtx.selectedBossId || null,
+          'entering instance: ' + state.enterInstanceCtx.phase, 'enter_instance', 0.95);
+      } else if (state.exitInstanceCtx) {
+        intent = makeIntent('exit_instance', null,
+          'exiting instance: ' + state.exitInstanceCtx.phase, 'exit_instance', 0.95);
+      } else if (state.teleportCtx) {
+        intent = makeIntent('teleport_to_module', null,
+          'teleporting to module: ' + state.teleportCtx.phase, 'teleport_wild', 0.95);
+      } else if (needRateCheck(snapshot)) {
+        resetOwnerObservation();
+        intent = makeIntent('check_rate', null, 'boss rate check due', 'check_boss_rate', 0.96);
+      } else if (hasLockedValidTarget(snapshot)) {
+        intent = intentForLockedTarget(snapshot);
+      } else {
+        const mapName = (snapshot.scene || {}).mapName || '';
+        const currentModule = moduleByMapName(mapName);
+        if (currentModule && currentModule.type === 'instance') {
+          intent = chooseInstanceIntent(snapshot, currentModule);
+        } else if (currentModule && currentModule.type === 'wild') {
+          intent = chooseWildIntent(snapshot, currentModule);
+        } else {
+          intent = chooseUnknownMapIntent(snapshot);
+        }
+      }
+
+      // 爆率低优先级兜底
+      if (!intent || intent.type === 'safe_wait' || intent.type === 'disabled' || intent.type === 'sync') {
+        const currentMapName = (snapshot && snapshot.scene || {}).mapName || '';
+        const currentModule = moduleByMapName(currentMapName);
+        if (currentModule && isMapRateLow(currentModule.mapName)) {
+          resetOwnerObservation();
+          releaseLockedTarget();
+          if (isAlreadyFarming(snapshot)) {
+            intent = makeIntent('safe_wait', null, 'boss rate low - already farming', 'none', 0.5);
+          } else {
+            intent = makeIntent('travel_farm', null, 'boss rate low - farming only', 'click_farm_target', 0.5);
+          }
+        }
+      }
+
+      return applyIntent(intent);
+    }
+
+    // --- Tick loop (Task 5) ---
+
+    function scheduleTick() {
+      if (state.tickId !== null) return;
+      state.tickId = window.setInterval(tick, TICK_MS);
+    }
+
+    function tick() {
+      try {
+        const snapshot = readSnapshot();
+        reconcileTargets(snapshot);
+        const intent = chooseIntent(snapshot);
+        if (state.enabled && !state.dryRun && !state.paused) {
+          return executeIntentPlaceholder(intent, snapshot);
+        }
+        return intent;
+      } catch (error) {
+        state.lastError = { at: Date.now(), message: error && error.message ? error.message : String(error) };
+        appendLog('tick_error', { message: error && error.message ? error.message : String(error) });
+        return null;
+      }
+    }
+
+    function executeIntentPlaceholder(intent, snapshot) {
+      // Task 6 会替换为真正 executeIntent
+      appendLog('intent_placeholder', { type: intent && intent.type, reason: intent && intent.reason });
+      return intent;
+    }
+
     setupKeyboardToggle();
+    scheduleTick();
   };
 
   function inject(fn) {
