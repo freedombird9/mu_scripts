@@ -46,7 +46,64 @@
       instanceEmptyCooldownMs: 15 * 60 * 1000,
     });
 
-    const MAP_MODULES = [];
+    const fourWindsModule = Object.freeze({
+      id: 'four_winds',
+      mapName: '四风平原',
+      type: 'wild',
+      priority: 10,
+      enabled: true,
+      farmTarget: { name: '1500级怪物' },
+      bossRowTab: '野外BOSS',
+      bossRowScroll: null,
+      enterButtonTog: null,
+      enterButtonTextRegex: null,
+      hasTaskbar: false,
+      bosses: [
+        { id: 'ao-left',   name: '傲之煞',       coordinate: '77,145' },
+        { id: 'ao-right',  name: '傲之煞',       coordinate: '182,164' },
+        { id: 'angry-ao',  name: '愤怒傲之煞',   coordinate: '179,79' },
+        { id: 'rage-ao',   name: '狂暴傲之煞',   coordinate: '82,88' },
+      ],
+    });
+
+    const trialLandModule = Object.freeze({
+      id: 'trial_land',
+      mapName: '试炼之地1',
+      type: 'instance',
+      priority: 20,
+      enabled: true,
+      farmTarget: null,
+      bossRowTab: '试炼之地',
+      bossRowScroll: 'privatelevelScroll',
+      enterButtonTog: 'privatetog_mapName',
+      enterButtonTextRegex: /^试炼之地1/,
+      hasTaskbar: false,
+      bosses: [
+        { id: 'lobster-1', name: '龙虾战士',       coordinate: '146,127', layer: 1 },
+        { id: 'lobster-2', name: '邪恶龙虾战士',   coordinate: '79,68',   layer: 1 },
+        { id: 'lobster-3', name: '咆哮龙虾战士',   coordinate: '122,33',  layer: 1 },
+      ],
+    });
+
+    const purgatoryModule = Object.freeze({
+      id: 'purgatory',
+      mapName: '苦难炼狱2',
+      type: 'instance',
+      priority: 30,
+      enabled: true,
+      farmTarget: null,
+      bossRowTab: '苦难炼狱',
+      bossRowScroll: 'wildlevelScroll',
+      enterButtonTog: 'wildtog_mapName',
+      enterButtonTextRegex: /^苦难炼狱2/,
+      hasTaskbar: false,
+      bosses: [
+        // Task 0 项 2 探查:角色站墓碑旁亲自验证为 '149,101'(按钮上的 (126,95) 是按钮坐标,非 BOSS 坐标)
+        { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },
+      ],
+    });
+
+    const MAP_MODULES = [fourWindsModule, trialLandModule, purgatoryModule];
 
     // Derived from MAP_MODULES; needed by scanMapPanel and scanCombat to filter BOSS rows
     // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
@@ -95,6 +152,14 @@
 
     state.config = normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS));
     syncRuntimeFlags();  // re-sync after normalizeConfig
+
+    state.targets = MAP_MODULES.flatMap((module) =>
+      module.bosses.map((boss) => createTargetState({
+        ...boss,
+        moduleId: module.id,
+        mapName: module.mapName,
+      }))
+    );
 
     // --- Utility functions (copied from mu-boss-trial-land-mvp.user.js) ---
 
@@ -150,6 +215,18 @@
 
     function clone(value) {
       return value == null ? value : JSON.parse(JSON.stringify(value));
+    }
+
+    function createTargetState(target) {
+      return {
+        ...target,
+        refreshAt: null,
+        lastRefreshAt: null,
+        lastRecordAt: 0,
+        cooldownUntil: 0,
+        cooldownRefreshAt: null,
+        status: 'UNKNOWN',
+      };
     }
 
     function root() {
