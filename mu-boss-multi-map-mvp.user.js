@@ -74,8 +74,10 @@
       enabled: true,
       farmTarget: null,
       bossRowTab: '试炼之地',
-      bossRowScroll: 'privatelevelScroll',
-      enterButtonTog: 'privatetog_mapName',
+      // CDP 实测(2026-07-17):试炼之地 tab 下 BOSS 行实际在 wildlevelScroll(与野外 tab 共用),
+      // 进入按钮也在 wildtog_mapName。之前 spec 探查误写为 privatelevelScroll/privatetog_mapName。
+      bossRowScroll: 'wildlevelScroll',
+      enterButtonTog: 'wildtog_mapName',
       enterButtonTextRegex: /^试炼之地1/,
       hasTaskbar: false,
       bosses: [
