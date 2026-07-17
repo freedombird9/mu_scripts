@@ -1312,24 +1312,9 @@
         state.currentModuleId = module.id;
         return makeIntent('enter_instance', null, module.id + ' has boss, need enter', 'enter_instance', 0.95);
       }
-      // 5. 副本内:游戏内置"进副本自动寻路到 BOSS"机制,角色从入口跑向 BOSS 需要时间。
-      //    此期间 isAtTarget=false,但不应主动开 M 大地图导航(会跟游戏寻路冲突 + 大地图卡开不关)。
-      //    用 safe_wait 等待游戏寻路把角色送到 BOSS 坐标;到坐标后 isAtTarget=true 走分支 3 正常 hold+战斗。
-      //    超时(travelTimeoutMs 180s)未到达则放弃:副本可能卡了,退出重进。
-      //    注意:不能用 hold intent,因为 executeHold 检查 isAtTarget 会拒绝(not_at_coordinate)。
-      if (module.type === 'instance' && (snapshot.scene && snapshot.scene.mapName) === module.mapName) {
-        if (!state.holdStartedAt) state.holdStartedAt = Number(snapshot.at) || Date.now();
-        const now = Number(snapshot.at) || Date.now();
-        if (now - state.holdStartedAt > state.config.travelTimeoutMs) {
-          appendLog('instance_travel_timeout', { targetId: target.id, elapsedMs: now - state.holdStartedAt });
-          state.lastCheckedAt[target.id] = now;
-          releaseLockedTarget();
-          state.holdStartedAt = 0;
-          return makeIntent('exit_instance', null, 'instance travel timeout - exit retry', 'exit_instance', 0.7);
-        }
-        return makeIntent('safe_wait', target.id, 'in instance, waiting for game auto-route to boss', 'none', 0.85);
-      }
-      // 6. 野外地图:已在正确地图但未到坐标 → travel_boss(M 大地图导航)
+      // 5. 已在正确地图但未到坐标 → travel_boss
+      //    野外地图:executeTravel 开 M 大地图点 BOSS 行导航
+      //    副本地图:executeTravel 内部走 executeInstanceTravel,不开大地图,只跟踪坐标变化(游戏自动寻路)
       return makeIntent('travel_boss', target.id, 'go to boss coord', 'click_boss_target', 0.9);
     }
 
@@ -1874,6 +1859,68 @@
 
     // --- Navigation (travel_boss / travel_farm) (Task 6) ---
 
+    // 副本内 BOSS 导航:游戏内置"进副本自动寻路到 BOSS",不开 M 大地图,只跟踪坐标变化。
+    // 借鉴原 trial-land 的 executeTravelTrialBoss(L1246-1425)的坐标稳定性检查逻辑。
+    function executeInstanceTravel(intent, snapshot, target, now) {
+      let navCtx = state.navigationContext;
+      const isSameNav = navCtx && navCtx.kind === 'instance_boss' && navCtx.targetId === target.id;
+
+      if (!isSameNav) {
+        state.navigationContext = {
+          kind: 'instance_boss',
+          targetId: target.id,
+          startedAt: now,
+          lastCoordinate: snapshot.scene.coordinate || '',
+          lastCoordinateAt: now,
+          clicked: false,  // 副本内不点大地图行,clicked 一直 false 但用作"已初始化"标志
+          retried: false,
+        };
+        navCtx = state.navigationContext;
+        appendLog('instance_travel_start', { targetId: target.id, coordinate: target.coordinate });
+      }
+
+      const currentCoord = snapshot.scene.coordinate || '';
+      if (!currentCoord) return { ok: true, reason: 'navigating_no_coord' };
+
+      const moved = currentCoord !== navCtx.lastCoordinate;
+      if (moved) {
+        navCtx.lastCoordinate = currentCoord;
+        navCtx.lastCoordinateAt = now;
+      }
+
+      // 坐标稳定 5s + 距离 ≤ ARRIVAL_THRESHOLD → 到达,开挂
+      if (!moved && now - navCtx.lastCoordinateAt > 5000) {
+        if (target.coordinate !== 'TBD'
+          && chebyshevDistance(currentCoord, target.coordinate) > ARRIVAL_THRESHOLD) {
+          return { ok: true, reason: 'navigating_stable_but_far' };
+        }
+        state.arrivalConfirmedAt = now;
+        state.navigationContext = null;
+        appendLog('instance_travel_arrived', { coordinate: currentCoord });
+        const zResult = ensureZKey(snapshot);
+        return { ok: true, reason: 'arrived', zKey: zResult.reason };
+      }
+
+      // 超时 → retry / exit_instance
+      if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
+        if (!navCtx.retried) {
+          navCtx.retried = true;
+          navCtx.startedAt = now;
+          navCtx.lastCoordinate = '';
+          navCtx.lastCoordinateAt = 0;
+          appendLog('instance_travel_retry_timeout', { targetId: target.id });
+          return { ok: true, reason: 'retry_pending' };
+        }
+        appendLog('instance_travel_failed_timeout', { targetId: target.id });
+        state.navigationContext = null;
+        state.currentTargetId = '';
+        state.currentAction = 'navigation_failed';
+        return { ok: false, reason: 'instance_travel_timeout' };
+      }
+
+      return { ok: true, reason: 'navigating' };
+    }
+
     function executeTravel(intent, snapshot, kind) {
       const now = Date.now();
       const targetKey = intent.targetId || 'farm';
@@ -1883,6 +1930,21 @@
       if (snapshot.bossChallengePanel && snapshot.bossChallengePanel.open) {
         closePanelIfExists('Instance_BossUI');
         return { ok: true, reason: 'closing_blocking_panel' };
+      }
+
+      // 副本内 BOSS 导航:游戏内置"进副本自动寻路到 BOSS"机制,不开 M 大地图,
+      // 只跟踪角色坐标变化判定到达。逻辑借鉴原 trial-land 的 executeTravelTrialBoss:
+      // - 角色跑动(coord 变化)→ 更新 lastCoordinate,继续等
+      // - 坐标稳定 5s + 距离 ≤ ARRIVAL_THRESHOLD → 到达,ensureZKey 开挂
+      // - 坐标稳定 5s + 距离远 → navigating_stable_but_far(寻路可能卡了,继续等)
+      // - 超时 travelTimeoutMs → retry / exit_instance
+      if (kind === 'boss' && intent.targetId) {
+        const target = targetById(intent.targetId);
+        const module = target ? moduleById(target.moduleId) : null;
+        if (module && module.type === 'instance'
+          && snapshot.scene && snapshot.scene.mapName === module.mapName) {
+          return executeInstanceTravel(intent, snapshot, target, now);
+        }
       }
 
       if (!isSameNav) {
