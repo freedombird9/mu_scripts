@@ -15,6 +15,7 @@
 | `mu-boss-only-collapsed.user.js` | BOSS 列表相关 UI 脚本。 |
 | `camera_zoom.js` | 改相机 `fieldOfView` 实现视角缩放。纯渲染参数,**不碰任何游戏逻辑**。 |
 | `mu-boss-four-winds-mvp.user.js` | 四风平原自动打 BOSS 脚本。状态机驱动:扫描 BOSS 面板 → 判定归属 → 导航 → ENGAGE 打 BOSS → HOLD 守点 → 切下一个。运行时 hook FairyGUI 节点,不改 bundle。 |
+| `mu-boss-multi-map-mvp.user.js` | 多地图 BOSS 自动化(四风平原 + 试炼之地1 + 苦难炼狱2),模块化可插拔架构。**取代 `mu-boss-trial-land-mvp.user.js`,旧脚本已退役,在 Tampermonkey 中 disable 旧脚本,两者不可同时启用(会抢 BOSS 面板/大地图状态)。** |
 | `cdp_eval.js` | Chrome DevTools Protocol 远程调试工具。通过 CDP 9222 端口在游戏 iframe 中执行 JS,开发和验证脚本时使用。 |
 
 ---
