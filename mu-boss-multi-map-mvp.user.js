@@ -1416,20 +1416,13 @@
       const now = Number(snapshot.at) || Date.now();
       const attackable = getAttackableTargets(module, now);
       if (attackable.length) {
-        // 即使有 attackable,但若都是 READY_UNKNOWN_TIMER(无 overlay 刷新记录)且 BOSS 不在视野,
-        // 优先 scan_map 让 overlay 采集倒计时(否则会无限 hold 60s 超时循环)。
-        // 苦难炼狱副本内 BOSS 信息只能靠 overlay,任务栏 secretBoss 是另一套玩法不含目标 BOSS。
-        const visible = attackable.filter((t) => isVisibleAndAttackable(t, snapshot));
-        if (!visible.length) {
-          const allUnknown = attackable.every((t) => validRefreshAt(t.refreshAt) === null);
-          if (allUnknown && needMapScan(snapshot, module)) {
-            return makeIntent('scan_map', null, 'scan instance for boss refresh timer', 'open_map_scan', 0.85);
-          }
-        }
+        // 副本内:游戏自带"进入副本自动寻路到 BOSS"机制,角色通常已在 BOSS 坐标。
+        // intentForTarget 已处理 atTarget→hold / visible→engage / 未到→travel_boss 三种情况。
+        // 不主动 scan_map,因为副本内 BOSS 信息只能靠 overlay,scan 会让大地图卡开不关。
         const target = selectInstanceTarget(attackable, snapshot);
         return intentForTarget(target, module, snapshot);
       }
-      // 本副本 BOSS 状态未知 → 先 scan 判空
+      // 本副本 BOSS 状态未知 → 先 scan 判空(scan_map 内部 60s cooldown 防频繁)
       if (needMapScan(snapshot, module)) {
         return makeIntent('scan_map', null, 'scan instance for boss presence', 'open_map_scan', 0.85);
       }
