@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.1.0
+// @version      0.2.0
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -39,7 +39,6 @@
       farmTargetName: '1500级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
-      trialBossFallbackAttempts: 3,
       enabledMaps: ['four_winds', 'trial_land', 'purgatory'],
       mapPriorities: { four_winds: 10, trial_land: 20, purgatory: 30 },
       enabledBosses: ['ao-left','ao-right','angry-ao','rage-ao','lobster-1','lobster-2','lobster-3','magic-crystal'],
@@ -62,7 +61,7 @@
       currentTargetId: '',
       currentAction: null,
       logs: [],
-      config: readJson(STORAGE_KEY, CONFIG_DEFAULTS),
+      config: null,
       paused: false,
       pauseReason: '',
       lastSnapshot: null,
@@ -95,9 +94,8 @@
     };
     syncRuntimeFlags();
 
-    // --- API exposure (placeholder for Task 2) ---
-
-    window.__muMultiMapBossMvp = { __placeholder: true };
+    state.config = normalizeConfig(readJson(STORAGE_KEY, CONFIG_DEFAULTS));
+    syncRuntimeFlags();  // re-sync after normalizeConfig
 
     // --- Utility functions (copied from mu-boss-trial-land-mvp.user.js) ---
 
@@ -302,6 +300,114 @@
         layer.style.opacity = '0';
         setTimeout(function () { if (layer.parentNode) layer.parentNode.removeChild(layer); }, 400);
       }, 1500);
+    }
+
+    // --- Config normalization (Task 2) ---
+
+    function normalizeConfig(input) {
+      const source = input && typeof input === 'object' ? input : {};
+      const config = {
+        enabled: Boolean(source.enabled),
+        dryRun: source.dryRun !== false,
+        ownerName: cleanText(source.ownerName) || CONFIG_DEFAULTS.ownerName,
+        preWaitSeconds: clampNumber(source.preWaitSeconds, 0, 3600, CONFIG_DEFAULTS.preWaitSeconds),
+        ownerObserveSeconds: clampNumber(source.ownerObserveSeconds, 0, 3600, CONFIG_DEFAULTS.ownerObserveSeconds),
+        contestedCooldownMs: clampNumber(source.contestedCooldownMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.contestedCooldownMs),
+        arrivalStallMs: clampNumber(source.arrivalStallMs, 0, 60 * 60 * 1000, CONFIG_DEFAULTS.arrivalStallMs),
+        travelTimeoutMs: clampNumber(source.travelTimeoutMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.travelTimeoutMs),
+        farmTargetName: cleanText(source.farmTargetName) || CONFIG_DEFAULTS.farmTargetName,
+        rateRecheckIntervalMs: clampNumber(source.rateRecheckIntervalMs, 60 * 1000, 60 * 60 * 1000, CONFIG_DEFAULTS.rateRecheckIntervalMs),
+        trialPriorityWindowMs: clampNumber(source.trialPriorityWindowMs, 0, 10 * 60 * 1000, CONFIG_DEFAULTS.trialPriorityWindowMs),
+        enabledMaps: Array.isArray(source.enabledMaps) && source.enabledMaps.length
+          ? source.enabledMaps.map(cleanText).filter(Boolean)
+          : clone(CONFIG_DEFAULTS.enabledMaps),
+        mapPriorities: normalizeMapPriorities(source.mapPriorities),
+        enabledBosses: Array.isArray(source.enabledBosses) && source.enabledBosses.length
+          ? source.enabledBosses.map(cleanText).filter(Boolean)
+          : clone(CONFIG_DEFAULTS.enabledBosses),
+        purgatoryMapChoice: cleanText(source.purgatoryMapChoice) || CONFIG_DEFAULTS.purgatoryMapChoice,
+        instanceEmptyCooldownMs: clampNumber(source.instanceEmptyCooldownMs, 60 * 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.instanceEmptyCooldownMs),
+      };
+      return config;
+    }
+
+    function normalizeMapPriorities(input) {
+      const source = input && typeof input === 'object' ? input : {};
+      const out = {};
+      for (const module of MAP_MODULES) {
+        const v = source[module.id];
+        out[module.id] = (typeof v === 'number' && Number.isFinite(v)) ? v : module.priority;
+      }
+      return out;
+    }
+
+    // --- Status & context reset (Task 2) ---
+
+    function getStatus() {
+      return clone({
+        enabled: state.enabled,
+        dryRun: state.dryRun,
+        phase: state.phase,
+        currentTargetId: state.currentTargetId,
+        currentAction: state.currentAction,
+        currentModuleId: state.currentModuleId,
+        ownerObserveSeconds: state.ownerObservation ? Math.floor((Date.now() - state.ownerObservation.observedAt) / 1000) : 0,
+        targets: state.targets,
+        logs: state.logs.slice(-100),
+        paused: state.paused,
+        pauseReason: state.pauseReason,
+        config: state.config,
+        lastError: state.lastError,
+        navigationContext: clone(state.navigationContext),
+        enterInstanceCtx: clone(state.enterInstanceCtx),
+        exitInstanceCtx: clone(state.exitInstanceCtx),
+        teleportCtx: clone(state.teleportCtx),
+        mapScanContext: clone(state.mapScanContext),
+        rateCheck: clone(state.rateCheck),
+        rateResults: clone(state.rateResults),
+        instanceCheckCooldown: clone(state.instanceCheckCooldown),
+        zKeySentAt: state.zKeySentAt,
+        zKeyRetryCount: state.zKeyRetryCount,
+        arrivalConfirmedAt: state.arrivalConfirmedAt,
+        currentIntent: clone(state.currentIntent),
+      });
+    }
+
+    function resetAllContexts() {
+      state.rateCheck = { phase: 'idle', targetModuleId: '', startedAt: 0, lastActionAt: 0 };
+      state.rateResults = {};
+      state.farmArrivedAt = 0;
+      state.farmArrivedCoord = '';
+      state.farmLastSeenFarmingAt = 0;
+      state.holdStartedAt = 0;
+      state.lastCheckedAt = {};
+      state.lastMapScanAt = 0;
+      state.mapScanContext = null;
+      state.navigationContext = null;
+      state.enterInstanceCtx = null;
+      state.exitInstanceCtx = null;
+      state.teleportCtx = null;
+      state.zKeySentAt = 0;
+      state.zKeyRetryCount = 0;
+      state.arrivalConfirmedAt = 0;
+      state.instanceCheckCooldown = {};
+    }
+
+    // --- Keyboard toggle (Task 2) ---
+
+    function setupKeyboardToggle() {
+      if (window.__muMultiMapBossToggleKeyBound) return;
+      window.__muMultiMapBossToggleKeyBound = true;
+      window.addEventListener('keydown', function (e) {
+        if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.toggle === 'function') {
+            const st = window.__muMultiMapBossMvp.toggle();
+            showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
+          }
+        }
+      }, true);
     }
 
     // --- Scan functions ---
@@ -552,6 +658,79 @@
         rateIconUrl,
       };
     }
+
+    // --- API exposure (Task 2) ---
+
+    window.__muMultiMapBossMvp = {
+      start() {
+        state.config.enabled = true;
+        state.config.dryRun = false;
+        syncRuntimeFlags();
+        persist();
+        appendLog('started', { dryRun: state.dryRun });
+        return getStatus();
+      },
+      toggle() {
+        if (state.config.enabled && !state.dryRun) {
+          state.config.enabled = false;
+          state.config.dryRun = true;
+          syncRuntimeFlags();
+          persist();
+          resetAllContexts();
+          releaseLockedTarget();
+          appendLog('toggled_off', {});
+        } else {
+          state.config.enabled = true;
+          state.config.dryRun = false;
+          syncRuntimeFlags();
+          persist();
+          appendLog('toggled_on', {});
+        }
+        return getStatus();
+      },
+      pause(reason) {
+        state.paused = true;
+        state.pauseReason = cleanText(reason) || 'manual';
+        state.phase = 'PAUSED';
+        appendLog('paused', { reason: state.pauseReason });
+        return getStatus();
+      },
+      resume() {
+        state.paused = false;
+        state.phase = 'SYNC';
+        state.pauseReason = '';
+        appendLog('resumed', {});
+        return getStatus();
+      },
+      status: getStatus,
+      setConfig(patch) {
+        state.config = normalizeConfig({ ...state.config, ...(patch || {}) });
+        syncRuntimeFlags();
+        persist();
+        appendLog('config_updated', { patch: clone(patch || {}) });
+        return getStatus();
+      },
+      scanNow: readSnapshot,  // Task 4 implements readSnapshot; hoisting lets it resolve
+      getModule(moduleId) {
+        const m = MAP_MODULES.find(m => m.id === moduleId);
+        return m ? clone(m) : null;
+      },
+      getTargets() {
+        return clone(state.targets);
+      },
+      resetInstanceCooldown(moduleId) {
+        if (moduleId && state.instanceCheckCooldown[moduleId]) {
+          delete state.instanceCheckCooldown[moduleId];
+          appendLog('instance_cooldown_reset', { moduleId });
+        } else if (!moduleId) {
+          state.instanceCheckCooldown = {};
+          appendLog('instance_cooldown_reset_all', {});
+        }
+        return getStatus();
+      },
+    };
+
+    setupKeyboardToggle();
   };
 
   function inject(fn) {
