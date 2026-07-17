@@ -2588,6 +2588,7 @@
               }
               appendLog('intermediate_popup_failed', { moduleId: currentModule.id });
               closePanelIfExists('Instance_BossUI');
+              closePanelIfExists('MapDetialWnd');
               state.enterInstanceCtx = null;
               releaseLockedTarget();
               return { ok: false, reason: 'intermediate_popup_timeout' };
