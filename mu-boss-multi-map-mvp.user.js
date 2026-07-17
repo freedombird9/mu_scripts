@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.2.0
+// @version      0.2.3
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -99,6 +99,9 @@
       enterButtonTog: 'wildtog_mapName',
       enterButtonTextRegex: /^苦难炼狱2/,
       hasTaskbar: false,
+      // 与 accessory 一致:进副本后走 M 大地图点击导航,既能让 mu-boss-respawn-overlay
+      // 抓取 BOSS 名-坐标信息,又统一两种副本逻辑便于复用。
+      instanceTravelClicksMap: true,
       bosses: [
         // Task 0 项 2 探查:角色站墓碑旁亲自验证为 '149,101'(按钮上的 (126,95) 是按钮坐标,非 BOSS 坐标)
         { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },
@@ -176,6 +179,13 @@
       arrivalConfirmedAt: 0,
       currentModuleId: '',
       instanceCheckCooldown: {},
+      // instanceTravelClicksMap 模块专用:本次副本访问是否已开过 M 大地图。
+      // 进副本时重置为 false;executeTravel 成功打开地图后置 true。
+      // 用途:苦难炼狱地图小,角色可能在 enter_instance.waiting 期间就自动走到
+      // BOSS 坐标,intentForTarget 直接走 hold/engage 跳过 travel_boss,导致
+      // M 大地图从未打开,mu-boss-respawn-overlay 抓不到坐标。此 flag 强制
+      // 先开一次大地图再允许 hold/engage。
+      instanceMapOpened: false,
     };
 
     // --- Rate-check maps (Task 5) ---
@@ -1333,6 +1343,12 @@
       if (observeContestedOwner(target, snapshot)) {
         return makeIntent('safe_wait', null, 'boss contested cooldown', 'none', 0.95);
       }
+      // 1.5 instanceTravelClicksMap 模块:本次副本未开过大地图 → 强制 travel_boss
+      //     先开 M 大地图(让 overlay 抓坐标),再走 hold/engage。地图小/寻路快时
+      //     角色可能在 enter_instance 期间已到位,没有此守卫会直接 hold 跳过开地图。
+      if (module.instanceTravelClicksMap && !state.instanceMapOpened) {
+        return makeIntent('travel_boss', target.id, 'force open map for overlay scan', 'click_boss_target', 0.9);
+      }
       // 2. 在视野内可攻击
       if (isVisibleAndAttackable(target, snapshot)) {
         const ownerName = cleanText(snapshot.combat && snapshot.combat.ownerName);
@@ -1742,6 +1758,13 @@
       if (!isAtTarget(target, snapshot)) {
         return { ok: false, reason: 'not_at_coordinate' };
       }
+      // 清理泄漏的 navigationContext:角色可能在 travel_boss 的 checkNavProgress
+      // 运行前就到位(isAtTarget=true),此时 navContext 未被正常清理。hold 属于
+      // locking intent,applyIntent 不会清它,这里兜底。
+      if (state.navigationContext) {
+        appendLog('hold_nav_context_leak_clear', { targetId: intent.targetId });
+        state.navigationContext = null;
+      }
       if (!state.arrivalConfirmedAt) {
         state.arrivalConfirmedAt = Date.now();
       }
@@ -1753,6 +1776,19 @@
     }
 
     function executeEngage(intent, snapshot) {
+      // 大地图可能还开着:isVisibleAndAttackable 不检查地图状态,BOSS 在 HUD 可见
+      // 且 HP>0 时 intent 可从 travel_boss 直接跳 engage,此时 M 大地图仍打开。
+      // 先关掉,下一 tick 再继续,避免违反单面板约束。
+      if (snapshot.mapPanel && snapshot.mapPanel.open) {
+        const closeResult = closeMapPanel(snapshot);
+        appendLog('engage_closing_leftover_map', { targetId: intent.targetId, reason: closeResult.reason });
+        return { ok: true, reason: 'closing_leftover_map' };
+      }
+      // 清理泄漏的 navigationContext(同 executeHold 理由)。
+      if (state.navigationContext) {
+        appendLog('engage_nav_context_leak_clear', { targetId: intent.targetId });
+        state.navigationContext = null;
+      }
       const result = ensureAutoBattle(snapshot);
       if (!result.ok && result.reason === 'auto_battle_state_unknown') {
         appendLog('auto_battle_state_unknown', { targetId: intent.targetId });
@@ -2040,6 +2076,8 @@
       const mapResult = ensureMapReady(snapshot, navCtx, contentReady, 'travel');
       if (!mapResult.ok) {
         appendLog('travel_give_up', { kind, targetId: targetKey, reason: mapResult.reason });
+        // give-up 也标记已开过,避免反复重试开图卡死;overlay 可能已在重开期间扫到。
+        if (kind === 'boss') state.instanceMapOpened = true;
         state.navigationContext = null;
         releaseLockedTarget();
         return { ok: false, reason: 'target_row_render_timeout' };
@@ -2047,6 +2085,8 @@
       if (mapResult.reason !== 'ready') {
         return mapResult;
       }
+      // 大地图已开且内容就绪:overlay 可扫描,标记本次副本已开过图。
+      if (kind === 'boss') state.instanceMapOpened = true;
 
       let targetRow;
       if (kind === 'boss') {
@@ -2675,6 +2715,8 @@
           if (mapName === currentModule.mapName) {
             appendLog('enter_instance_arrived', { mapName, moduleId: currentModule.id });
             closePanelIfExists('Instance_BossUI');
+            // 重置副本大地图访问标记:每次进副本清零,确保本次副本至少开一次大地图。
+            state.instanceMapOpened = false;
             state.enterInstanceCtx = null;
             state.currentTargetId = ctx.selectedBossId || '';
             state.arrivalConfirmedAt = 0;
