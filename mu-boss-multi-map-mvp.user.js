@@ -1414,6 +1414,16 @@
       const now = Number(snapshot.at) || Date.now();
       const attackable = getAttackableTargets(module, now);
       if (attackable.length) {
+        // 即使有 attackable,但若都是 READY_UNKNOWN_TIMER(无 overlay 刷新记录)且 BOSS 不在视野,
+        // 优先 scan_map 让 overlay 采集倒计时(否则会无限 hold 60s 超时循环)。
+        // 苦难炼狱副本内 BOSS 信息只能靠 overlay,任务栏 secretBoss 是另一套玩法不含目标 BOSS。
+        const visible = attackable.filter((t) => isVisibleAndAttackable(t, snapshot));
+        if (!visible.length) {
+          const allUnknown = attackable.every((t) => validRefreshAt(t.refreshAt) === null);
+          if (allUnknown && needMapScan(snapshot, module)) {
+            return makeIntent('scan_map', null, 'scan instance for boss refresh timer', 'open_map_scan', 0.85);
+          }
+        }
         const target = selectInstanceTarget(attackable, snapshot);
         return intentForTarget(target, module, snapshot);
       }
