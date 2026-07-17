@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.3.1
+// @version      0.4.0
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1046,13 +1046,63 @@
     }
 
     function needRateCheck(snapshot) {
-      // Task 6 完整实现,这里占位返回 false
-      return false;
+      const now = Number(snapshot.at) || Date.now();
+      const rc = state.rateCheck;
+      if (rc.phase !== 'idle') return true;
+      if (state.navigationContext) return false;
+      if (state.mapScanContext) return false;
+      if (state.enterInstanceCtx) return false;
+      if (state.exitInstanceCtx) return false;
+      if (state.teleportCtx) return false;
+      const autoBattle = snapshot && snapshot.autoBattle;
+      if (autoBattle && autoBattle.enabled) return false;
+      const sceneMap = snapshot && snapshot.scene && snapshot.scene.mapName;
+      if (!sceneMap || !RATE_CHECK_MAPS[sceneMap]) return false;
+      return getRateResult(sceneMap) === null;
     }
 
+    function markRateCheckDone(result, mapName) {
+      const now = Date.now();
+      state.rateCheck.phase = 'idle';
+      state.rateCheck.targetModuleId = '';
+      let nextCheckAt = 0;
+      if (mapName) {
+        nextCheckAt = result === 'low' ? nextRateResetTimestamp() : now + state.config.rateRecheckIntervalMs;
+        state.rateResults[mapName] = {
+          result: result,
+          checkedAt: now,
+          skipUntil: result === 'low' ? nextCheckAt : 0,
+          nextCheckAt: nextCheckAt,
+        };
+      }
+      if (result !== 'low') {
+        state.farmArrivedAt = 0;
+        state.farmArrivedCoord = '';
+        state.farmLastSeenFarmingAt = 0;
+      }
+      appendLog('rate_check_done', { result, mapName, nextCheckAt });
+    }
+
+    const MAP_SCAN_COOLDOWN_MS = 60 * 1000;
+    const MAP_SCAN_OPEN_WAIT_MS = 2000;
+
     function needMapScan(snapshot, module) {
-      // Task 6 完整实现,这里占位返回 false
-      return false;
+      const now = Number(snapshot.at) || Date.now();
+      if (state.mapScanContext) return true;
+      if (state.navigationContext) return false;
+      if (state.rateCheck.phase !== 'idle') return false;
+      if (state.enterInstanceCtx || state.exitInstanceCtx || state.teleportCtx) return false;
+      if (!module) return false;
+      const eligible = state.targets.filter((target) =>
+        target.moduleId === module.id
+        && isBossEnabled(target)
+        && !isCooling(target, now)
+        && !isMapRateLow(module.mapName));
+      if (!eligible.length) return false;
+      const allUnknown = eligible.every((target) => validRefreshAt(target.refreshAt) === null);
+      if (!allUnknown) return false;
+      if (now - state.lastMapScanAt < MAP_SCAN_COOLDOWN_MS) return false;
+      return true;
     }
 
     function parseCountdownMs(text) {
@@ -1507,7 +1557,7 @@
         reconcileTargets(snapshot);
         const intent = chooseIntent(snapshot);
         if (state.enabled && !state.dryRun && !state.paused) {
-          return executeIntentPlaceholder(intent, snapshot);
+          return executeIntent(intent, snapshot);
         }
         return intent;
       } catch (error) {
@@ -1517,10 +1567,683 @@
       }
     }
 
-    function executeIntentPlaceholder(intent, snapshot) {
-      // Task 6 会替换为真正 executeIntent
-      appendLog('intent_placeholder', { type: intent && intent.type, reason: intent && intent.reason });
-      return intent;
+    // --- executeIntent: main dispatch (Task 6) ---
+
+    function executeIntent(intent, snapshot) {
+      if (!intent) return null;
+      state.currentAction = intent.action || intent.type;
+      const now = Date.now();
+
+      if (intent.action === 'none' || intent.type === 'sync' || intent.type === 'disabled' || intent.type === 'safe_wait') {
+        appendLog('intent_' + intent.type, { reason: intent.reason, targetId: intent.targetId });
+        return clone(intent);
+      }
+
+      if (now - state.lastActionAt < 500) {
+        appendLog('action_throttled', { msSinceLast: now - state.lastActionAt });
+        return clone(intent);
+      }
+
+      let result;
+      switch (intent.type) {
+        case 'travel_boss': result = executeTravel(intent, snapshot, 'boss'); break;
+        case 'travel_farm': result = executeTravel(intent, snapshot, 'farm'); break;
+        case 'hold': result = executeHold(intent, snapshot); break;
+        case 'engage': result = executeEngage(intent, snapshot); break;
+        case 'observe_owner': result = executeObserveOwner(intent, snapshot); break;
+        case 'check_rate': result = executeCheckRate(intent, snapshot); break;
+        case 'scan_map': result = executeScanMap(intent, snapshot); break;
+        // enter_instance / exit_instance / teleport_to_module 在 Task 7 实现
+        case 'enter_instance': result = { ok: true, reason: 'task7_pending' }; break;
+        case 'exit_instance': result = { ok: true, reason: 'task7_pending' }; break;
+        case 'teleport_to_module': result = { ok: true, reason: 'task7_pending' }; break;
+        default:
+          appendLog('intent_unknown', { type: intent.type });
+          return clone(intent);
+      }
+
+      state.lastActionAt = now;
+      if (result && result.ok) {
+        appendLog('action_executed', { type: intent.type, method: result.method || '', reason: result.reason || '' });
+      } else {
+        appendLog('action_blocked', { type: intent.type, reason: result ? result.reason : 'unknown' });
+        state.lastError = { at: now, message: result ? result.reason : 'unknown', type: intent.type };
+      }
+      return clone(intent);
+    }
+
+    // --- Z key / auto-battle safety net (Task 6) ---
+
+    function ensureZKey(snapshot) {
+      const now = Date.now();
+      const autoBattle = snapshot.autoBattle;
+
+      if (autoBattle && autoBattle.enabled) {
+        state.zKeyRetryCount = 0;
+        return { ok: true, reason: 'auto_battle_enabled' };
+      }
+
+      if (!state.arrivalConfirmedAt) return { ok: true, reason: 'not_arrived_yet' };
+
+      if (now - state.arrivalConfirmedAt < 1500) return { ok: true, reason: 'waiting_post_arrival' };
+
+      if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
+        state.zKeyRetryCount = 0;
+      }
+
+      if (now - state.zKeySentAt < 5000) return { ok: true, reason: 'z_key_throttled' };
+
+      if (toggleAutoFight()) {
+        state.zKeySentAt = now;
+        state.zKeyRetryCount++;
+        appendLog('z_key_sent', { method: 'laya_keydown', retry: state.zKeyRetryCount });
+        return { ok: true, method: 'laya_keydown', reason: 'z_key_sent' };
+      }
+
+      state.zKeyRetryCount++;
+      return { ok: true, reason: 'z_key_pending' };
+    }
+
+    function toggleAutoFight() {
+      try {
+        if (typeof Laya === 'undefined' || !Laya.stage || !Laya.stage._events || !Laya.stage._events.keydown) return false;
+        const ev = new Laya.Event();
+        ev.type = Laya.Event.KEYDOWN;
+        ev.keyCode = 90;
+        ev.nativeEvent = { keyCode: 90, key: 'z', code: 'KeyZ', preventDefault: function(){}, stopPropagation: function(){} };
+        ev.target = Laya.stage;
+        ev.currentTarget = Laya.stage;
+        const kd = Laya.stage._events.keydown;
+        const listener = Array.isArray(kd) ? kd[0] : kd;
+        if (!listener || !listener.method || !listener.caller) return false;
+        listener.method.call(listener.caller, ev);
+        return true;
+      } catch (e) {
+        appendLog('toggle_auto_fight_error', { error: e.message });
+        return false;
+      }
+    }
+
+    function ensureAutoBattle(snapshot) {
+      if (snapshot.autoBattle && snapshot.autoBattle.enabled) {
+        state.zKeyRetryCount = 0;
+        return { ok: true, reason: 'already_enabled' };
+      }
+      const zResult = ensureZKey(snapshot);
+      if (zResult.ok) {
+        return { ok: true, reason: 'z_key_safety_net: ' + zResult.reason };
+      }
+      return { ok: true, reason: 'z_key_safety_net_failed: ' + zResult.reason };
+    }
+
+    // --- Hold / Engage / ObserveOwner (Task 6) ---
+
+    function executeHold(intent, snapshot) {
+      const target = targetById(intent.targetId);
+      if (!target) return { ok: false, reason: 'hold_target_missing' };
+      if (!isAtTarget(target, snapshot)) {
+        return { ok: false, reason: 'not_at_coordinate' };
+      }
+      if (!state.arrivalConfirmedAt) {
+        state.arrivalConfirmedAt = Date.now();
+      }
+      const result = ensureAutoBattle(snapshot);
+      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
+        appendLog('auto_battle_state_unknown', { targetId: intent.targetId, coordinate: snapshot.scene.coordinate });
+      }
+      return result;
+    }
+
+    function executeEngage(intent, snapshot) {
+      const result = ensureAutoBattle(snapshot);
+      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
+        appendLog('auto_battle_state_unknown', { targetId: intent.targetId });
+      }
+      return result;
+    }
+
+    function executeObserveOwner(intent, snapshot) {
+      const target = targetById(intent.targetId);
+      if (!target) return { ok: false, reason: 'observe_target_missing' };
+      const combat = snapshot.combat;
+      if (!combat || cleanText(combat.targetName) !== target.name) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'boss_disappeared' };
+      }
+      if (!hasVisibleHpBar(combat)) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'no_hp_bar' };
+      }
+      const ownerName = cleanText(combat.ownerName);
+      const now = Number(snapshot.at) || Date.now();
+      if (!ownerName || ownerName === state.config.ownerName) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'owner_clear_or_self' };
+      }
+      if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
+        state.ownerObservation = { targetId: target.id, observedAt: now };
+        appendLog('owner_observation_started', { targetId: target.id, ownerName });
+        return { ok: true, reason: 'observing_owner' };
+      }
+      const elapsed = now - state.ownerObservation.observedAt;
+      if (elapsed >= state.config.ownerObserveSeconds * 1000) {
+        markContested(target, now);
+        resetOwnerObservation();
+        appendLog('owner_contested', { targetId: target.id, ownerName, elapsedMs: elapsed });
+        return { ok: true, reason: 'contested_cooldown_set' };
+      }
+      return { ok: true, reason: 'observing_owner', elapsedSeconds: Math.floor(elapsed / 1000) };
+    }
+
+    // --- Panel helpers (Task 6) ---
+
+    function closePanelIfExists(panelName) {
+      const gRoot = root();
+      if (!gRoot) return { ok: true, reason: 'no_root' };
+      const nodes = collectNodes(gRoot);
+      const panelRoot = nodes.find((item) => item.effectiveVisible
+        && (item.name === panelName || item.packageName === panelName || item.packageOwner === panelName));
+      if (!panelRoot) return { ok: true, reason: 'already_closed' };
+      const panelNodes = descendantsOf(nodes, panelRoot);
+      const closeBtn = panelNodes.find((item) => item.effectiveVisible && item.name === 'btnClose');
+      if (!closeBtn) {
+        const panelNode = findNodeByPath(gRoot, panelRoot.path);
+        if (panelNode) {
+          if (typeof panelNode.hideImmediately === 'function') {
+            try { panelNode.hideImmediately(); return { ok: true, method: 'hideImmediately', reason: 'closed' }; } catch (_) {}
+          }
+          if (typeof panelNode.removeFromParent === 'function') {
+            try { panelNode.removeFromParent(); return { ok: true, method: 'removeFromParent', reason: 'closed' }; } catch (_) {}
+          }
+        }
+        return { ok: false, reason: 'close_button_missing' };
+      }
+      const node = findNodeByPath(gRoot, closeBtn.path);
+      if (!node || !nodeIsEffectivelyVisible(node)) {
+        const panelNode2 = findNodeByPath(gRoot, panelRoot.path);
+        if (panelNode2) {
+          if (typeof panelNode2.hideImmediately === 'function') {
+            try { panelNode2.hideImmediately(); return { ok: true, method: 'hideImmediately', reason: 'closed' }; } catch (_) {}
+          }
+          if (typeof panelNode2.removeFromParent === 'function') {
+            try { panelNode2.removeFromParent(); return { ok: true, method: 'removeFromParent', reason: 'closed' }; } catch (_) {}
+          }
+        }
+        return { ok: false, reason: 'close_node_unavailable' };
+      }
+      const action = activateNode(node);
+      if (!action.ok) {
+        const panelNode3 = findNodeByPath(gRoot, panelRoot.path);
+        if (panelNode3) {
+          if (typeof panelNode3.hideImmediately === 'function') {
+            try { panelNode3.hideImmediately(); return { ok: true, method: 'hideImmediately', reason: 'closed' }; } catch (_) {}
+          }
+          if (typeof panelNode3.removeFromParent === 'function') {
+            try { panelNode3.removeFromParent(); return { ok: true, method: 'removeFromParent', reason: 'closed' }; } catch (_) {}
+          }
+        }
+        return { ok: false, reason: 'close_failed', method: action.method };
+      }
+      return { ok: true, method: action.method, reason: 'closed' };
+    }
+
+    function closeMapPanel(snapshot) {
+      if (!snapshot.mapPanel.closeButton) return { ok: false, reason: 'no_close_button' };
+      const fresh = readSnapshot();
+      if (!fresh.mapPanel.closeButton) return { ok: false, reason: 'close_button_vanished' };
+      const node = findNodeByPath(root(), fresh.mapPanel.closeButton.sourcePath);
+      if (!node) return { ok: false, reason: 'close_node_not_found' };
+      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'close_node_hidden' };
+      const action = activateNode(node);
+      if (!action.ok) return { ok: false, reason: action.reason };
+      if (state.navigationContext) state.navigationContext.closeClicked = true;
+      return { ok: true, method: action.method, reason: 'map_closed' };
+    }
+
+    function findNodeByPathSummary(mapPanel, sourcePath, targetId) {
+      if (!sourcePath) return null;
+      const all = [...(mapPanel.bossTargets || []), mapPanel.farmTarget].filter(Boolean);
+      return all.find((row) => row.sourcePath === sourcePath) || null;
+    }
+
+    function clickOpenMapButton(snapshot) {
+      if (!snapshot.mapPanel.openButton) return { ok: false, reason: 'no_map_open_button' };
+      const fresh = readSnapshot();
+      if (!fresh.mapPanel.openButton) return { ok: false, reason: 'map_open_button_vanished' };
+      const node = findNodeByPath(root(), fresh.mapPanel.openButton.sourcePath);
+      if (!node) return { ok: false, reason: 'map_open_node_not_found' };
+      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'map_open_node_hidden' };
+      const action = activateNode(node);
+      if (!action.ok) return { ok: false, reason: action.reason };
+      return { ok: true, method: action.method, reason: 'map_opened' };
+    }
+
+    function ensureMapReady(snapshot, ctx, contentReady, label) {
+      const now = Date.now();
+      const RENDER_WAIT_MS = 5000;
+
+      if (snapshot.mapPanel.open) {
+        if (!ctx.mapOpenedAt) ctx.mapOpenedAt = now;
+        if (contentReady(snapshot)) {
+          ctx.reopenClicked = false;
+          return { ok: true, reason: 'ready' };
+        }
+        if (now - ctx.mapOpenedAt < RENDER_WAIT_MS) {
+          return { ok: true, reason: 'waiting_for_content' };
+        }
+        if (!ctx.reopenClicked) {
+          closePanelIfExists('MapDetialWnd');
+          ctx.reopenClicked = true;
+          ctx.mapOpenedAt = 0;
+          appendLog(label + '_map_reopen_for_retry', {});
+          return { ok: true, reason: 'map_reopen_for_retry' };
+        }
+        appendLog(label + '_map_give_up', {});
+        return { ok: false, reason: 'map_give_up' };
+      }
+
+      const result = clickOpenMapButton(snapshot);
+      if (result.ok) {
+        ctx.mapOpenedAt = 0;
+        ctx.reopenClicked = false;
+        return { ok: true, reason: 'waiting_for_open' };
+      }
+      return { ok: false, reason: result.reason };
+    }
+
+    // --- Navigation (travel_boss / travel_farm) (Task 6) ---
+
+    function executeTravel(intent, snapshot, kind) {
+      const now = Date.now();
+      const targetKey = intent.targetId || 'farm';
+      let navCtx = state.navigationContext;
+      const isSameNav = navCtx && navCtx.kind === kind && navCtx.targetId === targetKey;
+
+      if (snapshot.bossChallengePanel && snapshot.bossChallengePanel.open) {
+        closePanelIfExists('Instance_BossUI');
+        return { ok: true, reason: 'closing_blocking_panel' };
+      }
+
+      if (!isSameNav) {
+        state.navigationContext = {
+          kind,
+          targetId: targetKey,
+          startedAt: now,
+          lastCoordinate: '',
+          lastCoordinateAt: 0,
+          clicked: false,
+          retried: false,
+          mapOpenedAt: 0,
+          reopenClicked: false,
+        };
+        navCtx = state.navigationContext;
+      }
+
+      if (navCtx.clicked) {
+        if (snapshot.mapPanel.open) {
+          if (navCtx.closeClicked) return { ok: true, reason: 'waiting_map_close' };
+          return closeMapPanel(snapshot);
+        }
+        return checkNavProgress(navCtx, snapshot, intent, kind, now);
+      }
+
+      const contentReady = (snap) => {
+        if (kind === 'boss') {
+          const t = targetById(intent.targetId);
+          if (!t) return false;
+          const rows = snap.mapPanel.bossTargets || [];
+          return Boolean(rows.find((r) => r.name === t.name)
+            || rows.find((r) => r.targetId === intent.targetId));
+        }
+        return Boolean(snap.mapPanel.farmTarget);
+      };
+
+      const mapResult = ensureMapReady(snapshot, navCtx, contentReady, 'travel');
+      if (!mapResult.ok) {
+        appendLog('travel_give_up', { kind, targetId: targetKey, reason: mapResult.reason });
+        state.navigationContext = null;
+        releaseLockedTarget();
+        return { ok: false, reason: 'target_row_render_timeout' };
+      }
+      if (mapResult.reason !== 'ready') {
+        return mapResult;
+      }
+
+      let targetRow;
+      if (kind === 'boss') {
+        const target = targetById(intent.targetId);
+        if (!target) return { ok: false, reason: 'boss_target_missing' };
+        targetRow = snapshot.mapPanel.bossTargets.find((row) => row.name === target.name);
+        if (!targetRow || targetRow.targetId !== intent.targetId) {
+          targetRow = snapshot.mapPanel.bossTargets.find((row) => row.targetId === intent.targetId);
+        }
+        if (!targetRow) return { ok: false, reason: 'boss_row_not_found' };
+      } else {
+        targetRow = snapshot.mapPanel.farmTarget;
+        if (!targetRow) return { ok: false, reason: 'farm_target_missing' };
+      }
+
+      const fresh = readSnapshot();
+      if (!fresh.mapPanel.open) return { ok: false, reason: 'map_panel_closed' };
+      const freshRow = findNodeByPathSummary(fresh.mapPanel, targetRow.sourcePath, targetKey);
+      if (!freshRow) return { ok: false, reason: 'target_row_vanished' };
+
+      const node = findNodeByPath(root(), targetRow.sourcePath);
+      if (!node) return { ok: false, reason: 'target_node_not_found' };
+      if (!nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'target_node_hidden' };
+      const action = activateNode(node);
+      if (!action.ok) return { ok: false, reason: action.reason };
+      navCtx.clicked = true;
+      appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
+      return { ok: true, method: action.method, reason: kind + '_row_clicked' };
+    }
+
+    function checkNavProgress(navCtx, snapshot, intent, kind, now) {
+      if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
+        if (navCtx.retried) {
+          appendLog('navigation_failed', { kind, targetId: intent.targetId, elapsed: now - navCtx.startedAt });
+          state.navigationContext = null;
+          state.currentTargetId = '';
+          state.currentAction = 'navigation_failed';
+          return { ok: false, reason: 'navigation_timeout' };
+        }
+        navCtx.retried = true;
+        navCtx.startedAt = now;
+        navCtx.lastCoordinate = '';
+        navCtx.lastCoordinateAt = 0;
+        navCtx.clicked = false;
+        navCtx.closeClicked = false;
+        navCtx.mapOpenedAt = 0;
+        navCtx.reopenClicked = false;
+        appendLog('navigation_retry', { kind, targetId: intent.targetId });
+        return { ok: true, reason: 'retry_pending' };
+      }
+
+      const currentCoord = snapshot.scene.coordinate || '';
+      if (!currentCoord) return { ok: true, reason: 'navigating' };
+
+      const moved = currentCoord !== navCtx.lastCoordinate;
+      if (moved) {
+        navCtx.lastCoordinate = currentCoord;
+        navCtx.lastCoordinateAt = now;
+      }
+
+      if (kind === 'boss' && intent.targetId) {
+        const target = targetById(intent.targetId);
+        if (target && target.coordinate !== 'TBD'
+          && chebyshevDistance(currentCoord, target.coordinate) <= ARRIVAL_THRESHOLD) {
+          appendLog('navigation_arrived', { kind, targetId: intent.targetId, coordinate: currentCoord, targetCoordinate: target.coordinate });
+          state.arrivalConfirmedAt = now;
+          state.navigationContext = null;
+          return { ok: true, reason: 'arrived' };
+        }
+      }
+
+      if (kind === 'farm' && !moved && now - navCtx.lastCoordinateAt > 5000) {
+        appendLog('navigation_arrived', { kind: 'farm', targetId: 'farm', coordinate: currentCoord });
+        state.farmArrivedAt = now;
+        state.farmArrivedCoord = currentCoord;
+        state.arrivalConfirmedAt = now;
+        state.navigationContext = null;
+        return { ok: true, reason: 'arrived' };
+      }
+
+      if (!moved && now - navCtx.lastCoordinateAt > state.config.arrivalStallMs) {
+        if (!navCtx.retried) {
+          navCtx.retried = true;
+          navCtx.startedAt = now;
+          navCtx.clicked = false;
+          navCtx.closeClicked = false;
+          navCtx.mapOpenedAt = 0;
+          navCtx.reopenClicked = false;
+          appendLog('navigation_retry_stall', { kind, targetId: intent.targetId, coordinate: currentCoord });
+          return { ok: true, reason: 'retry_pending' };
+        }
+        appendLog('navigation_failed_stall', { kind, targetId: intent.targetId });
+        state.navigationContext = null;
+        state.currentTargetId = '';
+        state.currentAction = 'navigation_failed';
+        return { ok: false, reason: 'coordinate_stall_timeout' };
+      }
+
+      return { ok: true, reason: 'navigating' };
+    }
+
+    // --- scan_map (Task 6) ---
+
+    function executeScanMap(intent, snapshot) {
+      const now = Date.now();
+      const ctx = state.mapScanContext;
+
+      if (!ctx) {
+        state.mapScanContext = { startedAt: now, opened: false, closeClicked: false, openedAt: 0 };
+        appendLog('map_scan_start', {});
+      }
+
+      const scan = state.mapScanContext;
+
+      if (snapshot.bossChallengePanel && snapshot.bossChallengePanel.open) {
+        closePanelIfExists('Instance_BossUI');
+        return { ok: true, reason: 'closing_blocking_panel' };
+      }
+
+      if (!snapshot.mapPanel.open) {
+        if (!scan.opened) {
+          const result = clickOpenMapButton(snapshot);
+          if (result.ok) {
+            scan.opened = true;
+            scan.openedAt = now;
+            appendLog('map_scan_opened', { method: result.method });
+          }
+          return result;
+        }
+        appendLog('map_scan_complete', {});
+        state.lastMapScanAt = now;
+        state.mapScanContext = null;
+        return { ok: true, reason: 'map_scan_done' };
+      }
+
+      if (scan.opened && !scan.closeClicked && now - scan.openedAt >= MAP_SCAN_OPEN_WAIT_MS) {
+        const result = closeMapPanel(snapshot);
+        if (result.ok) {
+          scan.closeClicked = true;
+          appendLog('map_scan_closing', {});
+        }
+        return result;
+      }
+
+      return { ok: true, reason: 'map_scan_waiting' };
+    }
+
+    // --- check_rate (Task 6) ---
+
+    function executeCheckRate(intent, snapshot) {
+      const now = Date.now();
+      const rc = state.rateCheck;
+      const panel = snapshot.bossChallengePanel;
+
+      if (rc.phase !== 'idle' && now - rc.startedAt > 60 * 1000) {
+        appendLog('rate_check_timeout', { phase: rc.phase, elapsed: now - rc.startedAt });
+        markRateCheckDone('unknown', rc.targetModuleId);
+        return { ok: false, reason: 'rate_check_timeout' };
+      }
+
+      if (rc.phase === 'idle') {
+        const sceneMap = (snapshot.scene || {}).mapName || '';
+        rc.targetModuleId = sceneMap;
+        rc.phase = 'closing_map';
+        rc.startedAt = now;
+        rc.lastActionAt = 0;
+        appendLog('rate_check_start', { targetMap: sceneMap });
+      }
+
+      const MIN_ACTION_GAP = 800;
+      if (now - rc.lastActionAt < MIN_ACTION_GAP) {
+        return { ok: true, reason: 'rate_throttled' };
+      }
+
+      const rateMap = rc.targetModuleId ? RATE_CHECK_MAPS[rc.targetModuleId] : null;
+      if (!rateMap) {
+        appendLog('rate_check_no_map_config', { targetMap: rc.targetModuleId });
+        markRateCheckDone('unknown', rc.targetModuleId);
+        return { ok: false, reason: 'no_rate_check_map' };
+      }
+
+      switch (rc.phase) {
+        case 'closing_map': {
+          const freshSnap = readSnapshot();
+          if (!freshSnap.mapPanel.open) {
+            rc.phase = 'opening';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_closed_proceed' };
+          }
+          const closeBtn = freshSnap.mapPanel.closeButton;
+          if (!closeBtn) {
+            closePanelIfExists('MapDetialWnd');
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_close_attempted' };
+          }
+          const closeNode = findNodeByPath(root(), closeBtn.sourcePath);
+          if (!closeNode || !nodeIsEffectivelyVisible(closeNode)) {
+            closePanelIfExists('MapDetialWnd');
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_close_fallback' };
+          }
+          const closeAction = activateNode(closeNode);
+          rc.lastActionAt = now;
+          appendLog('rate_check_closed_map', { method: closeAction.method });
+          return { ok: true, reason: 'map_closing' };
+        }
+
+        case 'opening': {
+          if (panel && panel.open) {
+            rc.phase = 'select_tab';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'panel_already_open' };
+          }
+          if (snapshot.mapPanel && snapshot.mapPanel.open) {
+            rc.phase = 'closing_map';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'need_close_map_first' };
+          }
+          const btn = panel && panel.openButton;
+          if (!btn) return { ok: false, reason: 'no_boss_challenge_button' };
+          const fresh = readSnapshot();
+          const freshBtn = fresh.bossChallengePanel && fresh.bossChallengePanel.openButton;
+          if (!freshBtn) return { ok: false, reason: 'open_button_vanished' };
+          const node = findNodeByPath(root(), freshBtn.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'open_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          rc.phase = 'waiting_for_open';
+          appendLog('rate_check_opened_panel', { method: action.method });
+          return { ok: true, method: action.method, reason: 'panel_opening' };
+        }
+
+        case 'waiting_for_open': {
+          if (panel && panel.open) {
+            rc.phase = 'select_tab';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'panel_opened' };
+          }
+          if (now - rc.lastActionAt > 3000) {
+            rc.phase = 'opening';
+            rc.lastActionAt = now;
+            appendLog('rate_check_panel_open_retry', {});
+            return { ok: true, reason: 'panel_open_timeout_retry' };
+          }
+          return { ok: true, reason: 'waiting_for_panel_open' };
+        }
+
+        case 'select_tab': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (panel.selectedTab === rateMap.tab) {
+            rc.phase = 'select_boss';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'tab_already_selected' };
+          }
+          const tab = panel.tabs.find((t) => t.text === rateMap.tab);
+          if (!tab) return { ok: false, reason: 'target_tab_not_found:' + rateMap.tab };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshTab = freshPanel.tabs.find((t) => t.text === rateMap.tab);
+          if (!freshTab) return { ok: false, reason: 'tab_vanished' };
+          const node = findNodeByPath(root(), freshTab.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'tab_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          appendLog('rate_check_selected_tab', { method: action.method, tab: rateMap.tab });
+          return { ok: true, method: action.method, reason: 'tab_selected' };
+        }
+
+        case 'select_boss': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (panel.mapName.includes(rateMap.mapMatch)) {
+            rc.phase = 'read_rate';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_already_target' };
+          }
+          const bossRow = panel.bossRows.find((r) => rateMap.bossNames.includes(r.name));
+          if (!bossRow) return { ok: false, reason: 'target_boss_not_found' };
+          const fresh = readSnapshot();
+          const freshPanel = fresh.bossChallengePanel;
+          if (!freshPanel || !freshPanel.open) return { ok: false, reason: 'panel_closed' };
+          const freshRow = freshPanel.bossRows.find((r) => r.name === bossRow.name);
+          if (!freshRow) return { ok: false, reason: 'boss_row_vanished' };
+          const node = findNodeByPath(root(), freshRow.sourcePath);
+          if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'boss_row_node_unavailable' };
+          const action = activateNode(node);
+          if (!action.ok) return { ok: false, reason: action.reason };
+          rc.lastActionAt = now;
+          appendLog('rate_check_selected_boss', { bossName: bossRow.name });
+          return { ok: true, method: action.method, reason: 'boss_selected' };
+        }
+
+        case 'read_rate': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          if (!panel.mapName.includes(rateMap.mapMatch)) {
+            rc.phase = 'select_boss';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'map_not_target_retry' };
+          }
+          const rateUrl = panel.rateIconUrl || '';
+          const rateKey = rateUrl.split('/').pop() || '';
+          const rate = RATE_URL_MAP[rateKey] || null;
+          if (!rate) {
+            if (now - rc.startedAt > 10 * 1000) {
+              markRateCheckDone('unknown', rc.targetModuleId);
+              rc.phase = 'closing';
+              rc.lastActionAt = now;
+              return { ok: true, reason: 'rate_unknown_timeout' };
+            }
+            return { ok: true, reason: 'rate_not_ready' };
+          }
+          appendLog('rate_detected', { rate, url: rateUrl, mapName: rc.targetModuleId });
+          markRateCheckDone(rate, rc.targetModuleId);
+          rc.phase = 'closing';
+          rc.lastActionAt = now;
+          return { ok: true, reason: 'rate_read: ' + rate };
+        }
+
+        case 'closing': {
+          if (!panel || !panel.open) {
+            rc.phase = 'idle';
+            rc.lastActionAt = now;
+            return { ok: true, reason: 'panel_already_closed' };
+          }
+          const result = closePanelIfExists('Instance_BossUI');
+          rc.lastActionAt = now;
+          appendLog('rate_check_closed_panel', { reason: result.reason });
+          return { ok: true, reason: 'panel_closing' };
+        }
+
+        default:
+          rc.phase = 'idle';
+          return { ok: false, reason: 'unknown_rate_phase' };
+      }
     }
 
     setupKeyboardToggle();
