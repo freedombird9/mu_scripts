@@ -231,9 +231,10 @@
   enterButtonTextRegex: /^苦难炼狱2/,
   
   bosses: [
-    { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '<Task0-CDP探查回填>' },
+    { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },  // Task 0 项 2 探查:角色站墓碑旁验证
     // 只打这一个 BOSS(用户明确"只打魔晶菲尼斯",不打蛮横/邪恶两档)
     // coordinate 由 Task 0 CDP 探查拿到固定坐标后写死,不用运行时学习
+    // Task 0 项 2 探查结论:角色站墓碑旁亲自验证为 '149,101'(按钮上的 (126,95) 是按钮坐标,非 BOSS 坐标)
   ],
   
   hasTaskbar: false,              // 完全靠 M 大地图,跟 fourWinds 一样
@@ -491,6 +492,8 @@ closing_panels → waiting_for_close → click_exit → confirm → waiting
 - AlertWnd 弹窗 rightCallback(同试炼之地)
 - waiting 阶段判定:`mapName !== module.mapName` 即退出完成
 
+**2026-07-17 Task 0 项 3 探查结论:`btnExit` 在 `Damage list[9]` 容器内**(同试炼之地),原 `executeExitTrial` 的 `/Damage list/i.test(item.path)` 正则可直接复用,无需参数化退出按钮路径。注意:同一 activityInfoCom 下有多个 `btnExit`(bloodCastle/unionBoss/wolfFort/tower/pagoda/kalunte 等),`Damage list` 过滤是必要条件。
+
 ### 5.3 `executeTeleportToModule(module, snapshot, ctx)`
 
 从原 `executeTeleportFourWinds` 移植,参数化:
@@ -506,6 +509,8 @@ closing_panels → waiting_for_close → click_exit → confirm → waiting
 - 内容就绪判定 `contentReady` 用 module 信息(`target.name` + module.bosses)
 
 苦难炼狱副本内走 M 大地图导航 → 跟 fourWinds 完全一致。试炼之地副本内也走这个(取消 taskbar 路径)。
+
+**2026-07-17 Task 0 项 4 探查结论**:副本内大地图外层节点是 `Main_MapDetailUI[3]`,但其内部第一个子节点 `?[0]` 的 `packageName === 'MapDetialWnd'`(跟野外大地图同一 pkg)。`scanMapPanel` 找 `packageName === 'MapDetialWnd'` 仍能匹配到副本内大地图(命中 `Main_MapDetailUI[3]/?[0]`),`closePanelIfExists('MapDetialWnd')` 同理。**无需改造 scanMapPanel 或 closePanelIfExists**。副本内 `List_right` 下 `RightLift` 行从 idx=1 开始(idx=0 空行),`scanMapPanel` 用 `pkgName === 'RightLift'` filter 自动跳过空行;BOSS 名在 `n16`(`mapRowSummary` 已处理:先找 n16 再找 n0)。副本内 `leftlist` 的 `leftitem.title` 文本为空(副本内不显示地图名列表),但 `executeTravel` 在副本内只走 `List_right`+RightLift,不依赖 `leftitem`。**`executeTravel` 可直接复用,无需修改**。
 
 ### 5.5 `executeScanMap(snapshot, ctx)`(2026-07-17 修订:恢复原职责,不写坐标)
 
@@ -526,6 +531,8 @@ closing_panels → waiting_for_close → click_exit → confirm → waiting
 > ⚠️ **CDP 验证前提(Task 0)**:原爆率逻辑对四风/试炼有效,但苦难炼狱只有魔晶菲尼斯一个 BOSS,`BaolvIcon0` 是否随"切苦难炼狱 tab 选中魔晶菲尼斯"而反映**该 BOSS 的**爆率,尚未验证(icon 是全局共享节点)。Task 0 必须验证:切 tab 选中魔晶菲尼斯后 `BaolvIcon0.url` 是否变化为其爆率状态。
 > - **验证成立** → 苦难炼狱纳入爆率检查,低爆率跳过回四风 farming(与试炼一致)。
 > - **验证不成立**(icon 与魔晶菲尼斯无关联)→ **回退**:苦难炼狱不做爆率检查,`purgatoryModule` 不进 `RATE_CHECK_MAPS`。此时进不进副本仅由 BOSS 状态 + 副本空场冷却决定。
+
+**2026-07-17 Task 0 项 5 探查结论:验证成立**。CDP 实测:魔晶菲尼斯(高爆率)时 `BaolvIcon0.url = "ui://InstanceBossWnd/txt_blg"`,傲之煞(低爆率)时 `url = "ui://InstanceBossWnd/txt_bld"`。两次 URL 不同,证实 BaolvIcon0 反映当前选中 BOSS 爆率。→ `PURGATORY_RATE_CHECK_ENABLED = true`,苦难炼狱纳入爆率检查。
 
 `RATE_CHECK_MAPS` 改成从 `MAP_MODULES` 动态生成(苦难炼狱是否加入取决于上述验证):
 ```js
@@ -736,16 +743,20 @@ const CONFIG_DEFAULTS = Object.freeze({
 
 ### 8.7 CDP 验证清单(= Task 0,编码前必须先探查回填)
 
-| # | 探查项 | 用途 / 回填目标 |
-|---|---|---|
-| 1 | 苦难炼狱2 副本内 `scanScene` 返回的 mapName 文本是否精确等于 `苦难炼狱2` | `KNOWN_MAP_NAMES` + 到达/退出判定 |
-| 2 | 魔晶菲尼斯在副本内 M 大地图的固定坐标 | 写死进 `purgatoryModule.bosses[0].coordinate` |
-| 3 | 副本内退出按钮 `btnExit` 是否也在 `Damage list` 容器 | 复用 `executeExitInstance` 的前提;不一致则参数化退出按钮路径 |
-| 4 | 副本内 M 大地图 BOSS 图标/行结构(与四风平原是否一致) | 确认 `executeTravel` 副本内导航可行 |
-| 5 | 切苦难炼狱 tab 选中魔晶菲尼斯后 `BaolvIcon0.url` 是否反映该 BOSS 爆率 | 决定爆率检查成立 or 回退(见 §5.6) |
-| 6 | 苦难炼狱 tab 下 BOSS 行 `scrollName`(应为 `wildlevelScroll`)、进入按钮 `togName`(应为 `wildtog_mapName`)实际值 | 验证 `scanBossChallengePanel` 改造的 scroll/tog 归属正确 |
+| # | 探查项 | 用途 / 回填目标 | Task 0 探查结论 |
+|---|---|---|---|
+| 1 | 苦难炼狱2 副本内 `scanScene` 返回的 mapName 文本是否精确等于 `苦难炼狱2` | `KNOWN_MAP_NAMES` + 到达/退出判定 | ✅ 精确等于 `'苦难炼狱2'`(`MiniMapPart[0]/mapName[2]` visible=false 但 text 正确) |
+| 2 | 魔晶菲尼斯在副本内 M 大地图的固定坐标 | 写死进 `purgatoryModule.bosses[0].coordinate` | ✅ `'149,101'`(用户角色站墓碑旁亲自验证;副本任务栏 secretBoss 不显示该 BOSS,任务栏里的"寒霜魔王扎坎"是另一套玩法,不是目标 BOSS) |
+| 3 | 副本内退出按钮 `btnExit` 是否也在 `Damage list` 容器 | 复用 `executeExitInstance` 的前提 | ✅ 在 `Damage list[9]/btnExit[0]`,跟试炼之地完全一致,`executeExitInstance` 可直接复用 |
+| 4 | 副本内 M 大地图 BOSS 图标/行结构(与四风平原是否一致) | 确认 `executeTravel` 副本内导航可行 | ✅ 外层 `Main_MapDetailUI` 但内部 `?[0]` pkg=`MapDetialWnd`,`List_right`+`RightLift` 行结构跟野外一致,BOSS 名在 `n16`,`executeTravel` 可直接复用,无需改 scanMapPanel |
+| 5 | 切苦难炼狱 tab 选中魔晶菲尼斯后 `BaolvIcon0.url` 是否反映该 BOSS 爆率 | 决定爆率检查成立 or 回退(见 §5.6) | ✅ 反映:魔晶菲尼斯(高)`txt_blg`、傲之煞(低)`txt_bld`,`PURGATORY_RATE_CHECK_ENABLED = true` |
+| 6 | 苦难炼狱 tab 下 BOSS 行 `scrollName`、进入按钮 `togName` 实际值 | 验证 `scanBossChallengePanel` 改造的 scroll/tog 归属正确 | ✅ `scrollName = 'wildlevelScroll'`、`togName = 'wildtog_mapName'`,跟 spec 一致 |
 
 **探查 1/2/3/4 需角色实际进入苦难炼狱2 副本;5/6 只需打开挑战 BOSS 面板切 tab。探查结论逐项回填本 spec 对应占位符后,才进入后续编码 Task。**
+
+**Task 0 新发现补充(2026-07-17)**:
+- 副本内 BOSS 坐标无法通过大地图扫描自动拿到(RightLift 行只有 n0/n16 文本,不含坐标数字);**坐标必须由用户探查写死**,跟 Task 0 项 2 一致
+- 副本内 `secretBoss` 任务栏显示的是另一套玩法(寒霜魔王扎坎),不是目标 BOSS;`Damage list` 任务栏显示试炼之地 BOSS 也不是目标 — 这些任务栏**不应**作为副本内 BOSS 信息来源,只用来找 `btnExit`
 
 ## §9 实施任务拆分(给 coding agent 用)
 
