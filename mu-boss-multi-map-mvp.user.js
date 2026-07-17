@@ -126,8 +126,8 @@
       // 进副本后角色停在入口 126,118 不自动寻路,需手动点大地图)。
       instanceTravelClicksMap: true,
       bosses: [
-        // TODO CDP 探查幽灵巨人 BOSS 坐标后回填 coordinate
-        { id: 'phantom-giant', name: '幽灵巨人', coordinate: 'TBD' },
+        // CDP 探查(2026-07-17):幽灵巨人 BOSS 坐标 197,151(用户站在 BOSS 旁实测)
+        { id: 'phantom-giant', name: '幽灵巨人', coordinate: '197,151' },
       ],
     });
 
