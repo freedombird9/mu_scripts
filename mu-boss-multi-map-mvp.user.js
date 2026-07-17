@@ -557,18 +557,34 @@
 
     function scanScene(nodes) {
       let mapName = '';
-      // The mapName node in MiniMapPart has visible=false in some maps (e.g. trial land).
-      // Like the overlay script, read it regardless of visibility when name === 'mapName'.
-      const candidates = nodes
-        .filter((item) => (item.effectiveVisible || item.name === 'mapName')
-          && KNOWN_MAP_NAMES.includes(cleanText(item.contentText)))
+      // 首选:MiniMapPart 子树下的 mapName 节点(角色真实所在地图名)。
+      // 不依赖 KNOWN_MAP_NAMES 过滤,避免挑战 BOSS 面板里的"幻术秘境4"等地图名文本
+      // 被误判为 scene mapName(2026-07-17 CDP 探查发现:面板打开时 scanScene 误读
+      // 面板顶部的地图名而非 minimap 的真实地图名,导致 enter_instance.waiting 阶段
+      // 误判到达)。
+      // 注:MiniMapPart 下的 mapName 在某些地图(如试炼之地)visible=false,仍要读。
+      const minimapMapName = nodes
+        .filter((item) => item.name === 'mapName' && item.path && item.path.indexOf('MiniMapPart') >= 0)
         .sort((a, b) => {
-          const aScore = (a.name === 'mapName' ? 1000 : 0) + (a.rect.x >= 900 && a.rect.y <= 130 ? 100 : 0);
-          const bScore = (b.name === 'mapName' ? 1000 : 0) + (b.rect.x >= 900 && b.rect.y <= 130 ? 100 : 0);
-          return bScore - aScore;
-        });
-      if (candidates.length) mapName = cleanText(candidates[0].contentText);
-      // Fallback: pattern match for trial land variants
+          if (a.effectiveVisible !== b.effectiveVisible) return a.effectiveVisible ? -1 : 1;
+          return 0;
+        })[0];
+      if (minimapMapName) {
+        mapName = cleanText(minimapMapName.contentText);
+      }
+      // Fallback:其他可见且文本在 KNOWN_MAP_NAMES 里的节点(用于 minimap mapName 读取失败的极端情况)
+      if (!mapName) {
+        const candidates = nodes
+          .filter((item) => (item.effectiveVisible || item.name === 'mapName')
+            && KNOWN_MAP_NAMES.includes(cleanText(item.contentText)))
+          .sort((a, b) => {
+            const aScore = (a.name === 'mapName' ? 1000 : 0) + (a.rect.x >= 900 && a.rect.y <= 130 ? 100 : 0);
+            const bScore = (b.name === 'mapName' ? 1000 : 0) + (b.rect.x >= 900 && b.rect.y <= 130 ? 100 : 0);
+            return bScore - aScore;
+          });
+        if (candidates.length) mapName = cleanText(candidates[0].contentText);
+      }
+      // Fallback 2:pattern match for trial land variants
       if (!mapName) {
         const trial = nodes.find((item) => (item.effectiveVisible || item.name === 'mapName')
           && /^试炼之地\d*$/.test(cleanText(item.contentText)));
