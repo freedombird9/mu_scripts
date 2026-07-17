@@ -121,6 +121,10 @@
       hasIntermediatePopup: true,
       intermediatePopupTitle: '卓越之境',         // TODO CDP 验证弹窗标题
       intermediatePopupButtonText: '进入',       // TODO CDP 验证按钮文字
+      // 副本内 BOSS 导航:与 purgatory/trial_land 不同,幻术秘境4 需要点大地图右栏 BOSS 行
+      // 触发游戏自动寻路(spec 原描述"完全与 purgatory 一致"不准确;CDP 探查发现该副本
+      // 进副本后角色停在入口 126,118 不自动寻路,需手动点大地图)。
+      instanceTravelClicksMap: true,
       bosses: [
         // TODO CDP 探查幽灵巨人 BOSS 坐标后回填 coordinate
         { id: 'phantom-giant', name: '幽灵巨人', coordinate: 'TBD' },
@@ -1986,10 +1990,14 @@
       // - 坐标稳定 5s + 距离 ≤ ARRIVAL_THRESHOLD → 到达,ensureZKey 开挂
       // - 坐标稳定 5s + 距离远 → navigating_stable_but_far(寻路可能卡了,继续等)
       // - 超时 travelTimeoutMs → retry / exit_instance
+      // 注:某些副本(如 accessory)进副本后角色不自动寻路,需点大地图右栏 BOSS 行。
+      // 这种 module 标记 instanceTravelClicksMap=true,走与野外相同的大地图点击路径,
+      // 不走 executeInstanceTravel。
       if (kind === 'boss' && intent.targetId) {
         const target = targetById(intent.targetId);
         const module = target ? moduleById(target.moduleId) : null;
         if (module && module.type === 'instance'
+          && !module.instanceTravelClicksMap
           && snapshot.scene && snapshot.scene.mapName === module.mapName) {
           return executeInstanceTravel(intent, snapshot, target, now);
         }
