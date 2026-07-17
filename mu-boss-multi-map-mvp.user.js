@@ -137,7 +137,7 @@
     // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
     // Note: this is computed once at injection time. If MAP_MODULES were ever mutated at
     // runtime (it is not — Task 3 freezes it), this would go stale. Keep this constraint.
-    const TARGET_TABLE = MAP_MODULES.flatMap((m) => m.bosses.map((b) => ({ name: b.name, mapName: m.mapName })));
+    const TARGET_TABLE = MAP_MODULES.flatMap((m) => m.bosses.map((b) => ({ id: b.id, name: b.name, coordinate: b.coordinate, mapName: m.mapName })));
 
     const state = {
       enabled: false,
@@ -2388,28 +2388,33 @@
     // --- enter_instance / exit_instance / teleport_to_module (Task 7) ---
 
     // --- Intermediate popup helpers (accessory module) ---
-    // CDP 探查前用宽松匹配:在 gRoot 全树找含 module.intermediatePopupTitle 文本的弹窗节点。
-    // CDP 探查后回填精确 name/packageName 匹配条件(替换宽松匹配)。
+    // CDP 探查(2026-07-17)结论:"卓越之境"弹窗 packageName=Instance_BossHouseUI,
+    // frame 节点的 title 子节点文本是"卓越之境";弹窗内"进入"按钮 name=btnEnter,
+    // pkg=btnShort3。helper 用精确 packageName + name 匹配,文本兜底。
     function findIntermediatePopup(nodes, module) {
       if (!nodes || !module || !module.intermediatePopupTitle) return null;
       const title = module.intermediatePopupTitle;
-      // 精确匹配优先(CDP 探查后填):name/packageName/packageOwner 包含 '卓越之境' 或指定值
+      // 精确匹配:packageName=Instance_BossHouseUI 的弹窗根节点
       const exact = nodes.find((item) => item.effectiveVisible
-        && (item.name === title || item.packageName === title || item.packageOwner === title));
+        && (item.packageName === 'Instance_BossHouseUI' || item.name === 'Instance_BossHouseUI'));
       if (exact) return exact;
-      // 兜底:AlertWnd 或类似弹窗,且 contentText/text 含标题文本
+      // 兜底:文本含标题文本且看起来像弹窗
       const fallback = nodes.find((item) => item.effectiveVisible
         && (item.name === 'AlertWnd' || /Alert|Popup|Tip|Wnd/i.test(item.name || ''))
         && (cleanText(item.text).includes(title) || cleanText(item.contentText).includes(title)));
       return fallback || null;
     }
 
-    // CDP 探查前用宽松匹配:在弹窗户子树找 text 含 module.intermediatePopupButtonText 的可点击节点。
-    // CDP 探查后回填精确 name 匹配条件。
+    // CDP 探查:弹窗内"进入"按钮 name=btnEnter, pkg=btnShort3。精确 name 优先,
+    // 文本含按钮文字 + btn 前缀作兜底。
     function findPopupEnterButton(popupChildren, module) {
       if (!popupChildren || !module || !module.intermediatePopupButtonText) return null;
       const buttonText = module.intermediatePopupButtonText;
-      // 兜底:text/contentText 含按钮文字且可点击(常见按钮名:btn_ok/btn_enter/btnSure/btnOk)
+      // 精确匹配:name=btnEnter
+      const exact = popupChildren.find((item) => item.effectiveVisible
+        && item.name === 'btnEnter');
+      if (exact) return exact;
+      // 兜底:text/contentText 含按钮文字且 name 以 btn/button 开头
       const candidate = popupChildren.find((item) => item.effectiveVisible
         && (cleanText(item.text).includes(buttonText) || cleanText(item.contentText).includes(buttonText))
         && /^(btn|button)/i.test(item.name || ''));
