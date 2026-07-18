@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.4.0
+// @version      0.5.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -42,9 +42,12 @@
       enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
       mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
       enabledBosses: ['hell-knight-1','hell-knight-2','lobster-1','lobster-2','lobster-3','magic-crystal','phantom-giant'],
-      purgatoryMapChoice: '苦难炼狱2',
-      instanceEmptyCooldownMs: 15 * 60 * 1000,
-    });
+     purgatoryMapChoice: '苦难炼狱2',
+     instanceEmptyCooldownMs: 15 * 60 * 1000,
+      scheduledHour: 0,
+      scheduledMinute: 30,
+      scheduledStartAt: 0,
+   });
 
     const corrosionModule = Object.freeze({
       id: 'corrosion',
@@ -467,10 +470,13 @@
         enabledMaps: mergeWithDefaults(source.enabledMaps, CONFIG_DEFAULTS.enabledMaps),
         mapPriorities: normalizeMapPriorities(source.mapPriorities),
         enabledBosses: mergeWithDefaults(source.enabledBosses, CONFIG_DEFAULTS.enabledBosses),
-        purgatoryMapChoice: cleanText(source.purgatoryMapChoice) || CONFIG_DEFAULTS.purgatoryMapChoice,
-        instanceEmptyCooldownMs: clampNumber(source.instanceEmptyCooldownMs, 60 * 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.instanceEmptyCooldownMs),
-      };
-      return config;
+       purgatoryMapChoice: cleanText(source.purgatoryMapChoice) || CONFIG_DEFAULTS.purgatoryMapChoice,
+       instanceEmptyCooldownMs: clampNumber(source.instanceEmptyCooldownMs, 60 * 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.instanceEmptyCooldownMs),
+        scheduledHour: clampNumber(source.scheduledHour, 0, 23, CONFIG_DEFAULTS.scheduledHour),
+        scheduledMinute: clampNumber(source.scheduledMinute, 0, 59, CONFIG_DEFAULTS.scheduledMinute),
+        scheduledStartAt: clampNumber(source.scheduledStartAt, 0, Date.now() + 7 * 24 * 3600 * 1000, CONFIG_DEFAULTS.scheduledStartAt),
+     };
+     return config;
     }
 
     function normalizeMapPriorities(input) {
@@ -553,19 +559,97 @@
     function setupKeyboardToggle() {
       if (window.__muMultiMapBossToggleKeyBound) return;
       window.__muMultiMapBossToggleKeyBound = true;
-      window.addEventListener('keydown', function (e) {
-        if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.toggle === 'function') {
-            const st = window.__muMultiMapBossMvp.toggle();
-            showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
+     window.addEventListener('keydown', function (e) {
+       if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
+         e.preventDefault();
+         e.stopPropagation();
+         if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.toggle === 'function') {
+           const st = window.__muMultiMapBossMvp.toggle();
+           showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
+         }
+       }
+     }, true);
+   }
+
+    // --- Scheduled start (timer) ---
+
+    // 计算 UTC+8 时区下,从 fromMs 起严格未来的最近一个 hour:minute:00 的时间戳。
+    // 边界:恰好等于目标时刻算"已过",返回次日的(避免 tick 重复触发)。
+    function computeNextScheduledStart(hour, minute, fromMs) {
+      const base = fromMs || Date.now();
+      const utc8Ms = base + 8 * 3600 * 1000;
+      const utc8Date = new Date(utc8Ms);
+      // "UTC+8 时区 D 日 00:00" 对应的 UTC 时间戳 = Date.UTC(D) - 8h
+      let targetMs = Date.UTC(utc8Date.getUTCFullYear(), utc8Date.getUTCMonth(), utc8Date.getUTCDate())
+                   + (hour * 3600 + minute * 60) * 1000
+                   - 8 * 3600 * 1000;
+      if (targetMs <= base) {
+        targetMs += 24 * 3600 * 1000;
+      }
+      return targetMs;
+    }
+
+    function formatUtc8HHMM(ms) {
+      const utc8Date = new Date(ms + 8 * 3600 * 1000);
+      const hh = String(utc8Date.getUTCHours()).padStart(2, '0');
+      const mm = String(utc8Date.getUTCMinutes()).padStart(2, '0');
+      return hh + ':' + mm;
+    }
+
+    function scheduleNextStart() {
+      const at = computeNextScheduledStart(state.config.scheduledHour, state.config.scheduledMinute);
+      state.config.scheduledStartAt = at;
+      persist();
+      appendLog('schedule_set', { at, hhmm: formatUtc8HHMM(at) });
+      return at;
+    }
+
+    function cancelScheduledStart() {
+      if (!state.config.scheduledStartAt) return false;
+      state.config.scheduledStartAt = 0;
+      persist();
+      appendLog('schedule_canceled', {});
+      return true;
+    }
+
+    // 到点触发:已开启则跳过 start(),只清空 scheduledStartAt;未开启则启动。
+    function maybeFireSchedule() {
+      const at = state.config.scheduledStartAt;
+      if (!at || Date.now() < at) return false;
+      state.config.scheduledStartAt = 0;
+      persist();
+      const alreadyRunning = state.config.enabled && !state.config.dryRun;
+      if (alreadyRunning) {
+        appendLog('schedule_skipped_already_running', { at });
+        return true;
+      }
+      appendLog('schedule_fired', { at });
+      if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.start === 'function') {
+        window.__muMultiMapBossMvp.start();
+      }
+      showToast('定时启动');
+      return true;
+    }
+
+    function setupSchedulerKey() {
+      if (window.__muMultiMapBossScheduleKeyBound) return;
+     window.__muMultiMapBossScheduleKeyBound = true;
+     window.addEventListener('keydown', function (e) {
+        if (e.ctrlKey && !e.shiftKey && (e.key === 'j' || e.key === 'J')) {
+         e.preventDefault();
+         e.stopPropagation();
+          if (state.config.scheduledStartAt) {
+            cancelScheduledStart();
+            showToast('已取消定时启动');
+          } else {
+            const at = scheduleNextStart();
+            showToast('已安排 ' + formatUtc8HHMM(at) + ' 开启');
           }
         }
       }, true);
     }
 
-    // --- Scan functions ---
+   // --- Scan functions ---
 
     function scanScene(nodes) {
       let mapName = '';
@@ -1077,9 +1161,34 @@
           state.instanceCheckCooldown = {};
           appendLog('instance_cooldown_reset_all', {});
         }
+       return getStatus();
+     },
+      scheduleNext() {
+        const at = scheduleNextStart();
+        showToast('已安排 ' + formatUtc8HHMM(at) + ' 开启');
         return getStatus();
       },
-    };
+      cancelSchedule() {
+        const ok = cancelScheduledStart();
+        showToast(ok ? '已取消定时启动' : '无定时安排');
+        return getStatus();
+      },
+      setScheduleTime(h, m) {
+        state.config.scheduledHour = clampNumber(h, 0, 23, CONFIG_DEFAULTS.scheduledHour);
+        state.config.scheduledMinute = clampNumber(m, 0, 59, CONFIG_DEFAULTS.scheduledMinute);
+        persist();
+        appendLog('schedule_time_set', { hour: state.config.scheduledHour, minute: state.config.scheduledMinute });
+        return getStatus();
+      },
+      getSchedule() {
+        return {
+          scheduledStartAt: state.config.scheduledStartAt,
+          scheduledHour: state.config.scheduledHour,
+          scheduledMinute: state.config.scheduledMinute,
+          nextRunLocalString: state.config.scheduledStartAt ? formatUtc8HHMM(state.config.scheduledStartAt) : '',
+        };
+      },
+   };
 
     function nextRateResetTimestamp() {
       const now = Date.now();
@@ -1657,10 +1766,12 @@
       state.tickId = window.setInterval(tick, TICK_MS);
     }
 
-    function tick() {
-      try {
-        const snapshot = readSnapshot();
-        reconcileTargets(snapshot);
+   function tick() {
+     try {
+       // 定时启动检查:放在 tick 最前,disabled 状态也能触发。
+       maybeFireSchedule();
+       const snapshot = readSnapshot();
+       reconcileTargets(snapshot);
         const intent = chooseIntent(snapshot);
         if (state.enabled && !state.dryRun && !state.paused) {
           return executeIntent(intent, snapshot);
@@ -3114,8 +3225,22 @@
       }
     }
 
-    setupKeyboardToggle();
-    scheduleTick();
+   setupKeyboardToggle();
+    setupSchedulerKey();
+
+    // 加载时过期检查:超过 60s 的安排直接清空(避免重启后误触发);
+    // 60s 内的留给 tick 第一帧触发(maybeFireSchedule 会处理)。
+    (function reconcileScheduleOnLoad() {
+      const at = state.config.scheduledStartAt;
+      if (!at) return;
+      const overdueMs = Date.now() - at;
+      if (overdueMs > 60 * 1000) {
+        state.config.scheduledStartAt = 0;
+        persist();
+        appendLog('schedule_expired', { at, overdueMs });
+      }
+    })();
+   scheduleTick();
   };
 
   function inject(fn) {
