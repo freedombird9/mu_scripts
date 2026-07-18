@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.2.4
-// @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
+// @version      0.3.0
+// @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -26,7 +26,7 @@
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
     const MAX_LOGS = 200;
-    const KNOWN_MAP_NAMES = ['四风平原', '试炼之地1', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
+    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地1', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -36,33 +36,31 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
-      farmTargetName: '1500级怪物',
+      farmTargetName: '1600级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
-      enabledMaps: ['four_winds', 'trial_land', 'purgatory', 'accessory'],
-      mapPriorities: { four_winds: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-      enabledBosses: ['ao-left','ao-right','angry-ao','rage-ao','lobster-1','lobster-2','lobster-3','magic-crystal','phantom-giant'],
+      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
+      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
+      enabledBosses: ['hell-knight-1','hell-knight-2','lobster-1','lobster-2','lobster-3','magic-crystal','phantom-giant'],
       purgatoryMapChoice: '苦难炼狱2',
       instanceEmptyCooldownMs: 15 * 60 * 1000,
     });
 
-    const fourWindsModule = Object.freeze({
-      id: 'four_winds',
-      mapName: '四风平原',
+    const corrosionModule = Object.freeze({
+      id: 'corrosion',
+      mapName: '腐蚀之地',
       type: 'wild',
       priority: 10,
       enabled: true,
-      farmTarget: { name: '1500级怪物' },
+      farmTarget: { name: '1600级怪物' },
       bossRowTab: '野外BOSS',
       bossRowScroll: null,
       enterButtonTog: null,
       enterButtonTextRegex: null,
       hasTaskbar: false,
       bosses: [
-        { id: 'ao-left',   name: '傲之煞',       coordinate: '77,145' },
-        { id: 'ao-right',  name: '傲之煞',       coordinate: '182,164' },
-        { id: 'angry-ao',  name: '愤怒傲之煞',   coordinate: '179,79' },
-        { id: 'rage-ao',   name: '狂暴傲之煞',   coordinate: '82,88' },
+        { id: 'hell-knight-1', name: '地狱骑士', coordinate: '170,164' },
+        { id: 'hell-knight-2', name: '地狱骑士', coordinate: '179,90' },
       ],
     });
 
@@ -134,7 +132,7 @@
       ],
     });
 
-    const MAP_MODULES = [fourWindsModule, trialLandModule, purgatoryModule, accessoryModule];
+    const MAP_MODULES = [corrosionModule, trialLandModule, purgatoryModule, accessoryModule];
 
     // Derived from MAP_MODULES; needed by scanMapPanel and scanCombat to filter BOSS rows
     // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
@@ -197,7 +195,7 @@
       'txt_blg': 'high',
     };
 
-    // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,傲之煞=txt_bld=low)
+    // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,地狱骑士=txt_bld=low)
     // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
     const PURGATORY_RATE_CHECK_ENABLED = true;
     const ACCESSORY_RATE_CHECK_ENABLED = true;
@@ -670,8 +668,9 @@
         : [];
       const mapEntries = leftRows.map((row) => {
         const children = descendantsOf(panelNodes, row).filter((item) => item.path !== row.path);
-        // 'bigBtn' > 'title' contains the map name (e.g. '四风平原（3转）')
-        const nameNode = children.find((item) => item.name === 'title' && item.contentText)
+      // 'bigBtn' > 'title' contains the map name (e.g. '腐蚀之地（4转）')
+      // 'bigBtn' > 'title' contains the map name (e.g. '腐蚀之地（4转）')
+      const nameNode = children.find((item) => item.name === 'title' && item.contentText)
           || children.find((item) => item.contentText);
         return {
           name: nameNode ? cleanText(nameNode.contentText) : '',
@@ -1264,9 +1263,9 @@
     }
 
     function findVisibleAttackableTarget(snapshot, excludedTargetId) {
-      // 同名 BOSS(如 ao-left/ao-right 都叫"傲之煞")在 HUD 上 targetName 不能区分,
+      // 同名 BOSS(如 hell-knight-1/hell-knight-2 都叫"地狱骑士")在 HUD 上 targetName 不能区分,
       // 排除 lockedTarget 同名的其他 BOSS,避免 hold 期间被同名 BOSS 误判为可见可攻击
-      // 而释放锁。不同名 BOSS(愤怒傲之煞/狂暴傲之煞)不受影响,仍能正常转火。
+      // 而释放锁。不同名 BOSS 不受影响,仍能正常转火。
       const excludedTarget = state.targets.find((t) => t.id === excludedTargetId);
       const excludedName = excludedTarget ? excludedTarget.name : null;
       return state.targets.find((target) => target.id !== excludedTargetId
@@ -1574,10 +1573,10 @@
         state.currentModuleId = wildModule.id;
         return makeIntent('teleport_to_module', null, 'go to wild map: ' + wildModule.id, 'teleport_wild', 0.85);
       }
-      // 兜底:传送四风平原(默认)
-      const fw = moduleById('four_winds');
-      state.currentModuleId = fw ? fw.id : 'four_winds';
-      return makeIntent('teleport_to_module', null, 'fallback to four winds', 'teleport_wild', 0.8);
+      // 兜底:传送腐蚀之地(默认)
+      const fw = moduleById('corrosion');
+      state.currentModuleId = fw ? fw.id : 'corrosion';
+      return makeIntent('teleport_to_module', null, 'fallback to corrosion', 'teleport_wild', 0.8);
     }
 
     function selectHighestPriorityWildModule(snapshot) {
@@ -1592,8 +1591,8 @@
           if (attackable.length) return m;
         }
       }
-      // 否则默认四风平原
-      return wilds.find((m) => m.id === 'four_winds') || wilds[0] || null;
+      // 否则默认腐蚀之地
+      return wilds.find((m) => m.id === 'corrosion') || wilds[0] || null;
     }
 
     function chooseIntent(snapshot) {
@@ -2922,8 +2921,8 @@
       const now = Date.now();
       let targetModule = state.teleportCtx ? moduleById(state.teleportCtx.moduleId) : null;
       if (!state.teleportCtx) {
-        const moduleId = state.currentModuleId || 'four_winds';
-        targetModule = moduleById(moduleId) || moduleById('four_winds');
+        const moduleId = state.currentModuleId || 'corrosion';
+        targetModule = moduleById(moduleId) || moduleById('corrosion');
         if (!targetModule) return { ok: false, reason: 'no_target_module' };
         state.teleportCtx = {
           moduleId: targetModule.id,
