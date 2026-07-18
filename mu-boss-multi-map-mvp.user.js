@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.3.0
+// @version      0.4.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -2647,8 +2647,45 @@
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
           appendLog('enter_instance_selected_boss', { bossName: candidate.name, moduleId: currentModule.id });
-          ctx.phase = 'click_enter';
+          // 爆率检查:若该模块纳入 RATE_CHECK_MAPS,选完 BOSS 后先读 BaolvIcon0,
+          // low 则跳过该模块(走下一个 intent),非 low 则进副本后不再重复 check_rate。
+          ctx.phase = RATE_CHECK_MAPS[currentModule.mapName] ? 'read_rate' : 'click_enter';
           return { ok: true, method: action.method, reason: 'boss_selected' };
+        }
+
+        case 'read_rate': {
+          if (!panel || !panel.open) return { ok: false, reason: 'panel_closed_unexpectedly' };
+          // 点击 BOSS 行后 BaolvIcon0 可能下一帧才刷新,先读再决定
+          const rateUrl = panel.rateIconUrl || '';
+          const rateKey = rateUrl.split('/').pop() || '';
+          const rate = RATE_URL_MAP[rateKey] || null;
+          if (!rate) {
+            // 8s 内等待图标刷新;超时降级为 unknown,不阻塞进入
+            if (now - ctx.lastActionAt > 8 * 1000) {
+              appendLog('enter_instance_rate_unknown_timeout', { moduleId: currentModule.id });
+              markRateCheckDone('unknown', currentModule.mapName);
+              ctx.phase = 'click_enter';
+              ctx.lastActionAt = now;
+              return { ok: true, reason: 'rate_unknown_proceed' };
+            }
+            return { ok: true, reason: 'rate_not_ready' };
+          }
+          appendLog('enter_instance_rate_detected', { rate, url: rateUrl, moduleId: currentModule.id });
+          markRateCheckDone(rate, currentModule.mapName);
+          if (rate === 'low') {
+            // 爆率低:跳过该模块,关面板释放锁定,下一 tick 选下一个 intent
+            appendLog('enter_instance_rate_low_skip', { moduleId: currentModule.id, mapName: currentModule.mapName });
+            closePanelIfExists('Instance_BossUI');
+            closePanelIfExists('MapDetialWnd');
+            state.enterInstanceCtx = null;
+            releaseLockedTarget();
+            return { ok: false, reason: 'rate_low_skip' };
+          }
+          // 非 low:rateResults 已写入,getRateResult !== null → needRateCheck 返回 false,
+          // 进副本后不会触发 check_rate,直接走 boss 导航
+          ctx.phase = 'click_enter';
+          ctx.lastActionAt = now;
+          return { ok: true, reason: 'rate_ok: ' + rate };
         }
 
         case 'click_enter': {
