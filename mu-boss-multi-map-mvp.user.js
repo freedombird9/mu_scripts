@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.2.3
+// @version      0.2.4
 // @description  四风平原 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1264,7 +1264,13 @@
     }
 
     function findVisibleAttackableTarget(snapshot, excludedTargetId) {
+      // 同名 BOSS(如 ao-left/ao-right 都叫"傲之煞")在 HUD 上 targetName 不能区分,
+      // 排除 lockedTarget 同名的其他 BOSS,避免 hold 期间被同名 BOSS 误判为可见可攻击
+      // 而释放锁。不同名 BOSS(愤怒傲之煞/狂暴傲之煞)不受影响,仍能正常转火。
+      const excludedTarget = state.targets.find((t) => t.id === excludedTargetId);
+      const excludedName = excludedTarget ? excludedTarget.name : null;
       return state.targets.find((target) => target.id !== excludedTargetId
+        && (!excludedName || target.name !== excludedName)
         && !isCooling(target, Number(snapshot.at) || Date.now())
         && isVisibleAndAttackable(target, snapshot)) || null;
     }
@@ -1275,6 +1281,20 @@
       if (!hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
       const scene = snapshot.scene || {};
       return !scene.mapName || scene.mapName === target.mapName;
+    }
+
+    // 判定当前 HUD 是否在打一个自己/无主的 BOSS:
+    // HP 可见 > 0,targetName 在 TARGET_TABLE 内,归属为空或为自己。
+    // 用于"战斗中不被 instance 副本抢占"守卫:只要正在打自己的 BOSS,就不进副本。
+    // 归属他人时返回 false,允许放弃当前 BOSS 进副本。
+    function isInCombatWithOwnBoss(snapshot) {
+      const combat = snapshot && snapshot.combat;
+      if (!combat || !hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
+      const targetName = cleanText(combat.targetName);
+      if (!targetName) return false;
+      if (!TARGET_TABLE.some((entry) => entry.name === targetName)) return false;
+      const ownerName = cleanText(combat.ownerName);
+      return !ownerName || ownerName === state.config.ownerName;
     }
 
     function isAtTarget(target, snapshot) {
@@ -1377,6 +1397,14 @@
       }
       // 4. 副本模块且当前不在该副本内 → enter_instance
       if (module.type === 'instance' && (snapshot.scene && snapshot.scene.mapName) !== module.mapName) {
+        // 守卫:正在打自己/无主的 BOSS → 不进副本。
+        // 此分支只在锁错乱(lockedTarget 是其他 instance 模块 BOSS)时触发,
+        // 正常战斗中 isInCombatWithOwnBoss=true 时拦截,释放锁重新选,避免传送走。
+        if (isInCombatWithOwnBoss(snapshot)) {
+          appendLog('enter_instance_blocked_by_combat', { targetId: target.id, combatName: cleanText(snapshot.combat.targetName) });
+          releaseLockedTarget();
+          return makeIntent('safe_wait', null, 'in combat with own boss, skip enter_instance', 'none', 0.5);
+        }
         state.currentModuleId = module.id;
         return makeIntent('enter_instance', null, module.id + ' has boss, need enter', 'enter_instance', 0.95);
       }
@@ -1407,6 +1435,10 @@
       if (RATE_CHECK_MAPS[module.mapName] && isMapRateLow(module.mapName)) return false;
       // 不在另一个 instance ctx 内
       if (state.enterInstanceCtx || state.exitInstanceCtx) return false;
+      // 守卫:正在打自己/无主的 BOSS → 不进副本。
+      // 覆盖所有地图(野外 + 副本 + 未知),战斗中不被更高优先级 instance 模块抢占。
+      // 归属他人时 isInCombatWithOwnBoss 返回 false,允许放弃当前 BOSS 进副本。
+      if (isInCombatWithOwnBoss(snapshot)) return false;
       return true;
     }
 
