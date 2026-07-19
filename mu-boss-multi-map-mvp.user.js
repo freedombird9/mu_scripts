@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.5.0
+// @version      0.6.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -164,6 +164,7 @@
       lastActionAt: 0,
       lastZSentAt: 0,
       farmArrivedAt: 0,
+      lastOwnBossCombatAt: 0,
       farmArrivedCoord: '',
       farmLastSeenFarmingAt: 0,
       holdStartedAt: 0,
@@ -1057,6 +1058,7 @@
       state.currentTargetId = '';
       state.currentAction = null;
       state.currentIntent = null;
+      state.lastOwnBossCombatAt = 0;
     }
 
     // --- Module helpers (Task 4) ---
@@ -1257,6 +1259,9 @@
 
     const MAP_SCAN_COOLDOWN_MS = 60 * 1000;
     const MAP_SCAN_OPEN_WAIT_MS = 2000;
+    // 修复 B: isInCombatWithOwnBoss 滑动窗口宽限期。HP 条瞬时闪烁/BOSS 切阶段时,
+    //   距上次确认在打自己 BOSS 不超过此阈值仍视为在战斗, 防止跨模块抢占。
+    const OWN_BOSS_COMBAT_GRACE_MS = 5 * 1000;
 
     function needMapScan(snapshot, module) {
       const now = Number(snapshot.at) || Date.now();
@@ -1347,16 +1352,21 @@
       const now = Number(snapshot.at) || Date.now();
       if (!isLockingIntent()) return false;
       if (state.currentIntent.type === 'travel_farm') return false;
-      if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
-        releaseLockedTarget();
-        return false;
-      }
       if (state.currentIntent.type === 'engage' || state.currentIntent.type === 'observe_owner') {
         if (!target || isCooling(target, now)) {
           releaseLockedTarget();
           return false;
         }
         return true;
+      }
+      // 修复 A: 上面 engage/observe_owner 分支提前返回, 战斗保护只看 isCooling,
+      //   不被 WAITING_REFRESH 状态释放锁定。原因: 战斗中 mu-boss-respawn-overlay
+      //   抓到刷新时间会让 targetStatus 变 WAITING_REFRESH, 而 isLockTargetEligible
+      //   的 allowedStatuses 不含 WAITING_REFRESH, 会误释放锁定, 导致下一 tick
+      //   chooseIntent 落到 chooseWildIntent, 跨模块抢占战斗。
+      if (state.currentAction === 'navigation_failed' || !isLockTargetEligible(target, now)) {
+        releaseLockedTarget();
+        return false;
       }
       return !findVisibleAttackableTarget(snapshot, target.id);
     }
@@ -1395,14 +1405,26 @@
     // HP 可见 > 0,targetName 在 TARGET_TABLE 内,归属为空或为自己。
     // 用于"战斗中不被 instance 副本抢占"守卫:只要正在打自己的 BOSS,就不进副本。
     // 归属他人时返回 false,允许放弃当前 BOSS 进副本。
+    // 修复 B: 加滑动窗口兜底。HP 条瞬时闪烁(combat.hpPercent 一帧 null/0、BOSS 切阶段)
+    //   会让瞬时判定失败, 此时若距上次确认在战斗 < OWN_BOSS_COMBAT_GRACE_MS 仍视为在战斗,
+    //   避免 A 释放锁定那一 tick 恰好 HP 条闪烁, 让 shouldEnterInstance 通过而跨模块抢占。
     function isInCombatWithOwnBoss(snapshot) {
       const combat = snapshot && snapshot.combat;
-      if (!combat || !hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
+      const now = Number(snapshot && snapshot.at) || Date.now();
+      if (!combat || !hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) {
+        // HP 条瞬时缺失: 滑动窗口兜底
+        if (state.lastOwnBossCombatAt && now - state.lastOwnBossCombatAt < OWN_BOSS_COMBAT_GRACE_MS) {
+          return true;
+        }
+        return false;
+      }
       const targetName = cleanText(combat.targetName);
       if (!targetName) return false;
       if (!TARGET_TABLE.some((entry) => entry.name === targetName)) return false;
       const ownerName = cleanText(combat.ownerName);
-      return !ownerName || ownerName === state.config.ownerName;
+      const own = !ownerName || ownerName === state.config.ownerName;
+      if (own) state.lastOwnBossCombatAt = now;
+      return own;
     }
 
     function isAtTarget(target, snapshot) {
