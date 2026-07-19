@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.6.2
+// @version      0.6.3
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1435,6 +1435,14 @@
     }
 
     function isAlreadyFarming(snapshot) {
+      // 副本地图无 farming 点(只有 BOSS),直接返回 false。
+      // 用 farmTarget != null 判定野外地图:当前只有腐蚀之地有 farmTarget,
+      // 未来新增野外模块自动适配。
+      const mapName = snapshot && snapshot.scene && snapshot.scene.mapName;
+      if (mapName) {
+        const module = moduleByMapName(mapName);
+        if (!module || !module.farmTarget) return false;
+      }
       if (!state.farmArrivedAt || !state.farmArrivedCoord) return false;
       if (state.navigationContext) return false;
       const autoBattle = snapshot && snapshot.autoBattle;
