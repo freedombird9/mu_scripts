@@ -85,6 +85,15 @@ if (isTrialLandMap(cleanText(left && left.mapName))
 - 不同坐标直接拒绝合并(真实双 BOSS 保护)。
 - 不要求 `withinRefreshWindow`,因为任务栏延迟可能远超 15 秒窗口。
 
+**「不同坐标 = 不同 BOSS」规则的可行性**:飘字和任务栏路径**都不直接产生坐标**,都通过 `recordFromCandidate` 内同一个 `chooseMapBossMarker(context, detectedName)` 函数获取 marker(进而拿坐标):
+
+- 飘字路径:`detectedName` 取自 `canAttributeRecentCombat(candidate, context) ? context.bossName : ''`(最近 4 秒战斗目标),无归因时为空。
+- 任务栏路径:`detectedName = candidate.bossName`(从任务栏文字解析出,如「闪电巨人」)。
+- 完整性门槛(`!detectedBossName || !coordinate` → 丢弃飘字 candidate)保证飘字 record 一定带 `detectedBossName`,即 `detectedName` 一定非空。
+- 同 `context` + 同 `detectedName` → `chooseMapBossMarker` 必然返回同一 marker(或同样返回 null),坐标一致。坐标不同当且仅当 `detectedName` 不同,即两条记录确实是不同 BOSS,拒绝合并正确。
+
+**已知 corner case(暂不处理)**:同名多 marker 且 `playerCoordinate` 在两次扫描之间变化,可能使 `chooseMapBossMarker` 返回同名但不同坐标的 marker。概率低,先不加保护,后续观察再调整。
+
 ### 4. `preferredRecordOnMerge` 飘字优先
 
 ```js
