@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.6.1
+// @version      0.6.2
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1444,7 +1444,7 @@
         // 其中一个,farmArrivedCoord 是单值只记最近一次,跨点校验会误判。
         // BOSS 坐标固定已知,用"角色不在任一 BOSS 坐标附近"反推在 farming 点。
         const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
-        if (coord && isNearAnyBossCoordinate(coord)) {
+        if (coord && isNearAnyBossCoordinate(coord, snapshot.scene && snapshot.scene.mapName)) {
           state.farmLastSeenFarmingAt = 0;
           return false;
         }
@@ -1459,8 +1459,10 @@
       return chebyshevDistance(coord, state.farmArrivedCoord) <= ARRIVAL_THRESHOLD;
     }
 
-    function isNearAnyBossCoordinate(coord) {
-      return MAP_MODULES.flatMap((m) => m.bosses)
+    function isNearAnyBossCoordinate(coord, mapName) {
+      return MAP_MODULES
+        .filter((m) => !mapName || m.mapName === mapName)
+        .flatMap((m) => m.bosses)
         .some((b) => b.coordinate && b.coordinate !== 'TBD'
           && chebyshevDistance(coord, b.coordinate) <= ARRIVAL_THRESHOLD);
     }
