@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.6.0
+// @version      0.6.1
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1439,6 +1439,15 @@
       if (state.navigationContext) return false;
       const autoBattle = snapshot && snapshot.autoBattle;
       if (autoBattle && autoBattle.enabled) {
+        // 挂机开着但角色停在 BOSS 坐标(如打完 BOSS 原地打小怪)不算在 farming 点。
+        // 不用 farmArrivedCoord 校验:farming 点有 3 个,点击大地图 farming 行随机去
+        // 其中一个,farmArrivedCoord 是单值只记最近一次,跨点校验会误判。
+        // BOSS 坐标固定已知,用"角色不在任一 BOSS 坐标附近"反推在 farming 点。
+        const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
+        if (coord && isNearAnyBossCoordinate(coord)) {
+          state.farmLastSeenFarmingAt = 0;
+          return false;
+        }
         state.farmLastSeenFarmingAt = Date.now();
         return true;
       }
@@ -1448,6 +1457,12 @@
       const coord = snapshot && snapshot.scene && snapshot.scene.coordinate;
       if (!coord) return true;
       return chebyshevDistance(coord, state.farmArrivedCoord) <= ARRIVAL_THRESHOLD;
+    }
+
+    function isNearAnyBossCoordinate(coord) {
+      return MAP_MODULES.flatMap((m) => m.bosses)
+        .some((b) => b.coordinate && b.coordinate !== 'TBD'
+          && chebyshevDistance(coord, b.coordinate) <= ARRIVAL_THRESHOLD);
     }
 
     function observeContestedOwner(target, snapshot) {
