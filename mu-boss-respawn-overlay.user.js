@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.2.2
+// @version      0.2.3
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -220,7 +220,9 @@
       const taskbarCandidates = scanTrialTaskbarCountdowns(context);
       if (trialTaskbarOnly) removeTrialNonTaskbarRecords();
       const candidates = annotateCountdownObservations(
-        trialTaskbarOnly ? taskbarCandidates : scanSceneCountdowns().concat(taskbarCandidates),
+        trialTaskbarOnly
+          ? taskbarCandidates.concat(scanSceneCountdowns())
+          : scanSceneCountdowns().concat(taskbarCandidates),
       );
       state.lastDetected = candidates.map((item) => ({
         text: item.text,
@@ -257,7 +259,9 @@
 
     function removeTrialNonTaskbarRecords() {
       state.records = state.records.filter((record) => (
-        !isTrialLandMap(record && record.mapName) || isTrialTaskbarRecord(record)
+        !isTrialLandMap(record && record.mapName)
+          || isTrialTaskbarRecord(record)
+          || isTrialSceneCountdownRecord(record)
       ));
     }
 
@@ -698,7 +702,28 @@
         confidence,
       };
       if (isDismissedRecord(record)) return null;
+      // Trial-only guard: scene countdown records must be complete (boss name + coordinate + seconds)
+      // before we accept them; otherwise fall back to the taskbar record.
+      if (isTrialLandMap(mapName)
+          && isTrialSceneCountdownRecord(record)
+          && !isCompleteTrialSceneRecord(record)) {
+        return null;
+      }
       return record;
+    }
+
+    function isTrialSceneCountdownRecord(record) {
+      return cleanText(record && record.source) === 'laya_scene_countdown';
+    }
+
+    function isCompleteTrialSceneRecord(record) {
+      if (!record) return false;
+      const bossName = cleanText(record.bossName);
+      if (!bossName || bossName === '未知BOSS') return false;
+      if (!normalizeBossCoordinate(record.bossCoordinate)) return false;
+      const seconds = Number(record.detectedSeconds);
+      if (!seconds || seconds <= 0) return false;
+      return true;
     }
 
     function scoreRecordConfidence(candidate, context) {
