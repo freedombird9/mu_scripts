@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.6.3
+// @version      0.7.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -81,6 +81,11 @@
       enterButtonTog: 'wildtog_mapName',
       enterButtonTextRegex: /^试炼之地1/,
       hasTaskbar: false,
+      // 与 purgatory/accessory 一致:进副本后走 M 大地图点击右栏 BOSS 行导航。
+      // 之前未设此 flag 走 executeInstanceTravel(只跟踪坐标变化),但游戏自动寻路只送
+      // 第一只 BOSS,打完后切下一只时角色原地不动 → "稳定但远" 分支永不超时 →
+      // 卡在 TRAVEL_BOSS 发呆。统一为大地图点击路径,与其它副本一致。
+      instanceTravelClicksMap: true,
       bosses: [
         { id: 'lobster-1', name: '龙虾战士',       coordinate: '146,127', layer: 1 },
         { id: 'lobster-2', name: '邪恶龙虾战士',   coordinate: '79,68',   layer: 1 },
@@ -1564,8 +1569,7 @@
         return makeIntent('enter_instance', null, module.id + ' has boss, need enter', 'enter_instance', 0.95);
       }
       // 5. 已在正确地图但未到坐标 → travel_boss
-      //    野外地图:executeTravel 开 M 大地图点 BOSS 行导航
-      //    副本地图:executeTravel 内部走 executeInstanceTravel,不开大地图,只跟踪坐标变化(游戏自动寻路)
+      //    野外和副本统一:executeTravel 开 M 大地图点 BOSS 行导航(副本均设 instanceTravelClicksMap=true)
       return makeIntent('travel_boss', target.id, 'go to boss coord', 'click_boss_target', 0.9);
     }
 
@@ -1673,8 +1677,8 @@
       const now = Number(snapshot.at) || Date.now();
       const attackable = getAttackableTargets(module, now);
       if (attackable.length) {
-        // 副本内:游戏自带"进入副本自动寻路到 BOSS"机制,角色通常已在 BOSS 坐标。
-        // intentForTarget 已处理 atTarget→hold / visible→engage / 未到→travel_boss 三种情况。
+        // 副本内:intentForTarget 已处理 atTarget→hold / visible→engage / 未到→travel_boss 三种情况。
+        // 副本均设 instanceTravelClicksMap=true,travel_boss 走开 M 大地图点 BOSS 行导航。
         // 不主动 scan_map,因为副本内 BOSS 信息只能靠 overlay,scan 会让大地图卡开不关。
         const target = selectInstanceTarget(attackable, snapshot);
         return intentForTarget(target, module, snapshot);
@@ -2136,68 +2140,6 @@
 
     // --- Navigation (travel_boss / travel_farm) (Task 6) ---
 
-    // 副本内 BOSS 导航:游戏内置"进副本自动寻路到 BOSS",不开 M 大地图,只跟踪坐标变化。
-    // 借鉴原 trial-land 的 executeTravelTrialBoss(L1246-1425)的坐标稳定性检查逻辑。
-    function executeInstanceTravel(intent, snapshot, target, now) {
-      let navCtx = state.navigationContext;
-      const isSameNav = navCtx && navCtx.kind === 'instance_boss' && navCtx.targetId === target.id;
-
-      if (!isSameNav) {
-        state.navigationContext = {
-          kind: 'instance_boss',
-          targetId: target.id,
-          startedAt: now,
-          lastCoordinate: snapshot.scene.coordinate || '',
-          lastCoordinateAt: now,
-          clicked: false,  // 副本内不点大地图行,clicked 一直 false 但用作"已初始化"标志
-          retried: false,
-        };
-        navCtx = state.navigationContext;
-        appendLog('instance_travel_start', { targetId: target.id, coordinate: target.coordinate });
-      }
-
-      const currentCoord = snapshot.scene.coordinate || '';
-      if (!currentCoord) return { ok: true, reason: 'navigating_no_coord' };
-
-      const moved = currentCoord !== navCtx.lastCoordinate;
-      if (moved) {
-        navCtx.lastCoordinate = currentCoord;
-        navCtx.lastCoordinateAt = now;
-      }
-
-      // 坐标稳定 5s + 距离 ≤ ARRIVAL_THRESHOLD → 到达,开挂
-      if (!moved && now - navCtx.lastCoordinateAt > 5000) {
-        if (target.coordinate !== 'TBD'
-          && chebyshevDistance(currentCoord, target.coordinate) > ARRIVAL_THRESHOLD) {
-          return { ok: true, reason: 'navigating_stable_but_far' };
-        }
-        state.arrivalConfirmedAt = now;
-        state.navigationContext = null;
-        appendLog('instance_travel_arrived', { coordinate: currentCoord });
-        const zResult = ensureZKey(snapshot);
-        return { ok: true, reason: 'arrived', zKey: zResult.reason };
-      }
-
-      // 超时 → retry / exit_instance
-      if (now - navCtx.startedAt > state.config.travelTimeoutMs) {
-        if (!navCtx.retried) {
-          navCtx.retried = true;
-          navCtx.startedAt = now;
-          navCtx.lastCoordinate = '';
-          navCtx.lastCoordinateAt = 0;
-          appendLog('instance_travel_retry_timeout', { targetId: target.id });
-          return { ok: true, reason: 'retry_pending' };
-        }
-        appendLog('instance_travel_failed_timeout', { targetId: target.id });
-        state.navigationContext = null;
-        state.currentTargetId = '';
-        state.currentAction = 'navigation_failed';
-        return { ok: false, reason: 'instance_travel_timeout' };
-      }
-
-      return { ok: true, reason: 'navigating' };
-    }
-
     function executeTravel(intent, snapshot, kind) {
       const now = Date.now();
       const targetKey = intent.targetId || 'farm';
@@ -2209,25 +2151,10 @@
         return { ok: true, reason: 'closing_blocking_panel' };
       }
 
-      // 副本内 BOSS 导航:游戏内置"进副本自动寻路到 BOSS"机制,不开 M 大地图,
-      // 只跟踪角色坐标变化判定到达。逻辑借鉴原 trial-land 的 executeTravelTrialBoss:
-      // - 角色跑动(coord 变化)→ 更新 lastCoordinate,继续等
-      // - 坐标稳定 5s + 距离 ≤ ARRIVAL_THRESHOLD → 到达,ensureZKey 开挂
-      // - 坐标稳定 5s + 距离远 → navigating_stable_but_far(寻路可能卡了,继续等)
-      // - 超时 travelTimeoutMs → retry / exit_instance
-      // 注:某些副本(如 accessory)进副本后角色不自动寻路,需点大地图右栏 BOSS 行。
-      // 这种 module 标记 instanceTravelClicksMap=true,走与野外相同的大地图点击路径,
-      // 不走 executeInstanceTravel。
-      if (kind === 'boss' && intent.targetId) {
-        const target = targetById(intent.targetId);
-        const module = target ? moduleById(target.moduleId) : null;
-        if (module && module.type === 'instance'
-          && !module.instanceTravelClicksMap
-          && snapshot.scene && snapshot.scene.mapName === module.mapName) {
-          return executeInstanceTravel(intent, snapshot, target, now);
-        }
-      }
-
+      // 所有 instance 副本(trial_land/purgatory/accessory)均标记 instanceTravelClicksMap=true,
+      // 统一走"开 M 大地图 → 点右栏 BOSS 行 → 游戏自动寻路 → checkNavProgress 跟踪到达"流程。
+      // 旧 executeInstanceTravel(只跟踪坐标、不点大地图)已废弃:游戏自动寻路只送第一只
+      // BOSS,打完后切下一只时角色原地不动,"稳定但远"分支永不超时导致卡死发呆。
       if (!isSameNav) {
         state.navigationContext = {
           kind,
