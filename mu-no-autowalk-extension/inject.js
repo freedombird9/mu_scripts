@@ -1,19 +1,16 @@
-// ==UserScript==
-// @name         MU Manual Attack No Autowalk
-// @namespace    local.mu.manual.no.autowalk
-// @version      0.5.1
-// @description  [已退役 DEPRECATED] Tampermonkey 在游戏 iframe 里 document-start 注入太晚,输掉与游戏 index-*.js 的加载竞速(实测 status.interceptedBundle=false,patch 从未生效)。已改用迷你 Chrome 扩展 mu-no-autowalk-extension/(document_start + world:MAIN,必赢竞速)。请在 Tampermonkey 中 DISABLE 本脚本,勿与扩展同时启用(会抢 bundle 拦截,互相覆盖 → 见 CLAUDE.md §4)。保留本文件仅作参考/回退。
-// @description  Stop manual attack/skill from auto-moving to out-of-range targets while preserving Z auto-hunt.
-// @match        *://602.com/game/show/*
-// @match        *://cdn.qj2h5.jiuxiaokj.cn/mu2h5/h5-data/mu-release/*
-// @run-at       document-start
-// @grant        unsafeWindow
-// ==/UserScript==
+// MU Manual Attack No Autowalk — Chrome MV3 content script (MAIN world, document_start)
+// Adapted from manual-attack-no-autowalk.js userscript.
+// Injected by the browser BEFORE the page's own index-*.js runs, so the
+// appendChild interceptor is guaranteed to be installed before the game
+// bundle <script> is appended. This wins the load race that Tampermonkey
+// was losing in the cross-origin game iframe.
 
 (function () {
   'use strict';
 
-  const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  // In a MAIN-world content script, `window` IS the page's real window.
+  // No unsafeWindow needed.
+  const page = window;
 
   if (!isGameFrame(page.location)) {
     return;
@@ -51,7 +48,7 @@
     status: {
       version: '0.5.0',
       pageInjectedAt: new Date().toISOString(),
-      injectionMode: typeof unsafeWindow !== 'undefined' ? 'unsafeWindow' : 'window',
+      injectionMode: 'chrome-extension-main-world',
       interceptorInstalled: false,
       manualKeyCaptureInstalled: false,
       interceptedBundle: false,
@@ -234,7 +231,7 @@
       configurable: false,
     });
     state.status.interceptorInstalled = true;
-    log('unsafeWindow Node.prototype.appendChild interceptor installed');
+    log('Node.prototype.appendChild interceptor installed');
   }
 
   function isManualAttackKey(event) {
