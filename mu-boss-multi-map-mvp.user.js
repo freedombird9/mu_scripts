@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.7.0
+// @version      0.7.1
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -25,7 +25,7 @@
     const STORAGE_KEY = 'mu_multi_map_boss_mvp_v1';
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
-    const MAX_LOGS = 200;
+    const MAX_LOGS = 500;
     const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地1', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
@@ -519,7 +519,7 @@
         currentModuleId: state.currentModuleId,
         ownerObserveSeconds: state.ownerObservation ? Math.floor((Date.now() - state.ownerObservation.observedAt) / 1000) : 0,
         targets: state.targets,
-        logs: state.logs.slice(-100),
+        logs: state.logs.slice(-500),
         paused: state.paused,
         pauseReason: state.pauseReason,
         config: state.config,
@@ -1203,7 +1203,10 @@
       const utc8Date = new Date(utc8Ms);
       // UTC+8 凌晨 8am 重置 = UTC 0am 重置
       const utcMidnight = Date.UTC(utc8Date.getUTCFullYear(), utc8Date.getUTCMonth(), utc8Date.getUTCDate());
-      return utcMidnight + 24 * 3600 * 1000;
+      // Fix: 凌晨 0-8 点(now < utcMidnight)应返回今天 8am,而非明天 8am。
+      //   缺少此分支会导致 0-8 点打到 low 时 skipUntil 多算 24h,8am 后仍被过滤。
+      if (now >= utcMidnight) return utcMidnight + 24 * 3600 * 1000;
+      return utcMidnight;
     }
 
     function getRateResult(mapName) {
@@ -1843,12 +1846,10 @@
       const now = Date.now();
 
       if (intent.action === 'none' || intent.type === 'sync' || intent.type === 'disabled' || intent.type === 'safe_wait') {
-        appendLog('intent_' + intent.type, { reason: intent.reason, targetId: intent.targetId });
         return clone(intent);
       }
 
       if (now - state.lastActionAt < 500) {
-        appendLog('action_throttled', { msSinceLast: now - state.lastActionAt });
         return clone(intent);
       }
 
@@ -1870,10 +1871,7 @@
       }
 
       state.lastActionAt = now;
-      if (result && result.ok) {
-        appendLog('action_executed', { type: intent.type, method: result.method || '', reason: result.reason || '' });
-      } else {
-        appendLog('action_blocked', { type: intent.type, reason: result ? result.reason : 'unknown' });
+      if (!result || !result.ok) {
         state.lastError = { at: now, message: result ? result.reason : 'unknown', type: intent.type };
       }
       return clone(intent);
@@ -1903,7 +1901,6 @@
       if (toggleAutoFight()) {
         state.zKeySentAt = now;
         state.zKeyRetryCount++;
-        appendLog('z_key_sent', { method: 'laya_keydown', retry: state.zKeyRetryCount });
         return { ok: true, method: 'laya_keydown', reason: 'z_key_sent' };
       }
 
@@ -2229,7 +2226,6 @@
       const action = activateNode(node);
       if (!action.ok) return { ok: false, reason: action.reason };
       navCtx.clicked = true;
-      appendLog('nav_target_clicked', { kind, targetId: targetKey, method: action.method });
       return { ok: true, method: action.method, reason: kind + '_row_clicked' };
     }
 
@@ -2326,12 +2322,11 @@
         if (!scan.opened) {
           const result = clickOpenMapButton(snapshot);
           if (result.ok) {
-            scan.opened = true;
-            scan.openedAt = now;
-            appendLog('map_scan_opened', { method: result.method });
-          }
-          return result;
-        }
+           scan.opened = true;
+           scan.openedAt = now;
+         }
+         return result;
+       }
         appendLog('map_scan_complete', {});
         state.lastMapScanAt = now;
         state.mapScanContext = null;
@@ -2340,11 +2335,10 @@
 
       if (scan.opened && !scan.closeClicked && now - scan.openedAt >= MAP_SCAN_OPEN_WAIT_MS) {
         const result = closeMapPanel(snapshot);
-        if (result.ok) {
-          scan.closeClicked = true;
-          appendLog('map_scan_closing', {});
-        }
-        return result;
+       if (result.ok) {
+         scan.closeClicked = true;
+       }
+       return result;
       }
 
       return { ok: true, reason: 'map_scan_waiting' };
@@ -2404,10 +2398,9 @@
             rc.lastActionAt = now;
             return { ok: true, reason: 'map_close_fallback' };
           }
-          const closeAction = activateNode(closeNode);
-          rc.lastActionAt = now;
-          appendLog('rate_check_closed_map', { method: closeAction.method });
-          return { ok: true, reason: 'map_closing' };
+         const closeAction = activateNode(closeNode);
+         rc.lastActionAt = now;
+         return { ok: true, reason: 'map_closing' };
         }
 
         case 'opening': {
@@ -2429,11 +2422,10 @@
           const node = findNodeByPath(root(), freshBtn.sourcePath);
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'open_node_unavailable' };
           const action = activateNode(node);
-          if (!action.ok) return { ok: false, reason: action.reason };
-          rc.lastActionAt = now;
-          rc.phase = 'waiting_for_open';
-          appendLog('rate_check_opened_panel', { method: action.method });
-          return { ok: true, method: action.method, reason: 'panel_opening' };
+         if (!action.ok) return { ok: false, reason: action.reason };
+         rc.lastActionAt = now;
+         rc.phase = 'waiting_for_open';
+         return { ok: true, method: action.method, reason: 'panel_opening' };
         }
 
         case 'waiting_for_open': {
@@ -2469,9 +2461,8 @@
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'tab_node_unavailable' };
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
-          rc.lastActionAt = now;
-          appendLog('rate_check_selected_tab', { method: action.method, tab: rateMap.tab });
-          return { ok: true, method: action.method, reason: 'tab_selected' };
+         rc.lastActionAt = now;
+         return { ok: true, method: action.method, reason: 'tab_selected' };
         }
 
         case 'select_boss': {
@@ -2490,11 +2481,10 @@
           if (!freshRow) return { ok: false, reason: 'boss_row_vanished' };
           const node = findNodeByPath(root(), freshRow.sourcePath);
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'boss_row_node_unavailable' };
-          const action = activateNode(node);
-          if (!action.ok) return { ok: false, reason: action.reason };
-          rc.lastActionAt = now;
-          appendLog('rate_check_selected_boss', { bossName: bossRow.name });
-          return { ok: true, method: action.method, reason: 'boss_selected' };
+         const action = activateNode(node);
+         if (!action.ok) return { ok: false, reason: action.reason };
+         rc.lastActionAt = now;
+         return { ok: true, method: action.method, reason: 'boss_selected' };
         }
 
         case 'read_rate': {
@@ -2529,10 +2519,9 @@
             rc.lastActionAt = now;
             return { ok: true, reason: 'panel_already_closed' };
           }
-          const result = closePanelIfExists('Instance_BossUI');
-          rc.lastActionAt = now;
-          appendLog('rate_check_closed_panel', { reason: result.reason });
-          return { ok: true, reason: 'panel_closing' };
+         const result = closePanelIfExists('Instance_BossUI');
+         rc.lastActionAt = now;
+         return { ok: true, reason: 'panel_closing' };
         }
 
         default:
@@ -2633,9 +2622,8 @@
           const closeResult = closePanelIfExists('MapDetialWnd');
           closePanelIfExists('Instance_BossUI');
           ctx.phase = 'opening';
-          ctx.lastActionAt = now;
-          appendLog('enter_instance_panels_closed', { reason: closeResult.reason });
-          return { ok: true, reason: 'panels_closed' };
+         ctx.lastActionAt = now;
+         return { ok: true, reason: 'panels_closed' };
         }
 
         case 'opening': {
@@ -2659,9 +2647,8 @@
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
-          ctx.phase = 'waiting_for_open';
-          appendLog('enter_instance_opened_panel', { method: action.method });
-          return { ok: true, method: action.method, reason: 'panel_opening' };
+         ctx.phase = 'waiting_for_open';
+         return { ok: true, method: action.method, reason: 'panel_opening' };
         }
 
         case 'waiting_for_open': {
@@ -2697,9 +2684,8 @@
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'tab_node_unavailable' };
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
-          ctx.lastActionAt = now;
-          appendLog('enter_instance_selected_tab', { method: action.method, tab: currentModule.bossRowTab });
-          return { ok: true, method: action.method, reason: 'tab_selected' };
+         ctx.lastActionAt = now;
+         return { ok: true, method: action.method, reason: 'tab_selected' };
         }
 
         case 'select_boss': {
@@ -2730,9 +2716,8 @@
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'boss_row_node_unavailable' };
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
-          ctx.lastActionAt = now;
-          appendLog('enter_instance_selected_boss', { bossName: candidate.name, moduleId: currentModule.id });
-          // 爆率检查:若该模块纳入 RATE_CHECK_MAPS,选完 BOSS 后先读 BaolvIcon0,
+         ctx.lastActionAt = now;
+         // 爆率检查:若该模块纳入 RATE_CHECK_MAPS,选完 BOSS 后先读 BaolvIcon0,
           // low 则跳过该模块(走下一个 intent),非 low 则进副本后不再重复 check_rate。
           ctx.phase = RATE_CHECK_MAPS[currentModule.mapName] ? 'read_rate' : 'click_enter';
           return { ok: true, method: action.method, reason: 'boss_selected' };
@@ -2795,9 +2780,8 @@
           if (!node || !nodeIsEffectivelyVisible(node)) return { ok: false, reason: 'enter_node_unavailable' };
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
-          ctx.lastActionAt = now;
-          appendLog('enter_instance_clicked_enter', { text: enterBtn.text, method: action.method });
-          ctx.phase = currentModule.hasIntermediatePopup ? 'waiting_for_intermediate' : 'waiting';
+         ctx.lastActionAt = now;
+         ctx.phase = currentModule.hasIntermediatePopup ? 'waiting_for_intermediate' : 'waiting';
           return { ok: true, method: action.method, reason: 'enter_clicked' };
         }
 
@@ -2858,9 +2842,8 @@
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
-          ctx.phase = 'waiting';
-          appendLog('enter_instance_clicked_popup_enter', { method: action.method, moduleId: currentModule.id });
-          return { ok: true, method: action.method, reason: 'popup_enter_clicked' };
+         ctx.phase = 'waiting';
+         return { ok: true, method: action.method, reason: 'popup_enter_clicked' };
         }
 
         case 'waiting': {
@@ -2947,9 +2930,8 @@
           const closeResult = closePanelIfExists('Instance_BossUI');
           closePanelIfExists('MapDetialWnd');
           ctx.phase = 'waiting_for_close';
-          ctx.lastActionAt = now;
-          appendLog('exit_instance_panels_closed', { reason: closeResult.reason });
-          return { ok: true, reason: 'panels_closing' };
+         ctx.lastActionAt = now;
+         return { ok: true, reason: 'panels_closing' };
         }
 
         case 'waiting_for_close': {
@@ -2984,9 +2966,8 @@
           const action = activateNode(node);
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
-          ctx.phase = 'confirm';
-          appendLog('exit_instance_clicked_exit', { method: action.method });
-          return { ok: true, method: action.method, reason: 'exit_clicked' };
+         ctx.phase = 'confirm';
+         return { ok: true, method: action.method, reason: 'exit_clicked' };
         }
 
         case 'confirm': {
@@ -3130,9 +3111,8 @@
           const action = activateNode(clickTarget);
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
-          ctx.phase = 'select_submap';
-          appendLog('teleport_clicked_module', { method: action.method, module: module.id });
-          return { ok: true, method: action.method, reason: 'module_clicked' };
+         ctx.phase = 'select_submap';
+         return { ok: true, method: action.method, reason: 'module_clicked' };
         }
 
         case 'select_submap': {
@@ -3164,9 +3144,8 @@
           const action = activateNode(subNode);
           if (!action.ok) return { ok: false, reason: action.reason };
           ctx.lastActionAt = now;
-          ctx.phase = 'closing_map';
-          appendLog('teleport_clicked_submap', { method: action.method });
-          return { ok: true, method: action.method, reason: 'submap_clicked' };
+         ctx.phase = 'closing_map';
+         return { ok: true, method: action.method, reason: 'submap_clicked' };
         }
 
         case 'closing_map': {
@@ -3177,9 +3156,8 @@
           }
           const result = closePanelIfExists('MapDetialWnd');
           ctx.lastActionAt = now;
-          ctx.phase = 'waiting';
-          appendLog('teleport_closing_map', { reason: result.reason });
-          return { ok: true, reason: 'map_closed' };
+         ctx.phase = 'waiting';
+         return { ok: true, reason: 'map_closed' };
         }
 
         case 'waiting': {
