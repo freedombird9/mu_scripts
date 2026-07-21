@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.7.1
+// @version      0.7.2
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -36,7 +36,7 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
-      farmTargetName: '1600级怪物',
+      farmTargetName: '1650级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
       enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
@@ -55,7 +55,7 @@
       type: 'wild',
       priority: 10,
       enabled: true,
-      farmTarget: { name: '1600级怪物' },
+      farmTarget: { name: '1650级怪物' },
       bossRowTab: '野外BOSS',
       bossRowScroll: null,
       enterButtonTog: null,
