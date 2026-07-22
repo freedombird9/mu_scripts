@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.7.2
+// @version      0.8.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -507,6 +507,213 @@
       return out;
     }
 
+    // --- Stats emitter(统计埋点,完全隔离) ---
+    // 只读观测 snapshot/state,不写任何游戏状态,不改状态机决策。
+    // 所有入口 try/catch 静默降级,连续出错自动禁用;产物仅 localStorage
+    // journal + CustomEvent,由 mu-boss-stats.user.js 独立聚合展示。
+
+    const STATS_JOURNAL_KEY = '__mu_boss_stats_events_v1';
+    const STATS_JOURNAL_CAP = 2000;
+    const STATS_KILL_CONFIRM_TICKS = 3;
+
+    const statsEmitter = (() => {
+      const sessionId = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      let attemptSeq = 0;
+      let activeAttempt = null;
+      const recentClosed = new Map();  // targetId -> { attemptId, outcome, closedAt }
+      let journalCache = null;
+      let journalDisabled = false;
+      let emittedCount = 0;
+      let errorCount = 0;
+      let disabled = false;
+      let lastError = '';
+
+      // ownerObserveSeconds 较大时,contested 可能晚于 left 关闭,stale 窗口需覆盖。
+      function staleMs() {
+        const observeMs = (Number(state.config.ownerObserveSeconds) || 10) * 1000;
+        return Math.max(30000, observeMs + 15000);
+      }
+
+      function noteError(err) {
+        errorCount += 1;
+        lastError = err && err.message ? err.message : String(err);
+        if (errorCount >= 5) disabled = true;
+      }
+
+      function guard(fn) {
+        if (disabled) return;
+        try { fn(); } catch (err) { noteError(err); }
+      }
+
+      function loadJournal() {
+        if (journalCache && Array.isArray(journalCache.events)) return journalCache;
+        journalCache = { v: 1, seq: 0, events: [] };
+        try {
+          const raw = window.localStorage && window.localStorage.getItem(STATS_JOURNAL_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && Array.isArray(parsed.events)) journalCache = parsed;
+          }
+        } catch (_) {}
+        if (!journalCache || !Array.isArray(journalCache.events)) {
+          journalCache = { v: 1, seq: 0, events: [] };
+        }
+        return journalCache;
+      }
+
+      function saveJournal() {
+        if (journalDisabled) return;
+        const journal = loadJournal();
+        try {
+          if (journal.events.length > STATS_JOURNAL_CAP) {
+            journal.events = journal.events.slice(-Math.floor(STATS_JOURNAL_CAP * 0.75));
+          }
+          if (window.localStorage) window.localStorage.setItem(STATS_JOURNAL_KEY, JSON.stringify(journal));
+        } catch (_) {
+          try {
+            journal.events = journal.events.slice(-Math.floor(journal.events.length / 2));
+            if (window.localStorage) window.localStorage.setItem(STATS_JOURNAL_KEY, JSON.stringify(journal));
+          } catch (__) {
+            journalDisabled = true;  // localStorage 不可用,转纯内存模式
+          }
+        }
+      }
+
+      function emit(evt) {
+        const journal = loadJournal();
+        journal.seq = (Number(journal.seq) || 0) + 1;
+        evt.v = 1;
+        evt.seq = journal.seq;
+        evt.sessionId = sessionId;
+        journal.events.push(evt);
+        emittedCount += 1;
+        saveJournal();
+        try {
+          window.dispatchEvent(new CustomEvent('mu-boss-stats-event', { detail: clone(evt) }));
+        } catch (_) {}
+      }
+
+      function bossInfo(target) {
+        return {
+          bossId: cleanText(target && target.id),
+          bossName: cleanText(target && target.name),
+          mapId: cleanText(target && target.moduleId),
+          mapName: cleanText(target && target.mapName),
+        };
+      }
+
+      function openAttempt(target, now) {
+        attemptSeq += 1;
+        activeAttempt = {
+          attemptId: sessionId + '-' + attemptSeq,
+          ...bossInfo(target),
+          startedAt: now,
+          lastEngageAt: now,
+          lastOwner: '',
+          goneTicks: 0,
+        };
+      }
+
+      function closeAttempt(outcome, ownerName, now) {
+        const attempt = activeAttempt;
+        if (!attempt) return;
+        activeAttempt = null;
+        recentClosed.set(attempt.bossId, { attemptId: attempt.attemptId, outcome, closedAt: now });
+        emit({
+          type: 'attempt',
+          attemptId: attempt.attemptId,
+          ts: attempt.startedAt,
+          endTs: now,
+          durationMs: now - attempt.startedAt,
+          bossId: attempt.bossId,
+          bossName: attempt.bossName,
+          mapId: attempt.mapId,
+          mapName: attempt.mapName,
+          outcome,
+          ownerName: cleanText(ownerName) || (outcome === 'kill_other' ? attempt.lastOwner : ''),
+        });
+      }
+
+      function onTick(snapshot, intent) {
+        guard(() => {
+          const now = Date.now();
+          const engageTargetId = intent && intent.type === 'engage' ? cleanText(intent.targetId) : '';
+          if (engageTargetId && (!activeAttempt || activeAttempt.bossId !== engageTargetId)) {
+            if (activeAttempt) closeAttempt('left', '', now);
+            const target = targetById(engageTargetId);
+            if (target) openAttempt(target, now);
+          }
+          const attempt = activeAttempt;
+          if (!attempt) return;
+          if (engageTargetId === attempt.bossId) attempt.lastEngageAt = now;
+
+          const combat = snapshot && snapshot.combat ? snapshot.combat : {};
+          const sameTarget = cleanText(combat.targetName) === attempt.bossName;
+          const hpRaw = sameTarget ? combat.hpPercent : null;
+          const hp = hpRaw === null || hpRaw === undefined || hpRaw === '' ? null : Number(hpRaw);
+          const owner = sameTarget ? cleanText(combat.ownerName) : '';
+          if (owner) attempt.lastOwner = owner;
+          // HP 读不出(null/NaN)按活着处理,规避血条闪烁;HP==0 或目标消失计 gone。
+          const alive = sameTarget && (hp === null || !Number.isFinite(hp) || hp > 0);
+          if (alive) {
+            attempt.goneTicks = 0;
+          } else {
+            attempt.goneTicks += 1;
+            if (attempt.goneTicks >= STATS_KILL_CONFIRM_TICKS) {
+              const foreign = attempt.lastOwner && attempt.lastOwner !== state.config.ownerName;
+              closeAttempt(foreign ? 'kill_other' : 'kill_mine', '', now);
+              return;
+            }
+          }
+          if (now - attempt.lastEngageAt > staleMs()) closeAttempt('left', '', now);
+        });
+      }
+
+      function onContested(target, ownerName) {
+        guard(() => {
+          if (!target || !target.id) return;
+          const now = Date.now();
+          const owner = cleanText(ownerName);
+          if (activeAttempt && activeAttempt.bossId === target.id) {
+            closeAttempt('stolen', owner, now);
+            return;
+          }
+          const recent = recentClosed.get(target.id);
+          if (recent && now - recent.closedAt <= staleMs()) {
+            recentClosed.delete(target.id);
+            emit({ type: 'attempt_update', attemptId: recent.attemptId, ts: now, outcome: 'stolen', ownerName: owner });
+            return;
+          }
+          emit({ type: 'skipped_owned', ts: now, ...bossInfo(target), ownerName: owner });
+        });
+      }
+
+      function flushOnUnload() {
+        guard(() => {
+          if (activeAttempt) closeAttempt('unknown', '', Date.now());
+        });
+      }
+
+      function status() {
+        return {
+          emitted: emittedCount,
+          errors: errorCount,
+          disabled,
+          journalDisabled,
+          journalSize: loadJournal().events.length,
+          lastError,
+          sessionId,
+          activeAttempt: activeAttempt ? clone(activeAttempt) : null,
+        };
+      }
+
+      try {
+        window.addEventListener('pagehide', flushOnUnload);
+      } catch (_) {}
+
+      return { onTick, onContested, flushOnUnload, status };
+    })();
+
     // --- Status & context reset (Task 2) ---
 
     function getStatus() {
@@ -535,9 +742,10 @@
         zKeySentAt: state.zKeySentAt,
         zKeyRetryCount: state.zKeyRetryCount,
         arrivalConfirmedAt: state.arrivalConfirmedAt,
-        currentIntent: clone(state.currentIntent),
-      });
-    }
+       currentIntent: clone(state.currentIntent),
+       stats: statsEmitter.status(),
+     });
+   }
 
     function resetAllContexts() {
       state.rateCheck = { phase: 'idle', targetModuleId: '', startedAt: 0, lastActionAt: 0 };
@@ -1502,6 +1710,7 @@
       }
       if (now - state.ownerObservation.observedAt < state.config.ownerObserveSeconds * 1000) return false;
       resetOwnerObservation();
+      try { statsEmitter.onContested(target, ownerName); } catch (_) { /* 统计降级 */ }
       markContested(target, now);
       return true;
     }
@@ -1826,8 +2035,9 @@
        maybeFireSchedule();
        const snapshot = readSnapshot();
        reconcileTargets(snapshot);
-        const intent = chooseIntent(snapshot);
-        if (state.enabled && !state.dryRun && !state.paused) {
+       const intent = chooseIntent(snapshot);
+       try { statsEmitter.onTick(snapshot, intent); } catch (_) { /* 统计降级,绝不影响主流程 */ }
+       if (state.enabled && !state.dryRun && !state.paused) {
           return executeIntent(intent, snapshot);
         }
         return intent;
@@ -2011,6 +2221,7 @@
       }
       const elapsed = now - state.ownerObservation.observedAt;
       if (elapsed >= state.config.ownerObserveSeconds * 1000) {
+        try { statsEmitter.onContested(target, ownerName); } catch (_) { /* 统计降级 */ }
         markContested(target, now);
         resetOwnerObservation();
         appendLog('owner_contested', { targetId: target.id, ownerName, elapsedMs: elapsed });
