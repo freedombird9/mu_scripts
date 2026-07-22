@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.8.0
+// @version      0.9.0
 // @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -111,6 +111,8 @@
       bosses: [
         // Task 0 项 2 探查:角色站墓碑旁亲自验证为 '149,101'(按钮上的 (126,95) 是按钮坐标,非 BOSS 坐标)
         { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },
+        // 用户实测(2026-07-22):蛮横魔晶菲尼斯 BOSS 坐标 138,147
+        { id: 'brutal-magic-crystal', name: '蛮横魔晶菲尼斯', coordinate: '138,147' },
       ],
     });
 
