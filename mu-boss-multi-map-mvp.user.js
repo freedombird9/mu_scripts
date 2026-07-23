@@ -41,7 +41,7 @@
       trialPriorityWindowMs: 60 * 1000,
       enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
       mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-      enabledBosses: ['hell-knight-1','hell-knight-2','lobster-1','lobster-2','lobster-3','magic-crystal','phantom-giant'],
+      enabledBosses: ['hell-knight-1','hell-knight-2','lobster-1','lobster-2','lobster-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
