@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.11.0
+// @version      0.12.0
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -458,10 +458,143 @@
       setTimeout(function () {
         layer.style.opacity = '0';
         setTimeout(function () { if (layer.parentNode) layer.parentNode.removeChild(layer); }, 400);
-      }, 1500);
+     }, 1500);
+   }
+
+    // --- Status overlay (floating panel) ---
+
+    const OVERLAY_MIN_KEY = 'mu_multi_map_overlay_min';
+
+    function setupOverlay() {
+      if (window.__muMultiMapOverlayInit) return;
+      window.__muMultiMapOverlayInit = true;
+
+      function init() {
+        if (!document.body) { window.setTimeout(init, 200); return; }
+
+        var minimized = readJson(OVERLAY_MIN_KEY, false);
+
+        var host = document.createElement('div');
+        host.style.cssText = 'position:fixed;top:12px;left:12px;z-index:99998;'
+          + 'font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#fff;'
+          + 'user-select:none;-webkit-user-select:none;';
+
+        // --- Expanded panel ---
+        var panel = document.createElement('div');
+        panel.style.cssText = 'background:rgba(12,17,28,0.9);border-radius:10px;'
+          + 'overflow:hidden;border:1px solid rgba(255,255,255,0.1);'
+          + 'box-shadow:0 4px 24px rgba(0,0,0,0.45);min-width:210px;';
+
+        var header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;'
+          + 'padding:7px 12px;background:rgba(255,255,255,0.05);';
+        var hTitle = document.createElement('span');
+        hTitle.textContent = 'BOSS 脚本';
+        hTitle.style.cssText = 'font-weight:600;letter-spacing:1px;color:#fff;font-size:13px;';
+        var hBtn = document.createElement('span');
+        hBtn.textContent = '\u25C0';
+        hBtn.style.cssText = 'cursor:pointer;font-size:12px;color:rgba(255,255,255,0.5);'
+          + 'padding:2px 6px;border-radius:4px;transition:background 0.15s,color 0.15s;';
+        hBtn.addEventListener('mouseenter', function () {
+          hBtn.style.color = '#fff';
+          hBtn.style.background = 'rgba(255,255,255,0.1)';
+        });
+        hBtn.addEventListener('mouseleave', function () {
+          hBtn.style.color = 'rgba(255,255,255,0.5)';
+          hBtn.style.background = 'transparent';
+        });
+        header.appendChild(hTitle);
+        header.appendChild(hBtn);
+
+        var body = document.createElement('div');
+        body.style.cssText = 'padding:6px 10px 8px;display:flex;flex-direction:column;gap:1px;';
+
+        var rows = [];
+        var defs = [
+          { key: 'Ctrl+N', label: '\u811A\u672C' },
+          { key: 'Ctrl+Y', label: '\u5730\u56FE\u6A21\u5F0F' },
+          { key: 'Ctrl+J', label: '\u5B9A\u65F6\u542F\u52A8' },
+        ];
+        for (var i = 0; i < defs.length; i++) {
+          var def = defs[i];
+          var row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;';
+          var badge = document.createElement('span');
+          badge.textContent = def.key;
+          badge.style.cssText = 'background:rgba(255,255,255,0.1);border-radius:4px;padding:2px 6px;'
+            + 'font-size:11px;color:rgba(255,255,255,0.65);min-width:46px;text-align:center;letter-spacing:0.5px;';
+          var label = document.createElement('span');
+          label.textContent = def.label;
+          label.style.cssText = 'color:rgba(255,255,255,0.85);flex:1;font-size:13px;';
+          var status = document.createElement('span');
+          status.style.cssText = 'display:flex;align-items:center;gap:5px;font-weight:600;font-size:13px;';
+          var dot = document.createElement('span');
+          dot.style.cssText = 'width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;';
+          var stext = document.createElement('span');
+          status.appendChild(dot);
+          status.appendChild(stext);
+          row.appendChild(badge);
+          row.appendChild(label);
+          row.appendChild(status);
+          body.appendChild(row);
+          rows.push({ dot: dot, stext: stext });
+        }
+
+        panel.appendChild(header);
+        panel.appendChild(body);
+
+        // --- Collapsed view ---
+        var collapsed = document.createElement('div');
+        collapsed.style.cssText = 'background:rgba(12,17,28,0.9);border-radius:8px;'
+          + 'border:1px solid rgba(255,255,255,0.1);padding:8px 12px;cursor:pointer;'
+          + 'font-size:16px;color:#fff;box-shadow:0 4px 24px rgba(0,0,0,0.45);'
+          + 'display:flex;align-items:center;gap:6px;';
+        var cIcon = document.createElement('span');
+        cIcon.textContent = '\u25B6';
+        var cLabel = document.createElement('span');
+        cLabel.textContent = 'BOSS';
+        cLabel.style.cssText = 'font-size:12px;font-weight:600;color:rgba(255,255,255,0.8);';
+        collapsed.appendChild(cIcon);
+        collapsed.appendChild(cLabel);
+
+        host.appendChild(panel);
+        host.appendChild(collapsed);
+
+        function setMin(min) {
+          panel.style.display = min ? 'none' : '';
+          collapsed.style.display = min ? '' : 'none';
+          writeJson(OVERLAY_MIN_KEY, min);
+        }
+        hBtn.addEventListener('click', function (e) { e.stopPropagation(); setMin(true); });
+        collapsed.addEventListener('click', function () { setMin(false); });
+        setMin(minimized);
+
+        document.body.appendChild(host);
+
+        // --- Periodic update ---
+        function update() {
+          var cfg = state.config;
+          var on = cfg.enabled && !cfg.dryRun;
+          rows[0].dot.style.background = on ? '#4ade80' : '#6b7280';
+          rows[0].stext.textContent = on ? '\u5F00\u542F' : '\u5173\u95ED';
+          rows[0].stext.style.color = on ? '#4ade80' : '#9ca3af';
+
+          rows[1].dot.style.background = cfg.wildOnly ? '#4ade80' : '#60a5fa';
+          rows[1].stext.textContent = cfg.wildOnly ? '\u4EC5\u91CE\u5916' : '\u5168\u90E8\u5730\u56FE';
+          rows[1].stext.style.color = cfg.wildOnly ? '#4ade80' : '#60a5fa';
+
+          var hasSched = Boolean(cfg.scheduledStartAt);
+          rows[2].dot.style.background = hasSched ? '#4ade80' : '#6b7280';
+          rows[2].stext.textContent = hasSched ? formatUtc8HHMM(cfg.scheduledStartAt) : '\u672A\u8BBE\u7F6E';
+          rows[2].stext.style.color = hasSched ? '#4ade80' : '#9ca3af';
+        }
+        window.setInterval(update, 1000);
+        update();
+      }
+      init();
     }
 
-    // --- Config normalization (Task 2) ---
+   // --- Config normalization (Task 2) ---
 
     function normalizeConfig(input) {
       const source = input && typeof input === 'object' ? input : {};
@@ -3412,8 +3545,9 @@
       }
     }
 
-   setupKeyboardToggle();
-    setupSchedulerKey();
+  setupKeyboardToggle();
+   setupSchedulerKey();
+   setupOverlay();
 
     // 加载时过期检查:超过 60s 的安排直接清空(避免重启后误触发);
     // 60s 内的留给 tick 第一帧触发(maybeFireSchedule 会处理)。
