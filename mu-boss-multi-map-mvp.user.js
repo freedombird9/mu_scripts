@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.9.0
-// @description  腐蚀之地 + 试炼之地1 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
+// @version      0.11.0
+// @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -26,7 +26,7 @@
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
     const MAX_LOGS = 500;
-    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地1', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
+    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -41,12 +41,13 @@
       trialPriorityWindowMs: 60 * 1000,
       enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
       mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-      enabledBosses: ['hell-knight-1','hell-knight-2','lobster-1','lobster-2','lobster-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
+      enabledBosses: ['hell-knight-1','hell-knight-2','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
       scheduledMinute: 30,
       scheduledStartAt: 0,
+      wildOnly: false,
    });
 
     const corrosionModule = Object.freeze({
@@ -69,7 +70,7 @@
 
     const trialLandModule = Object.freeze({
       id: 'trial_land',
-      mapName: '试炼之地1',
+      mapName: '试炼之地2',
       type: 'instance',
       priority: 20,
       enabled: true,
@@ -79,7 +80,7 @@
       // 进入按钮也在 wildtog_mapName。之前 spec 探查误写为 privatelevelScroll/privatetog_mapName。
       bossRowScroll: 'wildlevelScroll',
       enterButtonTog: 'wildtog_mapName',
-      enterButtonTextRegex: /^试炼之地1/,
+      enterButtonTextRegex: /^试炼之地2/,
       hasTaskbar: false,
       // 与 purgatory/accessory 一致:进副本后走 M 大地图点击右栏 BOSS 行导航。
       // 之前未设此 flag 走 executeInstanceTravel(只跟踪坐标变化),但游戏自动寻路只送
@@ -87,9 +88,10 @@
       // 卡在 TRAVEL_BOSS 发呆。统一为大地图点击路径,与其它副本一致。
       instanceTravelClicksMap: true,
       bosses: [
-        { id: 'lobster-1', name: '龙虾战士',       coordinate: '146,127', layer: 1 },
-        { id: 'lobster-2', name: '邪恶龙虾战士',   coordinate: '79,68',   layer: 1 },
-        { id: 'lobster-3', name: '咆哮龙虾战士',   coordinate: '122,33',  layer: 1 },
+        // CDP 探查(2026-07-24):用户在大地图悬停 BOSS 图标读得坐标。
+        { id: 'totem-1', name: '图腾树人',       coordinate: '68,94',   layer: 1 },
+        { id: 'totem-2', name: '邪恶图腾树人',   coordinate: '156,164', layer: 1 },
+        { id: 'totem-3', name: '咆哮图腾树人',   coordinate: '204,149', layer: 1 },
       ],
     });
 
@@ -482,8 +484,9 @@
        instanceEmptyCooldownMs: clampNumber(source.instanceEmptyCooldownMs, 60 * 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.instanceEmptyCooldownMs),
         scheduledHour: clampNumber(source.scheduledHour, 0, 23, CONFIG_DEFAULTS.scheduledHour),
         scheduledMinute: clampNumber(source.scheduledMinute, 0, 59, CONFIG_DEFAULTS.scheduledMinute),
-        scheduledStartAt: clampNumber(source.scheduledStartAt, 0, Date.now() + 7 * 24 * 3600 * 1000, CONFIG_DEFAULTS.scheduledStartAt),
-     };
+       scheduledStartAt: clampNumber(source.scheduledStartAt, 0, Date.now() + 7 * 24 * 3600 * 1000, CONFIG_DEFAULTS.scheduledStartAt),
+        wildOnly: Boolean(source.wildOnly),
+    };
      return config;
     }
 
@@ -775,16 +778,27 @@
     function setupKeyboardToggle() {
       if (window.__muMultiMapBossToggleKeyBound) return;
       window.__muMultiMapBossToggleKeyBound = true;
-     window.addEventListener('keydown', function (e) {
-       if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
-         e.preventDefault();
-         e.stopPropagation();
-         if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.toggle === 'function') {
-           const st = window.__muMultiMapBossMvp.toggle();
-           showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
-         }
+    window.addEventListener('keydown', function (e) {
+      if (e.ctrlKey && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (window.__muMultiMapBossMvp && typeof window.__muMultiMapBossMvp.toggle === 'function') {
+          const st = window.__muMultiMapBossMvp.toggle();
+          showToast(st && st.enabled ? 'BOSS脚本 已开启' : 'BOSS脚本 已关闭');
+        }
+      }
+      // Ctrl+Y: 只切换 wildOnly(仅野外模式),不开启/停止脚本。
+      if (e.ctrlKey && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        e.stopPropagation();
+        const api = window.__muMultiMapBossMvp;
+        if (api && typeof api.setConfig === 'function') {
+          const current = api.status && api.status() ? api.status().config.wildOnly : false;
+         const st = api.setConfig({ wildOnly: !current });
+          showToast(st && st.config && st.config.wildOnly ? '当前: 仅野外地图' : '当前: 全部地图');
        }
-     }, true);
+      }
+    }, true);
    }
 
     // --- Scheduled start (timer) ---
@@ -1099,7 +1113,7 @@
         })
         .filter((row) => row.name);
       // Scan enter buttons (BtnBossMore) — text is in lab_mapName child,
-      // e.g. "试炼之地1 (150,197)" includes map name + teleport coordinate.
+      // e.g. "试炼之地2 (68,94)" includes map name + teleport coordinate.
       const enterButtons = panelNodes
         .filter((item) => item.effectiveVisible && item.packageName === 'BtnBossMore')
         .map((row) => {
@@ -1294,7 +1308,11 @@
     }
 
     function isModuleEnabled(module) {
-      return Boolean(module && module.enabled && state.config.enabledMaps.includes(module.id));
+      if (!module || !module.enabled) return false;
+      if (!state.config.enabledMaps.includes(module.id)) return false;
+      // wildOnly 模式:忽略所有副本地图,只保留野外 farming + 打 BOSS。
+      if (state.config.wildOnly && module.type === 'instance') return false;
+      return true;
     }
 
     function isBossEnabled(target) {
@@ -1889,6 +1907,10 @@
 
     function chooseInstanceIntent(snapshot, module) {
       const now = Number(snapshot.at) || Date.now();
+      // wildOnly 模式:忽略副本,直接退出回到野外。
+      if (state.config.wildOnly) {
+        return makeIntent('exit_instance', null, 'wildOnly - exit instance', 'exit_instance', 0.9);
+      }
       const attackable = getAttackableTargets(module, now);
       if (attackable.length) {
         // 副本内:intentForTarget 已处理 atTarget→hold / visible→engage / 未到→travel_boss 三种情况。

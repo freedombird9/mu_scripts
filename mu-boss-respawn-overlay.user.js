@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 刷新倒计时浮层
 // @namespace    codex.mu.boss.respawn.overlay
-// @version      0.2.3
+// @version      0.2.4
 // @description  只读识别画面中已死亡 BOSS 的刷新倒计时,记录并在右侧浮层动态显示。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -18,7 +18,7 @@
   const injected = function () {
     'use strict';
 
-    const VERSION = '0.2.1';
+    const VERSION = '0.2.4';
     const STORAGE_KEY = 'mu_boss_respawn_overlay_records_v1';
     const COLLAPSED_KEY = 'mu_boss_respawn_overlay_collapsed_v1';
     const POSITION_KEY = 'mu_boss_respawn_overlay_position_v1';
@@ -44,6 +44,9 @@
       '深渊咒怨魔王',
       '邪恶龙虾战士',
       '咆哮龙虾战士',
+      '邪恶图腾树人',
+      '咆哮图腾树人',
+      '图腾树人',
       '狂暴火焰巨人',
       '愤怒火焰巨人',
       '龙虾战士',
