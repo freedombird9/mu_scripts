@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.12.0
+// @version      0.12.1
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -39,9 +39,9 @@
       farmTargetName: '1650级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
-      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
-      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-      enabledBosses: ['hell-knight-1','hell-knight-2','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
+     enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
+     mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
+     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -65,6 +65,7 @@
       bosses: [
         { id: 'hell-knight-1', name: '地狱骑士', coordinate: '170,164' },
         { id: 'hell-knight-2', name: '地狱骑士', coordinate: '179,90' },
+        { id: 'furious-hell-knight-1', name: '愤怒地狱骑士', coordinate: '86,79' },
       ],
     });
 

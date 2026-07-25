@@ -222,3 +222,13 @@ delete window.__muFourWindsBossMvp;  // 清除旧实例
   - 修订号: bug 修复、小调整。
   - 次版本: 新功能、行为变更。
   - 主版本: 重大重构或架构变更。
+
+## 12. 新增 BOSS / 地图模块清单(必做)
+
+在 `mu-boss-multi-map-mvp.user.js` 中新增一只 BOSS 或一个地图模块时,除了在对应 module 的 `bosses` 数组里加条目,**必须同步更新以下派生位置**,否则新 BOSS 不会被默认启用或扫描不到:
+
+1. **`CONFIG_DEFAULTS.enabledBosses`**(约 L44):把新 BOSS 的 `id` 加入数组,表示默认启用。虽然 `mergeWithDefaults` 会把 `CONFIG_DEFAULTS` 中缺失项自动补进旧 localStorage,但显式写入才能明确表达"默认启用"意图,避免依赖隐式行为。
+2. **`MAP_MODULES`**(约 L147):新增地图模块时,把 module 对象加入数组;仅加 BOSS 不需动这里。
+3. **派生结构自动更新**:`TARGET_TABLE`、`RATE_CHECK_MAPS`、`state.targets` 都从 `MAP_MODULES` 动态生成,无需手动改;但新增后应 `node --check` 一次,确认没有语法/引用问题。
+4. **`name` 必须与游戏面板文本一致**:`scanMapPanel` / `scanCombat` 用 `name` 匹配挑战 BOSS 面板里的行,面板文本带 `[color]` 标签会被 `cleanText` 剥掉,所以 `name` 用纯文本即可,但要和面板显示的 BOSS 名字完全一致(含前缀如"愤怒""蛮横"等),否则扫描不到。
+5. **坐标需 CDP 验证**:`coordinate` 是大地图点击导航的目标,必须与游戏内大地图悬停 BOSS 图标显示的坐标一致;按钮上的 `(x,y)` 是按钮坐标不是 BOSS 坐标,不要混用。
