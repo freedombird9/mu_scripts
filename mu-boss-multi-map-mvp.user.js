@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.12.1
+// @version      0.13.0
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -32,7 +32,7 @@
       dryRun: true,
       ownerName: '普尔赫达',
       preWaitSeconds: 90,
-      ownerObserveSeconds: 10,
+      ownerObserveSeconds: 30,
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
@@ -41,7 +41,7 @@
       trialPriorityWindowMs: 60 * 1000,
      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant'],
+     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant','furious-phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -142,6 +142,8 @@
       bosses: [
         // CDP 探查(2026-07-17):幽灵巨人 BOSS 坐标 197,151(用户站在 BOSS 旁实测)
         { id: 'phantom-giant', name: '幽灵巨人', coordinate: '197,151' },
+        // CDP 探查(2026-07-29):愤怒幽灵巨人 BOSS 坐标 85,54(用户站在 BOSS 旁实测)
+        { id: 'furious-phantom-giant', name: '愤怒幽灵巨人', coordinate: '85,54' },
       ],
     });
 
