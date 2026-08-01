@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.13.0
+// @version      0.13.1
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -25,6 +25,9 @@
     const STORAGE_KEY = 'mu_multi_map_boss_mvp_v1';
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
+    // 连续多少个 tick 可靠读到"挂机关"后才允许发 Z 键补偿。
+    // Z 是 toggle，假阴性会误关挂机；要求连续确认以过滤网络抖动造成的瞬态假阴性。
+    const AUTO_OFF_CONFIRM_TICKS = 3;
     const MAX_LOGS = 500;
     const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
@@ -188,9 +191,11 @@
       enterInstanceCtx: null,
       exitInstanceCtx: null,
       teleportCtx: null,
-      zKeySentAt: 0,
-      zKeyRetryCount: 0,
-      arrivalConfirmedAt: 0,
+     zKeySentAt: 0,
+     zKeyRetryCount: 0,
+     arrivalConfirmedAt: 0,
+     autoOffStreak: 0,
+     lastZKeyReason: null,
       currentModuleId: '',
       instanceCheckCooldown: {},
       // instanceTravelClicksMap 模块专用:本次副本访问是否已开过 M 大地图。
@@ -880,9 +885,10 @@
         rateCheck: clone(state.rateCheck),
         rateResults: clone(state.rateResults),
         instanceCheckCooldown: clone(state.instanceCheckCooldown),
-        zKeySentAt: state.zKeySentAt,
-        zKeyRetryCount: state.zKeyRetryCount,
-        arrivalConfirmedAt: state.arrivalConfirmedAt,
+       zKeySentAt: state.zKeySentAt,
+       zKeyRetryCount: state.zKeyRetryCount,
+       arrivalConfirmedAt: state.arrivalConfirmedAt,
+       autoOffStreak: state.autoOffStreak,
        currentIntent: clone(state.currentIntent),
        stats: statsEmitter.status(),
      });
@@ -903,10 +909,12 @@
       state.exitInstanceCtx = null;
       state.teleportCtx = null;
       state.currentModuleId = '';
-      state.zKeySentAt = 0;
-      state.zKeyRetryCount = 0;
-      state.arrivalConfirmedAt = 0;
-      state.instanceCheckCooldown = {};
+     state.zKeySentAt = 0;
+     state.zKeyRetryCount = 0;
+     state.arrivalConfirmedAt = 0;
+   state.autoOffStreak = 0;
+   state.lastZKeyReason = null;
+   state.instanceCheckCooldown = {};
     }
 
     // --- Keyboard toggle (Task 2) ---
@@ -1183,23 +1191,38 @@
       // CDP verified 2026-07-14: AutoStatusItem count is unreliable (stays 0
       // even when auto-battle is on). Use autoFightState controller selectedIndex
       // instead: 0 = manual (off), 2 = auto (on).
-      const on = isAutoFightOn();
-      return { known: true, enabled: on };
+      // 三态读取:区分"真的关"与"读不到"。Z 键是 toggle,读不到时绝不能当成"关"去补发 Z,
+      // 否则网络抖动造成的假阴性会把已开的挂机误关。
+      const s = readAutoFightState();
+      return { known: s !== 'unknown', enabled: s === 'on' };
     }
 
-    // isAutoFightOn: read autoFightState controller selectedIndex (CDP verified 2026-07-14)
-    // selectedIndex 0 = manual (off), 2 = auto (on)
-    function isAutoFightOn() {
+    // readAutoFightState: 返回 'on' | 'off' | 'unknown'
+    //   on  = autoFightState.selectedIndex === 2 (auto, 可靠"开")
+    //   off = selectedIndex === 0 (manual, 可靠"关")
+    //   unknown = 控制器/节点取不到、catch、或 selectedIndex 为其它值
+    // 网络不稳时 mMainBottom/autoFightState 可能瞬态为 null,此时必须返回 unknown,
+    // 让上层(ensureZKey)降级不发 Z,而非当成"关"去 toggle。
+    function readAutoFightState() {
       try {
         const gRoot = root();
-        if (!gRoot || typeof gRoot.getChildAt !== 'function') return false;
+        if (!gRoot || typeof gRoot.getChildAt !== 'function') return 'unknown';
         const mainWnd = gRoot.getChildAt(0);
-        if (!mainWnd || !mainWnd.mMainBottom) return false;
-        const state = mainWnd.mMainBottom.autoFightState;
-        return !!state && state.selectedIndex === 2;
+        if (!mainWnd || !mainWnd.mMainBottom) return 'unknown';
+        const ctrl = mainWnd.mMainBottom.autoFightState;
+        if (!ctrl) return 'unknown';
+        const idx = ctrl.selectedIndex;
+        if (idx === 2) return 'on';
+        if (idx === 0) return 'off';
+        return 'unknown';
       } catch (_) {
-        return false;
+        return 'unknown';
       }
+    }
+
+    // 兼容旧调用点:返回布尔。仅在需要"是/否"语义处使用;Z 键决策改用 readAutoFightState。
+    function isAutoFightOn() {
+      return readAutoFightState() === 'on';
     }
 
     // --- BOSS challenge panel scanner (with enterButtons for instance entry) ---
@@ -1691,10 +1714,12 @@
         && next.type !== 'exit_instance' && next.type !== 'teleport_to_module'
         && next.type !== 'scan_map') state.currentTargetId = '';
       if (state.currentTargetId && state.currentTargetId !== previousTargetId) {
-        state.arrivalConfirmedAt = 0;
-        state.zKeySentAt = 0;
-        state.zKeyRetryCount = 0;
-        state.holdStartedAt = 0;
+       state.arrivalConfirmedAt = 0;
+       state.zKeySentAt = 0;
+       state.zKeyRetryCount = 0;
+      state.autoOffStreak = 0;
+      state.lastZKeyReason = null;
+      state.holdStartedAt = 0;
       }
       state.currentAction = next.action === 'none' ? null : next.action;
       state.phase = next.type.toUpperCase();
@@ -2249,34 +2274,60 @@
 
     // --- Z key / auto-battle safety net (Task 6) ---
 
-    function ensureZKey(snapshot) {
-      const now = Date.now();
-      const autoBattle = snapshot.autoBattle;
+   function ensureZKey(snapshot) {
+     const now = Date.now();
+     const autoBattle = snapshot.autoBattle;
+     // 边沿触发日志:reason 变化时记一条,避免每个 tick 重复刷屏(参考 CLAUDE.md
+     // 日志缓冲区约束)。仅记录守卫生效相关的关键 reason。
+     const finish = (reason, extra) => {
+       if (state.lastZKeyReason !== reason) {
+         state.lastZKeyReason = reason;
+         if (reason === 'auto_battle_state_unknown' || reason === 'auto_off_confirming' || reason === 'z_key_sent') {
+           appendLog('z_key_guard', { reason, streak: state.autoOffStreak, ...(extra || {}) });
+         }
+       }
+       return { ok: true, reason, ...(extra || {}) };
+     };
 
-      if (autoBattle && autoBattle.enabled) {
-        state.zKeyRetryCount = 0;
-        return { ok: true, reason: 'auto_battle_enabled' };
-      }
+     if (autoBattle && autoBattle.enabled) {
+       state.zKeyRetryCount = 0;
+       state.autoOffStreak = 0;
+       return finish('auto_battle_enabled');
+     }
 
-      if (!state.arrivalConfirmedAt) return { ok: true, reason: 'not_arrived_yet' };
+     // 守卫 1:读不到挂机状态(网络抖动导致控制器瞬态为空)时绝不能发 Z。
+     // Z 是 toggle,把"读不到"当成"关"去补发 Z 会把已开的挂机误关(降级原则)。
+     if (!autoBattle || !autoBattle.known) {
+       state.autoOffStreak = 0;
+       return finish('auto_battle_state_unknown');
+     }
 
-      if (now - state.arrivalConfirmedAt < 1500) return { ok: true, reason: 'waiting_post_arrival' };
+     // 守卫 2:只有连续 N 个 tick 可靠读到"关"才允许发 Z,过滤瞬态假阴性。
+     state.autoOffStreak = (state.autoOffStreak || 0) + 1;
+     if (state.autoOffStreak < AUTO_OFF_CONFIRM_TICKS) {
+       return finish('auto_off_confirming');
+     }
 
-      if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
-        state.zKeyRetryCount = 0;
-      }
+     if (!state.arrivalConfirmedAt) return finish('not_arrived_yet');
 
-      if (now - state.zKeySentAt < 5000) return { ok: true, reason: 'z_key_throttled' };
+     if (now - state.arrivalConfirmedAt < 1500) return finish('waiting_post_arrival');
 
-      if (toggleAutoFight()) {
-        state.zKeySentAt = now;
-        state.zKeyRetryCount++;
-        return { ok: true, method: 'laya_keydown', reason: 'z_key_sent' };
-      }
+     if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
+       state.zKeyRetryCount = 0;
+     }
 
-      state.zKeyRetryCount++;
-      return { ok: true, reason: 'z_key_pending' };
-    }
+     if (now - state.zKeySentAt < 5000) return finish('z_key_throttled');
+
+     if (toggleAutoFight()) {
+       state.zKeySentAt = now;
+       state.zKeyRetryCount++;
+       state.autoOffStreak = 0;
+       return finish('z_key_sent', { method: 'laya_keydown' });
+     }
+
+     state.zKeyRetryCount++;
+     return finish('z_key_pending');
+   }
 
     function toggleAutoFight() {
       try {
@@ -2329,9 +2380,6 @@
         state.arrivalConfirmedAt = Date.now();
       }
       const result = ensureAutoBattle(snapshot);
-      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
-        appendLog('auto_battle_state_unknown', { targetId: intent.targetId, coordinate: snapshot.scene.coordinate });
-      }
       return result;
     }
 
@@ -2350,9 +2398,6 @@
         state.navigationContext = null;
       }
       const result = ensureAutoBattle(snapshot);
-      if (!result.ok && result.reason === 'auto_battle_state_unknown') {
-        appendLog('auto_battle_state_unknown', { targetId: intent.targetId });
-      }
       return result;
     }
 
