@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.13.1
+// @version      0.16.2
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -35,9 +35,14 @@
       dryRun: true,
       ownerName: '普尔赫达',
       preWaitSeconds: 90,
-      ownerObserveSeconds: 30,
+      ownerObserveSeconds: 15,
       contestedCooldownMs: 5 * 60 * 1000,
-      arrivalStallMs: 15 * 1000,
+      ownerObserveGraceMs: 2000,
+     damageGapAbandonRatio: 0.75,
+     damageLowHpAbandonRatio: 0.9,
+     damageLowHpThreshold: 25,
+      damageLowHpObserveSeconds: 3,
+     arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
       farmTargetName: '1650级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
@@ -171,8 +176,8 @@
       lastSnapshot: null,
       lastIntent: null,
       currentIntent: null,
-      ownerObservation: null,
-      tickId: null,
+     ownerObservation: null,
+     tickId: null,
       farmTargetMissing: false,
       navigationContext: null,
       lastError: null,
@@ -611,9 +616,14 @@
         dryRun: source.dryRun !== false,
         ownerName: cleanText(source.ownerName) || CONFIG_DEFAULTS.ownerName,
         preWaitSeconds: clampNumber(source.preWaitSeconds, 0, 3600, CONFIG_DEFAULTS.preWaitSeconds),
-        ownerObserveSeconds: clampNumber(source.ownerObserveSeconds, 0, 3600, CONFIG_DEFAULTS.ownerObserveSeconds),
-        contestedCooldownMs: clampNumber(source.contestedCooldownMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.contestedCooldownMs),
-        arrivalStallMs: clampNumber(source.arrivalStallMs, 0, 60 * 60 * 1000, CONFIG_DEFAULTS.arrivalStallMs),
+       ownerObserveSeconds: clampNumber(source.ownerObserveSeconds, 0, 3600, CONFIG_DEFAULTS.ownerObserveSeconds),
+       contestedCooldownMs: clampNumber(source.contestedCooldownMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.contestedCooldownMs),
+        ownerObserveGraceMs: clampNumber(source.ownerObserveGraceMs, 0, 60 * 1000, CONFIG_DEFAULTS.ownerObserveGraceMs),
+      damageGapAbandonRatio: clampNumber(source.damageGapAbandonRatio, 0, 1, CONFIG_DEFAULTS.damageGapAbandonRatio),
+        damageLowHpAbandonRatio: clampNumber(source.damageLowHpAbandonRatio, 0, 1, CONFIG_DEFAULTS.damageLowHpAbandonRatio),
+       damageLowHpThreshold: clampNumber(source.damageLowHpThreshold, 0, 100, CONFIG_DEFAULTS.damageLowHpThreshold),
+        damageLowHpObserveSeconds: clampNumber(source.damageLowHpObserveSeconds, 0, 3600, CONFIG_DEFAULTS.damageLowHpObserveSeconds),
+     arrivalStallMs: clampNumber(source.arrivalStallMs, 0, 60 * 60 * 1000, CONFIG_DEFAULTS.arrivalStallMs),
         travelTimeoutMs: clampNumber(source.travelTimeoutMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.travelTimeoutMs),
         farmTargetName: cleanText(source.farmTargetName) || CONFIG_DEFAULTS.farmTargetName,
         rateRecheckIntervalMs: clampNumber(source.rateRecheckIntervalMs, 60 * 1000, 60 * 60 * 1000, CONFIG_DEFAULTS.rateRecheckIntervalMs),
@@ -674,11 +684,11 @@
       let disabled = false;
       let lastError = '';
 
-      // ownerObserveSeconds 较大时,contested 可能晚于 left 关闭,stale 窗口需覆盖。
-      function staleMs() {
-        const observeMs = (Number(state.config.ownerObserveSeconds) || 10) * 1000;
-        return Math.max(30000, observeMs + 15000);
-      }
+    // ownerObserveSeconds 较大时,contested 可能晚于 left 关闭,stale 窗口需覆盖。
+    function staleMs() {
+      const observeMs = (Number(state.config.ownerObserveSeconds) || 15) * 1000;
+      return Math.max(30000, observeMs + 15000);
+    }
 
       function noteError(err) {
         errorCount += 1;
@@ -870,12 +880,12 @@
         currentTargetId: state.currentTargetId,
         currentAction: state.currentAction,
         currentModuleId: state.currentModuleId,
-        ownerObserveSeconds: state.ownerObservation ? Math.floor((Date.now() - state.ownerObservation.observedAt) / 1000) : 0,
+ ownerObserveSeconds: state.ownerObservation ? Math.floor((Date.now() - state.ownerObservation.observedAt) / 1000) : 0,
+       paused: state.paused,
         targets: state.targets,
         logs: state.logs.slice(-500),
-        paused: state.paused,
-        pauseReason: state.pauseReason,
-        config: state.config,
+       pauseReason: state.pauseReason,
+       config: state.config,
         lastError: state.lastError,
         navigationContext: clone(state.navigationContext),
         enterInstanceCtx: clone(state.enterInstanceCtx),
@@ -1304,21 +1314,83 @@
       };
     }
 
-    // --- Snapshot & reconciliation (Task 4) ---
+   // --- Snapshot & reconciliation (Task 4) ---
 
-    function readSnapshot() {
-      const gRoot = root();
-      const nodes = gRoot ? collectNodes(gRoot) : [];
-      const snapshot = {
-        at: Date.now(),
-        overlay: readOverlay(),
-        scene: scanScene(nodes),
-        mapPanel: scanMapPanel(nodes),
-        combat: scanCombat(nodes),
-        bossChallengePanel: scanBossChallengePanel(nodes),
-        autoBattle: scanAutoBattle(nodes),
-        fguiReady: Boolean(gRoot),
-      };
+    // --- Damage ranking panel (副本左侧伤害列表) ---
+    // CDP 2026-07-30 探查确认结构:
+    //   Damage list (root/MainWnd/compLeftTop/activityInfoCom/Damage list)
+    //   n9: "我自己"固定行 -> txt_Name / txt_Harm / txt_No1(我的排名数字) / defBtn(仅第一名可见)
+    //   list_Rank: GList, 全员排名行(含我), 按伤害降序, 每行 txt_Name / txt_Harm
+    //   txt_rank 字段不可靠(全显示4), 弃用。
+    // 野外地图 Damage list 不可见, available=false。
+    function parseHarm(text) {
+      if (!text) return 0;
+      const s = String(text).trim();
+      if (/亿/.test(s)) {
+        const n = parseFloat(s.replace(/亿.*$/, ''));
+        return Number.isFinite(n) ? n * 1e8 : 0;
+      }
+      if (/万/.test(s)) {
+        const n = parseFloat(s.replace(/万.*$/, ''));
+        return Number.isFinite(n) ? n * 1e4 : 0;
+      }
+      const n = parseFloat(s.replace(/[^0-9.]/g, ''));
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function findChildText(nodes, parent, childName) {
+      const parentPath = parent.path;
+      const child = nodes.find((item) => item.path.startsWith(parentPath + '/')
+        && item.name === childName);
+      return child ? child.contentText : '';
+    }
+
+    function scanDamageRanking(nodes) {
+      const panelRoot = nodes.find((item) => item.effectiveVisible
+        && item.name === 'Damage list');
+      if (!panelRoot) {
+        return { available: false, myName: '', myHarm: 0, myRank: 0, firstHarm: 0, rows: [] };
+      }
+      const panelNodes = descendantsOf(nodes, panelRoot);
+      const n9 = panelNodes.find((item) => item.name === 'n9' && item.path.startsWith(panelRoot.path + '/'));
+      const listRank = panelNodes.find((item) => item.name === 'list_Rank' && item.path.startsWith(panelRoot.path + '/'));
+      const myName = n9 ? cleanText(findChildText(panelNodes, n9, 'txt_Name')) : '';
+      const myHarm = n9 ? parseHarm(findChildText(panelNodes, n9, 'txt_Harm')) : 0;
+      const myRankRaw = n9 ? cleanText(findChildText(panelNodes, n9, 'txt_No1')) : '';
+      const myRank = parseInt(myRankRaw, 10) || 0;
+      const rows = [];
+      if (listRank) {
+        const rankChildren = panelNodes.filter((item) => item.path.startsWith(listRank.path + '/')
+          && item.name === 'txt_Name');
+        for (const nameNode of rankChildren) {
+          const rowPath = nameNode.path.replace(/\/[^/]+$/, '');
+          const harmNode = panelNodes.find((item) => item.path.startsWith(rowPath + '/')
+            && item.name === 'txt_Harm');
+          rows.push({
+            name: cleanText(nameNode.contentText),
+            harm: harmNode ? parseHarm(harmNode.contentText) : 0,
+          });
+        }
+        rows.sort((a, b) => b.harm - a.harm);
+      }
+      const firstHarm = rows.length ? rows[0].harm : 0;
+      return { available: true, myName, myHarm, myRank, firstHarm, rows };
+    }
+
+   function readSnapshot() {
+     const gRoot = root();
+     const nodes = gRoot ? collectNodes(gRoot) : [];
+     const snapshot = {
+       at: Date.now(),
+       overlay: readOverlay(),
+       scene: scanScene(nodes),
+       mapPanel: scanMapPanel(nodes),
+       combat: scanCombat(nodes),
+       bossChallengePanel: scanBossChallengePanel(nodes),
+       damageRanking: scanDamageRanking(nodes),
+       autoBattle: scanAutoBattle(nodes),
+       fguiReady: Boolean(gRoot),
+     };
       // 注:scanTrialTaskbar 已删除,不读
       const farmTargetMissing = snapshot.mapPanel.open && !snapshot.mapPanel.farmTarget;
       if (farmTargetMissing && !state.farmTargetMissing) {
@@ -1880,19 +1952,73 @@
         && hasVisibleHpBar(combat)
         && ownerName
         && ownerName !== state.config.ownerName);
+      const now = Number(snapshot.at) || Date.now();
+      const module = moduleByMapName((snapshot.scene || {}).mapName);
+      const isInstance = Boolean(module && module.type === 'instance');
+      const dr = snapshot.damageRanking || { available: false };
+      const hasDamage = isInstance && dr.available && dr.myHarm > 0;
+
+      // 归属非我 → 初始化/续期观察; 归属空/为我 → grace 后重置
       if (!isForeignOwner) {
+        if (state.ownerObservation && state.ownerObservation.targetId === target.id
+          && state.ownerObservation.lastForeignAt
+          && now - state.ownerObservation.lastForeignAt <= (state.config.ownerObserveGraceMs || 0)) {
+          return false;
+        }
         resetOwnerObservation();
         return false;
       }
-      const now = Number(snapshot.at) || Date.now();
       if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
-        state.ownerObservation = { targetId: target.id, observedAt: now };
+        const baselineGap = hasDamage ? Math.max(0, (dr.firstHarm || 0) - dr.myHarm) : 0;
+        state.ownerObservation = {
+          targetId: target.id, observedAt: now, lastForeignAt: now, baselineGap,
+        };
         return false;
       }
-      if (now - state.ownerObservation.observedAt < state.config.ownerObserveSeconds * 1000) return false;
+     state.ownerObservation.lastForeignAt = now;
+
+      // 计算是否低血量加速场景, 决定观察时间
+      let observeSeconds = state.config.ownerObserveSeconds;
+      if (hasDamage) {
+        const firstHarm0 = dr.firstHarm || 0;
+        const ratio0 = firstHarm0 > 0 ? dr.myHarm / firstHarm0 : 1;
+        const hp0 = combat && hasVisibleHpBar(combat) ? Number(combat.hpPercent) : 100;
+        if (hp0 < (state.config.damageLowHpThreshold || 0)
+          && dr.myRank !== 1
+          && ratio0 < (state.config.damageLowHpAbandonRatio || 0)) {
+          observeSeconds = state.config.damageLowHpObserveSeconds;
+        }
+      }
+
+      // 计时未满 → 继续观察
+      if (now - state.ownerObservation.observedAt < observeSeconds * 1000) return false;
+
+      // 副本 + 伤害列表可用: 伤害门槛 + 趋势判定
+      if (hasDamage) {
+        if (dr.myRank === 1) return false; // 我是伤害第一, 继续打
+        const firstHarm = dr.firstHarm || 0;
+        if (firstHarm <= 0) return false;
+        const ratio = dr.myHarm / firstHarm;
+        const currentGap = firstHarm - dr.myHarm;
+        const gapLarge = ratio < (state.config.damageGapAbandonRatio || 0);
+        const hp = combat && hasVisibleHpBar(combat) ? Number(combat.hpPercent) : 100;
+        const lowHp = hp < (state.config.damageLowHpThreshold || 0);
+        const lowHpGap = lowHp && ratio < (state.config.damageLowHpAbandonRatio || 0);
+        if (!gapLarge && !lowHpGap) return false; // 伤害未低于任一阈值, 继续打
+        if (currentGap <= (state.ownerObservation.baselineGap || 0)) return false; // 差距未扩大, 有追上趋势
+      }
+
+      const logBaselineGap = state.ownerObservation ? state.ownerObservation.baselineGap : 0;
       resetOwnerObservation();
       try { statsEmitter.onContested(target, ownerName); } catch (_) { /* 统计降级 */ }
-      markContested(target, now);
+      appendLog('contested_abandon', {
+        targetId: target.id, ownerName,
+        myHarm: hasDamage ? dr.myHarm : 0,
+        firstHarm: hasDamage ? dr.firstHarm : 0,
+        myRank: hasDamage ? dr.myRank : 0,
+        baselineGap: logBaselineGap,
+      });
+     markContested(target, now);
       return true;
     }
 
@@ -2401,39 +2527,40 @@
       return result;
     }
 
-    function executeObserveOwner(intent, snapshot) {
-      const target = targetById(intent.targetId);
-      if (!target) return { ok: false, reason: 'observe_target_missing' };
-      const combat = snapshot.combat;
-      if (!combat || cleanText(combat.targetName) !== target.name) {
-        resetOwnerObservation();
-        return { ok: true, reason: 'boss_disappeared' };
-      }
-      if (!hasVisibleHpBar(combat)) {
-        resetOwnerObservation();
-        return { ok: true, reason: 'no_hp_bar' };
-      }
-      const ownerName = cleanText(combat.ownerName);
-      const now = Number(snapshot.at) || Date.now();
-      if (!ownerName || ownerName === state.config.ownerName) {
-        resetOwnerObservation();
-        return { ok: true, reason: 'owner_clear_or_self' };
-      }
-      if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
-        state.ownerObservation = { targetId: target.id, observedAt: now };
-        appendLog('owner_observation_started', { targetId: target.id, ownerName });
-        return { ok: true, reason: 'observing_owner' };
-      }
-      const elapsed = now - state.ownerObservation.observedAt;
-      if (elapsed >= state.config.ownerObserveSeconds * 1000) {
-        try { statsEmitter.onContested(target, ownerName); } catch (_) { /* 统计降级 */ }
-        markContested(target, now);
-        resetOwnerObservation();
-        appendLog('owner_contested', { targetId: target.id, ownerName, elapsedMs: elapsed });
-        return { ok: true, reason: 'contested_cooldown_set' };
-      }
-      return { ok: true, reason: 'observing_owner', elapsedSeconds: Math.floor(elapsed / 1000) };
-    }
+   function executeObserveOwner(intent, snapshot) {
+     const target = targetById(intent.targetId);
+     if (!target) return { ok: false, reason: 'observe_target_missing' };
+     // abandon 决策统一由 observeContestedOwner 在 intentForTarget 每 tick 处理,
+     // 这里只维持 observe_owner 状态,不再直接 markContested。
+     const combat = snapshot.combat;
+     if (!combat || cleanText(combat.targetName) !== target.name) {
+       resetOwnerObservation();
+       return { ok: true, reason: 'boss_disappeared' };
+     }
+     if (!hasVisibleHpBar(combat)) {
+       // HP 条瞬时缺失: grace 容忍, 不立即重置。
+       return { ok: true, reason: 'no_hp_bar' };
+     }
+     const ownerName = cleanText(combat.ownerName);
+     const now = Number(snapshot.at) || Date.now();
+     if (!ownerName || ownerName === state.config.ownerName) {
+       // 归属变空/自己: grace 容忍由 observeContestedOwner 处理, 这里不重置。
+       return { ok: true, reason: 'owner_clear_or_self' };
+     }
+    if (!state.ownerObservation || state.ownerObservation.targetId !== target.id) {
+      state.ownerObservation = { targetId: target.id, observedAt: now, lastForeignAt: now };
+      const dr0 = snapshot.damageRanking || { available: false };
+      const module0 = moduleByMapName((snapshot.scene || {}).mapName);
+      const isInstance0 = Boolean(module0 && module0.type === 'instance');
+      const hasDamage0 = isInstance0 && dr0.available && dr0.myHarm > 0;
+      state.ownerObservation.baselineGap = hasDamage0 ? Math.max(0, (dr0.firstHarm || 0) - dr0.myHarm) : 0;
+      appendLog('owner_observation_started', { targetId: target.id, ownerName });
+       return { ok: true, reason: 'observing_owner' };
+     }
+     state.ownerObservation.lastForeignAt = now;
+     const elapsed = now - state.ownerObservation.observedAt;
+     return { ok: true, reason: 'observing_owner', elapsedSeconds: Math.floor(elapsed / 1000) };
+   }
 
     // --- Panel helpers (Task 6) ---
 
