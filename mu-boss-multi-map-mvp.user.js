@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.13.1
+// @version      0.14.3
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -51,6 +51,12 @@
       scheduledMinute: 30,
       scheduledStartAt: 0,
       wildOnly: false,
+      thiefSkipEnabled: true,
+      thiefStolenCount: 2,
+      thiefWindowHours: 24,
+      thiefDetectMs: 10 * 1000,
+      thiefSkipMs: 2 * 60 * 1000,
+      stolenStartHpMin: 90,
    });
 
     const corrosionModule = Object.freeze({
@@ -205,6 +211,11 @@
       // M 大地图从未打开,mu-boss-respawn-overlay 抓不到坐标。此 flag 强制
       // 先开一次大地图再允许 hold/engage。
       instanceMapOpened: false,
+      thiefSight: { since: 0, thieves: [] },
+      thiefLastScanAt: 0,
+      thiefSkipUntil: {},
+      thiefNamesCache: [],
+      thiefNamesCacheAt: 0,
     };
 
     // --- Rate-check maps (Task 5) ---
@@ -627,6 +638,12 @@
         scheduledMinute: clampNumber(source.scheduledMinute, 0, 59, CONFIG_DEFAULTS.scheduledMinute),
        scheduledStartAt: clampNumber(source.scheduledStartAt, 0, Date.now() + 7 * 24 * 3600 * 1000, CONFIG_DEFAULTS.scheduledStartAt),
         wildOnly: Boolean(source.wildOnly),
+        thiefSkipEnabled: source.thiefSkipEnabled !== false,
+        thiefStolenCount: clampNumber(source.thiefStolenCount, 1, 20, CONFIG_DEFAULTS.thiefStolenCount),
+        thiefWindowHours: clampNumber(source.thiefWindowHours, 1, 24 * 7, CONFIG_DEFAULTS.thiefWindowHours),
+        thiefDetectMs: clampNumber(source.thiefDetectMs, 1000, 5 * 60 * 1000, CONFIG_DEFAULTS.thiefDetectMs),
+        thiefSkipMs: clampNumber(source.thiefSkipMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.thiefSkipMs),
+        stolenStartHpMin: clampNumber(source.stolenStartHpMin, 1, 100, CONFIG_DEFAULTS.stolenStartHpMin),
     };
      return config;
     }
@@ -748,23 +765,50 @@
         };
       }
 
-      function openAttempt(target, now) {
+      function openAttempt(target, now, startHpPercent) {
         attemptSeq += 1;
         activeAttempt = {
           attemptId: sessionId + '-' + attemptSeq,
           ...bossInfo(target),
           startedAt: now,
           lastEngageAt: now,
+          startHpPercent: startHpPercent === null || startHpPercent === undefined ? null : Number(startHpPercent),
           lastOwner: '',
           goneTicks: 0,
         };
+      }
+
+      function isLateArrivalHp(hp) {
+        const value = Number(hp);
+        return !Number.isFinite(value) || value < Number(state.config.stolenStartHpMin);
       }
 
       function closeAttempt(outcome, ownerName, now) {
         const attempt = activeAttempt;
         if (!attempt) return;
         activeAttempt = null;
-        recentClosed.set(attempt.bossId, { attemptId: attempt.attemptId, outcome, closedAt: now });
+        // 中间介入(开始打时血量已低于阈值或未知)除最终由我击杀外一律按跳过处理,
+        // 不再产生 stolen/kill_other/left/unknown 等 attempt 事件。
+        const lateArrival = outcome !== 'kill_mine' && isLateArrivalHp(attempt.startHpPercent);
+        if (lateArrival) {
+          recentClosed.set(attempt.bossId, { attemptId: attempt.attemptId, outcome: 'skipped', closedAt: now });
+          emit({
+            type: 'skipped_owned',
+            ts: now,
+            bossId: attempt.bossId,
+            bossName: attempt.bossName,
+            mapId: attempt.mapId,
+            mapName: attempt.mapName,
+            ownerName: cleanText(ownerName),
+          });
+          return;
+        }
+        recentClosed.set(attempt.bossId, {
+          attemptId: attempt.attemptId,
+          outcome,
+          closedAt: now,
+          startHpPercent: attempt.startHpPercent,
+        });
         emit({
           type: 'attempt',
           attemptId: attempt.attemptId,
@@ -787,7 +831,8 @@
           if (engageTargetId && (!activeAttempt || activeAttempt.bossId !== engageTargetId)) {
             if (activeAttempt) closeAttempt('left', '', now);
             const target = targetById(engageTargetId);
-            if (target) openAttempt(target, now);
+            const combat = snapshot && snapshot.combat ? snapshot.combat : {};
+            if (target) openAttempt(target, now, combat.hpPercent);
           }
           const attempt = activeAttempt;
           if (!attempt) return;
@@ -807,7 +852,7 @@
             attempt.goneTicks += 1;
             if (attempt.goneTicks >= STATS_KILL_CONFIRM_TICKS) {
               const foreign = attempt.lastOwner && attempt.lastOwner !== state.config.ownerName;
-              closeAttempt(foreign ? 'kill_other' : 'kill_mine', '', now);
+              closeAttempt(foreign ? 'kill_other' : 'kill_mine', foreign ? attempt.lastOwner : '', now);
               return;
             }
           }
@@ -827,9 +872,12 @@
           const recent = recentClosed.get(target.id);
           if (recent && now - recent.closedAt <= staleMs()) {
             recentClosed.delete(target.id);
+            // 中间介入已按 skipped 关闭,或开始血量无法证明从头开始 → 不再修正为 stolen。
+            if (recent.outcome === 'skipped' || isLateArrivalHp(recent.startHpPercent)) return;
             emit({ type: 'attempt_update', attemptId: recent.attemptId, ts: now, outcome: 'stolen', ownerName: owner });
             return;
           }
+          // 无 active attempt、也无近期关闭记录 → 从未证明从头开始竞争,一律跳过。
           emit({ type: 'skipped_owned', ts: now, ...bossInfo(target), ownerName: owner });
         });
       }
@@ -891,6 +939,10 @@
        autoOffStreak: state.autoOffStreak,
        currentIntent: clone(state.currentIntent),
        stats: statsEmitter.status(),
+       thiefSight: clone(state.thiefSight),
+       thiefLastScanAt: state.thiefLastScanAt,
+       thiefSkipUntil: clone(state.thiefSkipUntil),
+       thiefList: getThiefNames(),
      });
    }
 
@@ -915,6 +967,11 @@
    state.autoOffStreak = 0;
    state.lastZKeyReason = null;
    state.instanceCheckCooldown = {};
+   state.thiefSight = { since: 0, thieves: [] };
+   state.thiefLastScanAt = 0;
+   state.thiefSkipUntil = {};
+   state.thiefNamesCache = [];
+   state.thiefNamesCacheAt = 0;
     }
 
     // --- Keyboard toggle (Task 2) ---
@@ -1547,6 +1604,17 @@
       getTargets() {
         return clone(state.targets);
       },
+      getVisibleNames() {
+        return getVisibleEntityNames();
+      },
+      getThiefNames() {
+        return getThiefNames();
+      },
+      statsTest: {
+        onTick: statsEmitter.onTick,
+        onContested: statsEmitter.onContested,
+        flushOnUnload: statsEmitter.flushOnUnload,
+      },
       resetInstanceCooldown(moduleId) {
         if (moduleId && state.instanceCheckCooldown[moduleId]) {
           delete state.instanceCheckCooldown[moduleId];
@@ -1729,6 +1797,12 @@
       }
       state.lastIntent = next;
       state.currentIntent = next;
+      // 只在守点/战斗阶段累积窃贼可见时长;切到导航/等待等阶段立即清零,
+      // 保证 10 秒要求是"在 boss 点连续检测到",不是跨地图累计。
+      if (next.type !== 'hold' && next.type !== 'engage') {
+        state.thiefSight = { since: 0, thieves: [] };
+        state.thiefLastScanAt = 0;
+      }
       return clone(next);
     }
 
@@ -1785,6 +1859,7 @@
       const excludedTarget = state.targets.find((t) => t.id === excludedTargetId);
       const excludedName = excludedTarget ? excludedTarget.name : null;
       return state.targets.find((target) => target.id !== excludedTargetId
+        && !isThiefSkipped(target.id, Number(snapshot.at) || Date.now())
         && (!excludedName || target.name !== excludedName)
         && !isCooling(target, Number(snapshot.at) || Date.now())
         && isVisibleAndAttackable(target, snapshot)) || null;
@@ -1908,10 +1983,154 @@
         && Number.isFinite(Number(hpPercent));
     }
 
+    // --- Thief-avoidance (Task: skip boss when a repeat thief is in view) ---
+    // 只统计 outcome=stolen 的"抢走"事件;kill_other 不算,因为可能是我到得晚/尾刀被拿,
+    // 不能说明从头打也抢不过。名单每 60s 刷新一次,避免每 tick 扫描历史数组。
+    // 扫描失败允许 2 tick 宽限,超过则视为"未确认",防止场景重建后旧计时直接触发跳过。
+    const THIEF_SCAN_GRACE_MS = 2 * TICK_MS;
+
+    function getThiefNames() {
+      const now = Date.now();
+      if (state.thiefNamesCacheAt && now - state.thiefNamesCacheAt < 60 * 1000) {
+        return state.thiefNamesCache;
+      }
+      const names = [];
+      try {
+        const stats = window.__muBossStats;
+        const raw = stats && typeof stats.raw === 'function' ? stats.raw() : [];
+        const windowMs = Number(state.config.thiefWindowHours) * 60 * 60 * 1000;
+        const counts = {};
+        for (const rec of raw) {
+          if (!rec || rec.type !== 'attempt' || rec.outcome !== 'stolen') continue;
+          if (!rec.ts || now - rec.ts > windowMs) continue;
+          const owner = cleanText(rec.ownerName);
+          if (owner) counts[owner] = (counts[owner] || 0) + 1;
+        }
+        const threshold = Number(state.config.thiefStolenCount);
+        for (const name of Object.keys(counts)) {
+          if (counts[name] >= threshold) names.push(name);
+        }
+      } catch (_) {
+        // 统计读取失败时降级为空名单,不影响主流程。
+      }
+      state.thiefNamesCache = names;
+      state.thiefNamesCacheAt = now;
+      return names;
+    }
+
+    function findNameLayer() {
+      try {
+        const stage = Laya && Laya.stage;
+        if (!stage) return null;
+        let found = null;
+        function search(node, depth) {
+          if (found || !node || depth > 6) return;
+          if (node.nameLayer && node.nameLayer._children) {
+            found = node.nameLayer;
+            return;
+          }
+          const children = node._children || [];
+          for (let i = 0; i < children.length; i++) search(children[i], depth + 1);
+        }
+        search(stage, 0);
+        return found;
+      } catch (_) {
+        // 场景未就绪/树被重建时返回 null。
+      }
+      return null;
+    }
+
+    function isEffectivelyVisible(node) {
+      let current = node;
+      let depth = 0;
+      while (current && depth < 20) {
+        if (current.visible === false) return false;
+        current = current._parent;
+        depth += 1;
+      }
+      return true;
+    }
+
+    function getVisibleEntityNames() {
+      const layer = findNameLayer();
+      if (!layer) return null;
+      if (!isEffectivelyVisible(layer)) return [];
+      const names = [];
+      try {
+        const children = layer._children || [];
+        for (let i = 0; i < children.length; i++) {
+          const node = children[i];
+          if (!node || node.visible === false || !node.text) continue;
+          const name = cleanText(node.text);
+          if (name && name.length < 30) names.push(name);
+        }
+      } catch (_) {
+        return null;
+      }
+      return names;
+    }
+
+    function isThiefSkipped(targetId, now) {
+      return Boolean(targetId && Number(state.thiefSkipUntil[targetId]) > now);
+    }
+
+    function applyThiefDetection(intent, snapshot) {
+      if (!state.config.thiefSkipEnabled) return intent;
+      try {
+        const now = Number(snapshot.at) || Date.now();
+        const visibleNames = getVisibleEntityNames();
+        // nameLayer 未就绪:短暂失败不打断 10 秒窗口,超过宽限则清零按未确认处理。
+        if (visibleNames === null) {
+          if (state.thiefLastScanAt && now - state.thiefLastScanAt > THIEF_SCAN_GRACE_MS) {
+            state.thiefSight = { since: 0, thieves: [] };
+          }
+          return intent;
+        }
+        state.thiefLastScanAt = now;
+        const thieves = getThiefNames();
+        const detected = thieves.filter((name) => visibleNames.includes(name));
+        if (!detected.length) {
+          state.thiefSight = { since: 0, thieves: [] };
+          return intent;
+        }
+        if (!state.thiefSight.since) {
+          state.thiefSight = { since: now, thieves: detected };
+          return intent;
+        }
+        state.thiefSight.thieves = detected;
+        if (now - state.thiefSight.since < Number(state.config.thiefDetectMs)) return intent;
+
+        const targetId = intent.targetId;
+        if (targetId) state.thiefSkipUntil[targetId] = now + Number(state.config.thiefSkipMs);
+        appendLog('thief_skip_trigger', {
+          targetId,
+          thiefNames: detected.slice(0, 10).join(','),
+          detectedMs: now - state.thiefSight.since,
+          skipMs: Number(state.config.thiefSkipMs),
+        });
+        state.thiefSight = { since: 0, thieves: [] };
+        releaseLockedTarget();
+        resetOwnerObservation();
+        return null;
+      } catch (error) {
+        // 任何未预期异常都降级回原 intent,绝不让窃贼探测阻塞主流程。
+        try {
+          appendLog('thief_scan_error', { message: error && error.message ? error.message : String(error) });
+        } catch (_) {
+          // appendLog 也不应再抛错。
+        }
+        return intent;
+      }
+    }
+
     // --- Intent selection (Task 5) ---
 
     function intentForTarget(target, module, snapshot) {
       if (!target) return makeIntent('sync', null, 'target missing', 'none', 0);
+      if (isThiefSkipped(target.id, Number(snapshot.at) || Date.now())) {
+        releaseLockedTarget();
+        return makeIntent('safe_wait', null, 'boss thief-skipped', 'none', 0.9);
+      }
       // 1. 被他人占据 → 观察
       if (observeContestedOwner(target, snapshot)) {
         return makeIntent('safe_wait', null, 'boss contested cooldown', 'none', 0.95);
@@ -2012,6 +2231,7 @@
       return state.targets.filter((t) => {
         if (t.moduleId !== module.id) return false;
         if (!isBossEnabled(t)) return false;
+        if (isThiefSkipped(t.id, now)) return false;
         if (isCooling(t, now)) return false;
         const status = targetStatus(t, now);
         return status === 'READY' || status === 'READY_UNKNOWN_TIMER' || status === 'PREPARE';
@@ -2040,6 +2260,7 @@
       const eligible = state.targets.filter((target) =>
         target.moduleId === module.id
         && isBossEnabled(target)
+        && !isThiefSkipped(target.id, now)
         && !isCooling(target, now)
         && !isMapRateLow(module.mapName));
       const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
@@ -2152,6 +2373,18 @@
       return wilds.find((m) => m.id === 'corrosion') || wilds[0] || null;
     }
 
+    function chooseFreshIntent(snapshot) {
+      const mapName = (snapshot.scene || {}).mapName || '';
+      const currentModule = moduleByMapName(mapName);
+      if (currentModule && currentModule.type === 'instance') {
+        return chooseInstanceIntent(snapshot, currentModule);
+      }
+      if (currentModule && currentModule.type === 'wild') {
+        return chooseWildIntent(snapshot, currentModule);
+      }
+      return chooseUnknownMapIntent(snapshot);
+    }
+
     function chooseIntent(snapshot) {
       let intent;
       if (!state.config.enabled) {
@@ -2177,16 +2410,16 @@
         intent = makeIntent('check_rate', null, 'boss rate check due', 'check_boss_rate', 0.96);
       } else if (hasLockedValidTarget(snapshot)) {
         intent = intentForLockedTarget(snapshot);
-      } else {
-        const mapName = (snapshot.scene || {}).mapName || '';
-        const currentModule = moduleByMapName(mapName);
-        if (currentModule && currentModule.type === 'instance') {
-          intent = chooseInstanceIntent(snapshot, currentModule);
-        } else if (currentModule && currentModule.type === 'wild') {
-          intent = chooseWildIntent(snapshot, currentModule);
-        } else {
-          intent = chooseUnknownMapIntent(snapshot);
+        if (intent && (intent.type === 'hold' || intent.type === 'engage')) {
+          const skippedTargetId = state.currentTargetId;
+          intent = applyThiefDetection(intent, snapshot);
+          if (intent === null) {
+            appendLog('thief_reselect', { skippedTargetId });
+            intent = chooseFreshIntent(snapshot);
+          }
         }
+      } else {
+        intent = chooseFreshIntent(snapshot);
       }
 
       // 爆率低优先级兜底
