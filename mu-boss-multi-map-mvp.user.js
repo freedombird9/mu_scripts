@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.3
+// @version      0.14.6
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -55,7 +55,7 @@
       thiefStolenCount: 2,
       thiefWindowHours: 24,
       thiefDetectMs: 10 * 1000,
-      thiefSkipMs: 2 * 60 * 1000,
+      thiefSkipMs: 5 * 60 * 1000,
       stolenStartHpMin: 90,
    });
 
@@ -642,7 +642,7 @@
         thiefStolenCount: clampNumber(source.thiefStolenCount, 1, 20, CONFIG_DEFAULTS.thiefStolenCount),
         thiefWindowHours: clampNumber(source.thiefWindowHours, 1, 24 * 7, CONFIG_DEFAULTS.thiefWindowHours),
         thiefDetectMs: clampNumber(source.thiefDetectMs, 1000, 5 * 60 * 1000, CONFIG_DEFAULTS.thiefDetectMs),
-        thiefSkipMs: clampNumber(source.thiefSkipMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.thiefSkipMs),
+        thiefSkipMs: clampNumber(source.thiefSkipMs, 1000, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.thiefSkipMs),
         stolenStartHpMin: clampNumber(source.stolenStartHpMin, 1, 100, CONFIG_DEFAULTS.stolenStartHpMin),
     };
      return config;
@@ -832,7 +832,11 @@
             if (activeAttempt) closeAttempt('left', '', now);
             const target = targetById(engageTargetId);
             const combat = snapshot && snapshot.combat ? snapshot.combat : {};
-            if (target) openAttempt(target, now, combat.hpPercent);
+            // 只在 HUD 显示的就是新目标时才采用其 HP, 否则记 null (无法证明从满血开始)。
+            // 切目标同 tick HUD 仍显示旧 BOSS 血量时, startHpPercent 会被错写成旧数值,
+            // 后续 onContested 会误判为"中间介入"发出 skipped_owned。
+            const sameTarget = target && cleanText(combat.targetName) === target.name;
+            if (target) openAttempt(target, now, sameTarget ? combat.hpPercent : null);
           }
           const attempt = activeAttempt;
           if (!attempt) return;
@@ -888,6 +892,17 @@
         });
       }
 
+      // 主动关闭当前 attempt (thief-skip 等场景), 不等 goneTicks 累计或下一次 engage。
+      // 不通知 stats emitter 会让旧 attempt 挂起, 3 tick 后按 kill_mine/kill_other 误关闭,
+      // 污染统计与窃贼名单。
+      function closeActive(reason) {
+        guard(() => {
+          if (!activeAttempt) return;
+          const now = Date.now();
+          closeAttempt(reason || 'left', '', now);
+        });
+      }
+
       function status() {
         return {
           emitted: emittedCount,
@@ -905,7 +920,7 @@
         window.addEventListener('pagehide', flushOnUnload);
       } catch (_) {}
 
-      return { onTick, onContested, flushOnUnload, status };
+      return { onTick, onContested, flushOnUnload, closeActive, status };
     })();
 
     // --- Status & context reset (Task 2) ---
@@ -1614,6 +1629,7 @@
         onTick: statsEmitter.onTick,
         onContested: statsEmitter.onContested,
         flushOnUnload: statsEmitter.flushOnUnload,
+        closeActive: statsEmitter.closeActive,
       },
       resetInstanceCooldown(moduleId) {
         if (moduleId && state.instanceCheckCooldown[moduleId]) {
@@ -1736,6 +1752,7 @@
       const eligible = state.targets.filter((target) =>
         target.moduleId === module.id
         && isBossEnabled(target)
+        && !isThiefSkipped(target.id, now)
         && !isCooling(target, now)
         && !isMapRateLow(module.mapName));
       if (!eligible.length) return false;
@@ -1987,6 +2004,8 @@
     // 只统计 outcome=stolen 的"抢走"事件;kill_other 不算,因为可能是我到得晚/尾刀被拿,
     // 不能说明从头打也抢不过。名单每 60s 刷新一次,避免每 tick 扫描历史数组。
     // 扫描失败允许 2 tick 宽限,超过则视为"未确认",防止场景重建后旧计时直接触发跳过。
+    // 同时统计 attempt 与 attempt_update 两种 stolen 事件 (后者来自 onContested 的"近期关闭
+    // 被抢"路径), 用 attemptId 去重: 同一次 attempt 被抢只算一次, 不应因先 close 再 update 翻倍。
     const THIEF_SCAN_GRACE_MS = 2 * TICK_MS;
 
     function getThiefNames() {
@@ -1997,12 +2016,20 @@
       const names = [];
       try {
         const stats = window.__muBossStats;
-        const raw = stats && typeof stats.raw === 'function' ? stats.raw() : [];
+        const raw = stats && typeof stats.rawEvents === 'function' ? stats.rawEvents() : (stats && typeof stats.raw === 'function' ? stats.raw() : []);
         const windowMs = Number(state.config.thiefWindowHours) * 60 * 60 * 1000;
         const counts = {};
+        const seenAttemptIds = new Set();
         for (const rec of raw) {
-          if (!rec || rec.type !== 'attempt' || rec.outcome !== 'stolen') continue;
+          if (!rec || (rec.type !== 'attempt' && rec.type !== 'attempt_update')) continue;
+          if (rec.outcome !== 'stolen') continue;
           if (!rec.ts || now - rec.ts > windowMs) continue;
+          // 同一 attemptId 去重: 一次 attempt 可能先 emit closeAttempt('stolen') (type=attempt)
+          // 再被 onContested 修正为 attempt_update; 只应计一次。
+          if (rec.attemptId) {
+            if (seenAttemptIds.has(rec.attemptId)) continue;
+            seenAttemptIds.add(rec.attemptId);
+          }
           const owner = cleanText(rec.ownerName);
           if (owner) counts[owner] = (counts[owner] || 0) + 1;
         }
@@ -2111,6 +2138,9 @@
         state.thiefSight = { since: 0, thieves: [] };
         releaseLockedTarget();
         resetOwnerObservation();
+        // 主动关闭当前 stats attempt, 防止新 intent 不是 engage 时旧 attempt 挂起,
+        // 3 tick gone 后被误判为 kill_mine/kill_other 污染统计与窃贼名单。
+        try { statsEmitter.closeActive('left'); } catch (_) { /* 统计降级 */ }
         return null;
       } catch (error) {
         // 任何未预期异常都降级回原 intent,绝不让窃贼探测阻塞主流程。
@@ -2300,6 +2330,15 @@
         // 不主动 scan_map,因为副本内 BOSS 信息只能靠 overlay,scan 会让大地图卡开不关。
         const target = selectInstanceTarget(attackable, snapshot);
         return intentForTarget(target, module, snapshot);
+      }
+      // attackable 为空:区分"副本里真没 BOSS"与"BOSS 被临时 thief-skipped"。
+      // 后者不应挂 instanceEmptyCooldown (15min),否则 "跳过 2min" 会扩大为 "整副本冷却 15min"。
+      // 不挂冷却直接 exit_instance,让状态机下一 tick 按 chooseWildIntent 选 farming / 其它副本 /
+      // 野外 BOSS。thief-skip 过期后该 BOSS 重新可打,shouldEnterInstance 自然放行,可再进副本。
+      const hasThiefSkippedInModule = state.targets.some((t) =>
+        t.moduleId === module.id && isBossEnabled(t) && isThiefSkipped(t.id, now));
+      if (hasThiefSkippedInModule) {
+        return makeIntent('exit_instance', null, 'instance bosses thief-skipped - exit without cooldown', 'exit_instance', 0.8);
       }
       // 本副本 BOSS 状态未知 → 先 scan 判空(scan_map 内部 60s cooldown 防频繁)
       if (needMapScan(snapshot, module)) {

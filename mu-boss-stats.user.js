@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 统计面板
 // @namespace    codex.mu.boss-stats
-// @version      1.1.1
+// @version      1.1.2
 // @description  读取统计事件 journal,按时间窗口聚合打 BOSS 指标,浮层(Ctrl+i 切换)与 console 双呈现。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -251,6 +251,13 @@
       console.log(`事件数: ${w.length}${hours ? ` (近${hours}h)` : ' (全部)'}`);
       w.forEach((e) => console.log(JSON.stringify(e)));
       return w;
+    }
+
+    // 不带 console 副作用的访问器:供其他脚本(如 mu-boss-multi-map-mvp 的窃贼检测)
+    // 读取 journal 事件,避免每 60s 调用 raw() 把整个 journal 刷屏。
+    function rawEvents(hours) {
+      const events = readJournal();
+      return hours ? inWindow(events, hours) : events;
     }
 
     // ---------- 通用工具 ----------
@@ -885,7 +892,7 @@
     // ---------- 导出 + 启动 ----------
 
     window.__muBossStats = {
-      report, raw, clear: clearJournal,
+      report, raw, rawEvents, clear: clearJournal,
       toggle: toggleOverlay,
       show() { if (!ui.visible) toggleOverlay(); },
       hide() { if (ui.visible) toggleOverlay(); },
