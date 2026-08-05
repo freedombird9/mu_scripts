@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.6
+// @version      0.14.9
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -684,6 +684,8 @@
       let attemptSeq = 0;
       let activeAttempt = null;
       const recentClosed = new Map();  // targetId -> { attemptId, outcome, closedAt }
+      // 守点记录:脚本本次锁定某 BOSS 点位的最早时间,用于区分"刷新前已在等"与"刷新后才到"。
+      let presence = { targetId: '', since: 0, firstHpAt: 0, firstHpPercent: null };
       let journalCache = null;
       let journalDisabled = false;
       let emittedCount = 0;
@@ -827,11 +829,30 @@
       function onTick(snapshot, intent) {
         guard(() => {
           const now = Date.now();
-          const engageTargetId = intent && intent.type === 'engage' ? cleanText(intent.targetId) : '';
+          const combat = snapshot && snapshot.combat ? snapshot.combat : {};
+          const intentType = intent && intent.type ? String(intent.type) : '';
+          const lockedTargetId = (intentType === 'hold' || intentType === 'engage' || intentType === 'observe_owner')
+            ? cleanText(intent && intent.targetId)
+            : '';
+          if (lockedTargetId && lockedTargetId !== presence.targetId) {
+            presence = { targetId: lockedTargetId, since: now, firstHpAt: 0, firstHpPercent: null };
+          } else if (!lockedTargetId) {
+            presence = { targetId: '', since: 0, firstHpAt: 0, firstHpPercent: null };
+          }
+          if (presence.targetId) {
+            const presenceTarget = targetById(presence.targetId);
+            if (presenceTarget && cleanText(combat.targetName) === presenceTarget.name && hasVisibleHpBar(combat)) {
+              if (!presence.firstHpAt) presence.firstHpAt = now;
+              if (presence.firstHpPercent === null) {
+                const hpRaw = combat.hpPercent;
+                if (hpRaw !== null && hpRaw !== undefined && hpRaw !== '') presence.firstHpPercent = Number(hpRaw);
+              }
+            }
+          }
+          const engageTargetId = intentType === 'engage' ? cleanText(intent.targetId) : '';
           if (engageTargetId && (!activeAttempt || activeAttempt.bossId !== engageTargetId)) {
             if (activeAttempt) closeAttempt('left', '', now);
             const target = targetById(engageTargetId);
-            const combat = snapshot && snapshot.combat ? snapshot.combat : {};
             // 只在 HUD 显示的就是新目标时才采用其 HP, 否则记 null (无法证明从满血开始)。
             // 切目标同 tick HUD 仍显示旧 BOSS 血量时, startHpPercent 会被错写成旧数值,
             // 后续 onContested 会误判为"中间介入"发出 skipped_owned。
@@ -842,7 +863,6 @@
           if (!attempt) return;
           if (engageTargetId === attempt.bossId) attempt.lastEngageAt = now;
 
-          const combat = snapshot && snapshot.combat ? snapshot.combat : {};
           const sameTarget = cleanText(combat.targetName) === attempt.bossName;
           const hpRaw = sameTarget ? combat.hpPercent : null;
           const hp = hpRaw === null || hpRaw === undefined || hpRaw === '' ? null : Number(hpRaw);
@@ -881,9 +901,38 @@
             emit({ type: 'attempt_update', attemptId: recent.attemptId, ts: now, outcome: 'stolen', ownerName: owner });
             return;
           }
+          // 无 active attempt 但刷新前已在点位守着 → 视为从头开始竞争,记被抢。
+          if (startedFromRefresh(target)) {
+            const startedAt = presence.firstHpAt || presence.since;
+            attemptSeq += 1;
+            emit({
+              type: 'attempt',
+              attemptId: sessionId + '-' + attemptSeq,
+              ts: startedAt,
+              endTs: now,
+              durationMs: Math.max(0, now - startedAt),
+              ...bossInfo(target),
+              outcome: 'stolen',
+              ownerName: owner,
+              startHpPercent: presence.firstHpPercent,
+            });
+            presence = { targetId: '', since: 0, firstHpAt: 0, firstHpPercent: null };
+            return;
+          }
           // 无 active attempt、也无近期关闭记录 → 从未证明从头开始竞争,一律跳过。
           emit({ type: 'skipped_owned', ts: now, ...bossInfo(target), ownerName: owner });
         });
+      }
+
+      // 严格判定:守点开始时间早于本次刷新时间,才算"刷新前就在等、一刷新就打"。
+      // 刷新时间未知(READY_UNKNOWN_TIMER)一律不算,避免误把晚到记成被抢。
+      function startedFromRefresh(target) {
+        if (!target || !target.id) return false;
+        if (!presence.targetId || presence.targetId !== target.id || !presence.since) return false;
+        // 必须真的看到过该 BOSS 的 HUD 血条,避免"人在点位但没在攻击"也被记成被抢。
+        if (!presence.firstHpAt) return false;
+        const refreshAt = validRefreshAt(target.refreshAt);
+        return refreshAt !== null && presence.since < refreshAt;
       }
 
       function flushOnUnload() {
@@ -913,6 +962,7 @@
           lastError,
           sessionId,
           activeAttempt: activeAttempt ? clone(activeAttempt) : null,
+          presence: clone(presence),
         };
       }
 
@@ -1882,9 +1932,27 @@
         && isVisibleAndAttackable(target, snapshot)) || null;
     }
 
-    function isVisibleAndAttackable(target, snapshot) {
+    function hasSameNameBoss(target) {
+      if (!target || !target.mapName || !target.id) return false;
+      return MAP_MODULES
+        .filter((m) => m.mapName === target.mapName)
+        .flatMap((m) => m.bosses)
+        .some((b) => b.id !== target.id && cleanText(b.name) === cleanText(target.name));
+    }
+
+    // 同名 BOSS(如两只地狱骑士)在 HUD 上无法区分,只有角色在该 BOSS 坐标附近时,
+    // 才允许把 HUD 上的同名目标归属给这个 ID,避免同一只 BOSS 被不同 ID 重复处理。
+    function hudMatchesTarget(target, snapshot) {
+      if (!target || !target.id) return false;
       const combat = snapshot && snapshot.combat;
       if (!combat || cleanText(combat.targetName) !== target.name) return false;
+      if (hasSameNameBoss(target)) return isAtTarget(target, snapshot);
+      return true;
+    }
+
+    function isVisibleAndAttackable(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      if (!hudMatchesTarget(target, snapshot)) return false;
       if (!hasVisibleHpBar(combat) || Number(combat.hpPercent) === 0) return false;
       const scene = snapshot.scene || {};
       return !scene.mapName || scene.mapName === target.mapName;
@@ -1968,7 +2036,7 @@
       const combat = snapshot && snapshot.combat;
       const ownerName = cleanText(combat && combat.ownerName);
       const isForeignOwner = Boolean(combat
-        && cleanText(combat.targetName) === target.name
+        && hudMatchesTarget(target, snapshot)
         && hasVisibleHpBar(combat)
         && ownerName
         && ownerName !== state.config.ownerName);
@@ -1998,6 +2066,28 @@
         && hpPercent !== undefined
         && hpPercent !== ''
         && Number.isFinite(Number(hpPercent));
+    }
+
+    function isOwnBossInHud(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      const ownerName = cleanText(combat && combat.ownerName);
+      return Boolean(target && combat
+        && hudMatchesTarget(target, snapshot)
+        && hasVisibleHpBar(combat)
+        && (!ownerName || ownerName === state.config.ownerName));
+    }
+
+    function clearOwnedThiefSkips(snapshot) {
+      try {
+        for (const target of state.targets) {
+          if (isThiefSkipped(target.id, Date.now()) && isOwnBossInHud(target, snapshot)) {
+            delete state.thiefSkipUntil[target.id];
+            appendLog('thief_skip_cleared_owned', { targetId: target.id, bossName: target.name });
+          }
+        }
+      } catch (_) {
+        // 清理失败不影响主流程。
+      }
     }
 
     // --- Thief-avoidance (Task: skip boss when a repeat thief is in view) ---
@@ -2103,6 +2193,15 @@
 
     function applyThiefDetection(intent, snapshot) {
       if (!state.config.thiefSkipEnabled) return intent;
+      // 正在打自己的 BOSS(HUD 归属为空或自己)时,窃贼可能来晚,不能仅因他在场就放弃。
+      // 归属变为他人后由 observe_owner/contested 路径处理,不再走 thief-skip。
+      const target = intent && intent.targetId ? targetById(intent.targetId) : null;
+      const ownsBoss = isOwnBossInHud(target, snapshot);
+      if (ownsBoss) {
+        state.thiefSight = { since: 0, thieves: [] };
+        state.thiefLastScanAt = 0;
+        return intent;
+      }
       try {
         const now = Number(snapshot.at) || Date.now();
         const visibleNames = getVisibleEntityNames();
@@ -2425,6 +2524,7 @@
     }
 
     function chooseIntent(snapshot) {
+      clearOwnedThiefSkips(snapshot);
       let intent;
       if (!state.config.enabled) {
         resetOwnerObservation();
@@ -2680,6 +2780,10 @@
       if (!combat || cleanText(combat.targetName) !== target.name) {
         resetOwnerObservation();
         return { ok: true, reason: 'boss_disappeared' };
+      }
+      if (hasSameNameBoss(target) && !isAtTarget(target, snapshot)) {
+        resetOwnerObservation();
+        return { ok: true, reason: 'not_at_same_name_boss_coordinate' };
       }
       if (!hasVisibleHpBar(combat)) {
         resetOwnerObservation();
