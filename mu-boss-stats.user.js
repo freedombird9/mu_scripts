@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 统计面板
 // @namespace    codex.mu.boss-stats
-// @version      1.1.3
+// @version      1.2.0
 // @description  读取统计事件 journal,按时间窗口聚合打 BOSS 指标,浮层(Ctrl+i 切换)与 console 双呈现。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -40,7 +40,7 @@
       { id: 'hourly', label: '小时繁忙' },
       { id: 'timeline', label: '时间线' },
     ];
-    const HOUR_OPTIONS = [0, 1, 2, 3, 6, 12, 24];
+    const HOUR_OPTIONS = [0, 1, 2, 3, 6, 8, 10, 12, 24];
 
     // ---------- journal 读写 ----------
 
@@ -236,7 +236,7 @@
         return;
       }
 
-      for (const h of [1, 2, 3, 6, 12, 24]) {
+      for (const h of [1, 2, 3, 6, 8, 10, 12, 24]) {
         const w = inWindow(events, h);
         const label = `近 ${h}h`;
         printSummary(aggregateBoss(w), label);
