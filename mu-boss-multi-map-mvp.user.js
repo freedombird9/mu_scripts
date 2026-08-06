@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.10
+// @version      0.14.11
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -44,7 +44,7 @@
       trialPriorityWindowMs: 60 * 1000,
      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','phantom-giant','furious-phantom-giant'],
+     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','evil-magic-crystal','phantom-giant','furious-phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -125,6 +125,8 @@
         { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },
         // 用户实测(2026-07-22):蛮横魔晶菲尼斯 BOSS 坐标 138,147
         { id: 'brutal-magic-crystal', name: '蛮横魔晶菲尼斯', coordinate: '138,147' },
+        // 用户提供(2026-08-06):邪恶魔晶菲尼斯 BOSS 坐标 108,150
+        { id: 'evil-magic-crystal', name: '邪恶魔晶菲尼斯', coordinate: '108,150' },
       ],
     });
 
