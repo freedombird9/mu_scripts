@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.11
+// @version      0.14.12
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -28,6 +28,10 @@
     // 连续多少个 tick 可靠读到"挂机关"后才允许发 Z 键补偿。
     // Z 是 toggle，假阴性会误关挂机；要求连续确认以过滤网络抖动造成的瞬态假阴性。
     const AUTO_OFF_CONFIRM_TICKS = 3;
+    // farming 到达后等更久再发 Z：游戏内置开挂机可能比 BOSS 站桩慢一拍，
+    // 太早 toggle 反而会把刚开起来的挂机关掉。
+    const FARM_Z_KEY_WAIT_MS = 3000;
+    const Z_KEY_WAIT_MS = 1500;
     const MAX_LOGS = 500;
     const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
     const CONFIG_DEFAULTS = Object.freeze({
@@ -2481,7 +2485,7 @@
       }
       // farming
       resetOwnerObservation();
-      if (isAlreadyFarming(snapshot)) return makeIntent('safe_wait', null, 'no boss work - already farming', 'none', 0.8);
+      if (isAlreadyFarming(snapshot)) return makeIntent('safe_wait', null, 'no boss work - already farming', 'ensure_farm_autobattle', 0.8);
       return makeIntent('travel_farm', null, 'no boss work', 'click_farm_target', 0.8);
     }
 
@@ -2583,7 +2587,7 @@
           resetOwnerObservation();
           releaseLockedTarget();
           if (isAlreadyFarming(snapshot)) {
-            intent = makeIntent('safe_wait', null, 'boss rate low - already farming', 'none', 0.5);
+            intent = makeIntent('safe_wait', null, 'boss rate low - already farming', 'ensure_farm_autobattle', 0.5);
           } else {
             intent = makeIntent('travel_farm', null, 'boss rate low - farming only', 'click_farm_target', 0.5);
           }
@@ -2627,6 +2631,9 @@
       const now = Date.now();
 
       if (intent.action === 'none' || intent.type === 'sync' || intent.type === 'disabled' || intent.type === 'safe_wait') {
+        if (intent.type === 'safe_wait' && intent.action === 'ensure_farm_autobattle') {
+          ensureAutoBattle(snapshot, { waitPostArrivalMs: FARM_Z_KEY_WAIT_MS });
+        }
         return clone(intent);
       }
 
@@ -2660,9 +2667,10 @@
 
     // --- Z key / auto-battle safety net (Task 6) ---
 
-   function ensureZKey(snapshot) {
+   function ensureZKey(snapshot, opts) {
      const now = Date.now();
      const autoBattle = snapshot.autoBattle;
+     const waitPostArrivalMs = (opts && opts.waitPostArrivalMs) || Z_KEY_WAIT_MS;
      // 边沿触发日志:reason 变化时记一条,避免每个 tick 重复刷屏(参考 CLAUDE.md
      // 日志缓冲区约束)。仅记录守卫生效相关的关键 reason。
      const finish = (reason, extra) => {
@@ -2696,7 +2704,7 @@
 
      if (!state.arrivalConfirmedAt) return finish('not_arrived_yet');
 
-     if (now - state.arrivalConfirmedAt < 1500) return finish('waiting_post_arrival');
+     if (now - state.arrivalConfirmedAt < waitPostArrivalMs) return finish('waiting_post_arrival');
 
      if (state.zKeySentAt && now - state.zKeySentAt > 15000) {
        state.zKeyRetryCount = 0;
@@ -2735,12 +2743,12 @@
       }
     }
 
-    function ensureAutoBattle(snapshot) {
+    function ensureAutoBattle(snapshot, opts) {
       if (snapshot.autoBattle && snapshot.autoBattle.enabled) {
         state.zKeyRetryCount = 0;
         return { ok: true, reason: 'already_enabled' };
       }
-      const zResult = ensureZKey(snapshot);
+      const zResult = ensureZKey(snapshot, opts);
       if (zResult.ok) {
         return { ok: true, reason: 'z_key_safety_net: ' + zResult.reason };
       }
