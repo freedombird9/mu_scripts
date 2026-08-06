@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.12
+// @version      0.14.13
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -1346,14 +1346,28 @@
     function readAutoFightState() {
       try {
         const gRoot = root();
-        if (!gRoot || typeof gRoot.getChildAt !== 'function') return 'unknown';
-        const mainWnd = gRoot.getChildAt(0);
-        if (!mainWnd || !mainWnd.mMainBottom) return 'unknown';
-        const ctrl = mainWnd.mMainBottom.autoFightState;
-        if (!ctrl) return 'unknown';
-        const idx = ctrl.selectedIndex;
-        if (idx === 2) return 'on';
-        if (idx === 0) return 'off';
+        if (!gRoot || typeof gRoot.getChildAt !== 'function' || typeof gRoot.numChildren !== 'number') return 'unknown';
+        // MainMapTip 等 UI 可能排在 GRoot 前面,MainWnd 不一定在 index 0。
+        // 遍历子节点优先找 MainWnd,再用任一含 mMainBottom 的节点兜底。
+        let fallbackCtrl = null;
+        for (let i = 0; i < gRoot.numChildren; i++) {
+          const wnd = gRoot.getChildAt(i);
+          if (!wnd || !wnd.mMainBottom) continue;
+          const ctrl = wnd.mMainBottom.autoFightState;
+          if (!ctrl) continue;
+          if (wnd.name === 'MainWnd') {
+            const idx = ctrl.selectedIndex;
+            if (idx === 2) return 'on';
+            if (idx === 0) return 'off';
+            return 'unknown';
+          }
+          if (!fallbackCtrl) fallbackCtrl = ctrl;
+        }
+        if (fallbackCtrl) {
+          const idx = fallbackCtrl.selectedIndex;
+          if (idx === 2) return 'on';
+          if (idx === 0) return 'off';
+        }
         return 'unknown';
       } catch (_) {
         return 'unknown';
