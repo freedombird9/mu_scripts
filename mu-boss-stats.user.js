@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 统计面板
 // @namespace    codex.mu.boss-stats
-// @version      1.1.2
+// @version      1.1.3
 // @description  读取统计事件 journal,按时间窗口聚合打 BOSS 指标,浮层(Ctrl+i 切换)与 console 双呈现。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -110,18 +110,21 @@
     }
 
     function aggregateStolenByPlayer(events) {
-      const map = new Map();
+      const countByOwner = new Map();
+      const seenAttempts = new Set();
       for (const e of events) {
-        const owner = e.ownerName || '';
+        if (!e || (e.type !== 'attempt' && e.type !== 'attempt_update') || e.outcome !== 'stolen') continue;
+        // 同一次被抢可能先发 attempt 再被 attempt_update 修正,按 attemptId 只计一次。
+        const attemptId = e.attemptId;
+        if (attemptId) {
+          if (seenAttempts.has(attemptId)) continue;
+          seenAttempts.add(attemptId);
+        }
+        const owner = String(e.ownerName || '').trim();
         if (!owner) continue;
-        if (e.type === 'attempt' && e.outcome === 'stolen') {
-          map.set(owner, (map.get(owner) || 0) + 1);
-        }
-        if (e.type === 'attempt_update' && e.outcome === 'stolen') {
-          map.set(owner, (map.get(owner) || 0) + 1);
-        }
+        countByOwner.set(owner, (countByOwner.get(owner) || 0) + 1);
       }
-      return Array.from(map.entries())
+      return Array.from(countByOwner.entries())
         .map(([player, count]) => ({ player, count }))
         .sort((a, b) => b.count - a.count);
     }

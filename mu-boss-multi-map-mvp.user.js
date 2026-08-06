@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.9
+// @version      0.14.10
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -777,6 +777,7 @@
           startHpPercent: startHpPercent === null || startHpPercent === undefined ? null : Number(startHpPercent),
           lastOwner: '',
           goneTicks: 0,
+          fromRefresh: startedFromRefresh(target),
         };
       }
 
@@ -791,7 +792,9 @@
         activeAttempt = null;
         // 中间介入(开始打时血量已低于阈值或未知)除最终由我击杀外一律按跳过处理,
         // 不再产生 stolen/kill_other/left/unknown 等 attempt 事件。
-        const lateArrival = outcome !== 'kill_mine' && isLateArrivalHp(attempt.startHpPercent);
+        // 从刷新前就在打(attempt.fromRefresh)属于"从头竞争",不以开始血量判中途介入。
+        const lateArrival = outcome !== 'kill_mine' && !(outcome === 'stolen' && attempt.fromRefresh)
+          && isLateArrivalHp(attempt.startHpPercent);
         if (lateArrival) {
           recentClosed.set(attempt.bossId, { attemptId: attempt.attemptId, outcome: 'skipped', closedAt: now });
           emit({
@@ -823,6 +826,8 @@
           mapName: attempt.mapName,
           outcome,
           ownerName: cleanText(ownerName) || (outcome === 'kill_other' ? attempt.lastOwner : ''),
+          startHpPercent: attempt.startHpPercent,
+          fromRefresh: Boolean(attempt.fromRefresh),
         });
       }
 
@@ -876,7 +881,13 @@
             attempt.goneTicks += 1;
             if (attempt.goneTicks >= STATS_KILL_CONFIRM_TICKS) {
               const foreign = attempt.lastOwner && attempt.lastOwner !== state.config.ownerName;
-              closeAttempt(foreign ? 'kill_other' : 'kill_mine', foreign ? attempt.lastOwner : '', now);
+              // 归属看全程总伤害:从刷新就在打、最终归属他人 = 被抢,与尾刀无关。
+              const stolenByFromRefresh = foreign && attempt.fromRefresh;
+              closeAttempt(
+                stolenByFromRefresh ? 'stolen' : (foreign ? 'kill_other' : 'kill_mine'),
+                foreign ? attempt.lastOwner : '',
+                now
+              );
               return;
             }
           }
@@ -915,6 +926,7 @@
               outcome: 'stolen',
               ownerName: owner,
               startHpPercent: presence.firstHpPercent,
+              fromRefresh: true,
             });
             presence = { targetId: '', since: 0, firstHpAt: 0, firstHpPercent: null };
             return;
