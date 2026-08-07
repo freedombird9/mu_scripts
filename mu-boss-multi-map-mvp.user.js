@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.15.5
+// @version      0.15.7
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -2561,9 +2561,9 @@
     // --- PREPARE 抢占(全模块)---
     // 规则:任何 enabled 模块内出现 PREPARE BOSS(刷新时间 <= preWaitSeconds)时,
     // 除非角色已在蹲守(hold)/正在打 BOSS(engage/observe_owner/战斗),或正在前往该目标,
-    // 否则立即放弃当前任务,清掉所有 ctx/导航/锁定状态,前往该 PREPARE 目标。
-    // 这是最高优先级,蹲守即将刷新的 BOSS 优于 farming / scan_map / check_rate /
-    // enter_instance / exit_instance / teleport_to_module / travel_farm / observe_owner。
+    // 否则在普通任务(含 travel/scan/rate/farming)中立即放弃当前任务,清掉 ctx/导航/锁定状态,
+    // 前往该 PREPARE 目标。enter_instance / exit_instance / teleport_to_module 属于地图切换,
+    // 处于半路时不抢占,先让传送/退出完成,避免遗留弹窗或误开大地图。
     function findHighestPriorityPrepareTarget(snapshot, now) {
       const candidates = [];
       for (const module of MAP_MODULES) {
@@ -2588,10 +2588,6 @@
     // 判断"当前是否正在前往/已就位于 prepareTarget":
     // - hold/engage/observe_owner 锁定同 ID → 已在蹲守/战斗/观察同一目标,不重复打断
     // - travel_boss 锁定同 ID → 正在前往该 BOSS
-    // - enter_instance ctx 且 moduleId === prepareTarget.moduleId → 正在进该副本。
-    //   不能只看 selectedBossId：该字段要到 select_boss 阶段才赋值，进场早期为 null，
-    //   只看 ID 会让 PREPARE 抢占每 tick abort/重启进场流程，直到倒计时结束才恢复。
-    // - teleport_to_module ctx 且目标模块 === prepareTarget.moduleId → 正在传送到该模块
     function isHeadingTowardPrepareTarget(prepareTarget, snapshot) {
       if (!prepareTarget) return false;
       const intent = state.currentIntent;
@@ -2602,25 +2598,11 @@
       if (intent && intent.type === 'travel_boss' && intent.targetId === prepareTarget.id) {
         return true;
       }
-      // enter_instance/teleport 的 ctx 在 execute 内创建/清理，存在一个 tick 的空窗，
-      // 只认 ctx 会把“刚到达目标模块”误判成可抢占。
-      if (intent && intent.type === 'enter_instance' && state.currentModuleId === prepareTarget.moduleId) {
-        return true;
-      }
-      if (intent && intent.type === 'teleport_to_module' && state.currentModuleId === prepareTarget.moduleId) {
-        return true;
-      }
-      if (state.enterInstanceCtx && state.enterInstanceCtx.moduleId === prepareTarget.moduleId) {
-        return true;
-      }
-      if (state.teleportCtx && state.teleportCtx.moduleId === prepareTarget.moduleId) {
-        return true;
-      }
       return false;
     }
 
     // 清掉所有 ctx / 导航 / 锁定状态,并关闭已打开的面板(若有)。
-    // 中途打断 enter/exit/teleport 时,面板可能仍打开 → 关掉避免残留。
+    // 被抢占的普通任务可能正开着挑战 BOSS / 大地图 / 二段弹窗 → 关掉避免残留。
     function abortAllCtxForPrepare(snapshot, reason) {
       appendLog('prepare_abort', { reason, hadEnterCtx: Boolean(state.enterInstanceCtx),
         hadExitCtx: Boolean(state.exitInstanceCtx), hadTeleportCtx: Boolean(state.teleportCtx),
@@ -2641,7 +2623,62 @@
         closePanelIfExists('Instance_BossUI');
         closePanelIfExists('MapDetialWnd');
         closePanelIfExists('AlertWnd');
+        closePanelIfExists('Instance_BossHouseUI');
       } catch (_) { /* 关闭失败不阻塞抢占 */ }
+    }
+
+    // 地图切换过程中不抢占:enter/exit/teleport 都可能处于半路状态,
+    // 此时强插 PREPARE 容易留下未关闭的弹窗/未完成的传送,或把空 sceneMap 误判成野外。
+    function isMapTransitionInProgress() {
+      return Boolean(
+        state.enterInstanceCtx
+        || state.exitInstanceCtx
+        || state.teleportCtx
+        || (state.currentIntent
+          && (state.currentIntent.type === 'enter_instance'
+            || state.currentIntent.type === 'exit_instance'
+            || state.currentIntent.type === 'teleport_to_module'))
+      );
+    }
+
+    function isTargetInHud(target, snapshot) {
+      const combat = snapshot && snapshot.combat;
+      return Boolean(combat && hudMatchesTarget(target, snapshot) && hasVisibleHpBar(combat));
+    }
+
+    function isAnyKnownBossInHud(snapshot) {
+      const combat = snapshot && snapshot.combat;
+      if (!combat || !hasVisibleHpBar(combat)) return false;
+      const targetName = cleanText(combat.targetName);
+      return Boolean(targetName && TARGET_TABLE.some((entry) => entry.name === targetName));
+    }
+
+    // 需求例外必须落在“实际状态”上,不能只看 stale 的 currentIntent:
+    // hold 要真的在坐标,engage/observe_owner 要真的还在打/观察任一已知 BOSS。
+    function isActuallyHoldingOrFighting(intent, snapshot) {
+      if (!intent) return false;
+      const target = intent.targetId ? targetById(intent.targetId) : null;
+      if (!target) return false;
+      if (intent.type === 'hold') {
+        const now = Number(snapshot && snapshot.at) || Date.now();
+        return isLockTargetEligible(target, now) && isAtTarget(target, snapshot);
+      }
+      if (intent.type === 'engage' || intent.type === 'observe_owner') {
+        return isTargetInHud(target, snapshot)
+          || isAnyKnownBossInHud(snapshot)
+          || isInCombatWithOwnBoss(snapshot);
+      }
+      return false;
+    }
+
+    // travel_boss 的目标本身已是 PREPARE(<= preWaitSeconds)时,当前就是在去蹲守的路上,
+    // 不能再被其它 PREPARE 抢走;只有 travel 目标是 READY / READY_UNKNOWN_TIMER 等普通目标时,
+    // 出现新 PREPARE 才允许中断。
+    function isTravelingToPrepare(now) {
+      const intent = state.currentIntent;
+      if (!intent || intent.type !== 'travel_boss') return false;
+      const target = intent.targetId ? targetById(intent.targetId) : null;
+      return Boolean(target && targetStatus(target, now) === 'PREPARE');
     }
 
     // 全局 PREPARE 抢占检查:返回应抢占的 intent,或 null 表示无抢占。
@@ -2649,23 +2686,20 @@
     function maybePreparePreempt(snapshot, now) {
       const prepare = findHighestPriorityPrepareTarget(snapshot, now);
       if (!prepare) return null;
+      // 传送/退出副本等地图切换是原子流程,不能被打断;到达新地图后再按 PREPARE 重新决策。
+      if (isMapTransitionInProgress()) return null;
+      // 已经在去蹲守某个 PREPARE 的路上 → 不抢占。
+      if (isTravelingToPrepare(now)) return null;
+      const sceneMap = (snapshot.scene || {}).mapName || '';
+      // sceneMap 为空时无法可靠判断“是否在副本”,禁止直接开大地图传送,等场景稳定再抢占。
+      if (!sceneMap) return null;
       const { target, module } = prepare;
       // 已在前往该目标/已就位 → 不打断
       if (isHeadingTowardPrepareTarget(target, snapshot)) return null;
       // 需求例外:已在蹲守(hold)或正在打 BOSS。
       // observe_owner 属于“在 BOSS 边上打有主 BOSS”的场景,同样视为战斗中,不抢占。
       if (isInCombatWithOwnBoss(snapshot)) return null;
-      if (state.currentIntent
-        && (state.currentIntent.type === 'hold' || state.currentIntent.type === 'engage'
-          || state.currentIntent.type === 'observe_owner')
-        && state.currentIntent.targetId !== target.id) {
-        return null;
-      }
-      // 正在退出副本时不要抢占:退出是前往野外 PREPARE 目标的前置步骤。
-      // 同模块 PREPARE(还在本副本内)不拦截,允许取消退出并留在副本内。
-      if (state.exitInstanceCtx && prepareTarget.moduleId !== state.exitInstanceCtx.moduleId) {
-        return null;
-      }
+      if (isActuallyHoldingOrFighting(state.currentIntent, snapshot)) return null;
       // 抢占:清状态、关面板,生成前往该目标的新 intent
       abortAllCtxForPrepare(snapshot, 'prepare preempt: ' + target.id
         + ' (' + target.name + ' @' + module.mapName + ' refresh in '
@@ -2675,7 +2709,6 @@
       // - 副本模块:intentForTarget 内部 L2332 会返回 enter_instance(由 shouldEnterInstance 链路进副本)
       // - 野外模块:intentForTarget 不会返回 teleport_to_module,需手动补,否则 executeTravel 开 M 大地图
       //   点的是当前地图 BOSS 行而非目标模块 BOSS 行,会失败。
-      const sceneMap = (snapshot.scene || {}).mapName || '';
       if (module.type === 'wild' && sceneMap !== module.mapName) {
         // 副本里不能靠 M 大地图直接传送到野外,必须先退出副本。
         // 用 MAP_MODULES 判断地图类型,不依赖 enabledMaps:wildOnly/临时关闭模块时
@@ -2706,7 +2739,8 @@
       } else {
         // PREPARE 抢占:在 ctx 类任务分发前,扫描所有模块找最早 PREPARE 的 BOSS。
         // 除非正在 hold/engage/observe_owner(已在蹲守/战斗)或正在前往该 PREPARE 目标,
-        // 否则中断一切其他任务立即去蹲守。例外 1/2 覆盖在 maybePreparePreempt 内。
+        // 否则中断普通任务立即去蹲守。例外 1/2 覆盖在 maybePreparePreempt 内;
+        // enter/exit/teleport 地图切换属于原子流程,由 isMapTransitionInProgress 排除。
         const now = Number(snapshot.at) || Date.now();
         const prepareIntent = maybePreparePreempt(snapshot, now);
         if (prepareIntent) {
@@ -3578,6 +3612,7 @@
         appendLog('enter_instance_timeout', { phase: ctx.phase, elapsed: now - ctx.startedAt });
         closePanelIfExists('Instance_BossUI');
         closePanelIfExists('MapDetialWnd');
+        closePanelIfExists('Instance_BossHouseUI');
         state.enterInstanceCtx = null;
         releaseLockedTarget();
         return { ok: false, reason: 'enter_instance_timeout' };
@@ -3594,6 +3629,7 @@
         case 'closing_panels': {
           const closeResult = closePanelIfExists('MapDetialWnd');
           closePanelIfExists('Instance_BossUI');
+          closePanelIfExists('Instance_BossHouseUI');
           ctx.phase = 'opening';
          ctx.lastActionAt = now;
          return { ok: true, reason: 'panels_closed' };
@@ -3776,6 +3812,7 @@
               appendLog('intermediate_popup_failed', { moduleId: currentModule.id });
               closePanelIfExists('Instance_BossUI');
               closePanelIfExists('MapDetialWnd');
+              closePanelIfExists('Instance_BossHouseUI');
               state.enterInstanceCtx = null;
               releaseLockedTarget();
               return { ok: false, reason: 'intermediate_popup_timeout' };
@@ -3824,6 +3861,7 @@
           if (mapName === currentModule.mapName) {
             appendLog('enter_instance_arrived', { mapName, moduleId: currentModule.id });
             closePanelIfExists('Instance_BossUI');
+            closePanelIfExists('Instance_BossHouseUI');
             // 重置副本大地图访问标记:每次进副本清零,确保本次副本至少开一次大地图。
             state.instanceMapOpened = false;
             state.enterInstanceCtx = null;
@@ -3879,6 +3917,9 @@
           return { ok: true, reason: 'retry_pending' };
         }
         appendLog('exit_instance_failed_timeout', {});
+        closePanelIfExists('Instance_BossUI');
+        closePanelIfExists('MapDetialWnd');
+        closePanelIfExists('Instance_BossHouseUI');
         state.exitInstanceCtx = null;
         return { ok: false, reason: 'exit_instance_timeout' };
       }
@@ -3902,6 +3943,7 @@
         case 'closing_panels': {
           const closeResult = closePanelIfExists('Instance_BossUI');
           closePanelIfExists('MapDetialWnd');
+          closePanelIfExists('Instance_BossHouseUI');
           ctx.phase = 'waiting_for_close';
          ctx.lastActionAt = now;
          return { ok: true, reason: 'panels_closing' };
@@ -3910,7 +3952,9 @@
         case 'waiting_for_close': {
           const bossOpen = snapshot.bossChallengePanel && snapshot.bossChallengePanel.open;
           const mapOpen = snapshot.mapPanel && snapshot.mapPanel.open;
-          if (!bossOpen && !mapOpen) {
+          const popupOpen = Boolean(module.hasIntermediatePopup
+            && findIntermediatePopup(nodes, module));
+          if (!bossOpen && !mapOpen && !popupOpen) {
             ctx.phase = 'click_exit';
             ctx.lastActionAt = now;
             return { ok: true, reason: 'panels_closed' };
