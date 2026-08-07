@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.13
+// @version      0.15.5
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -2296,10 +2296,13 @@
       if (observeContestedOwner(target, snapshot)) {
         return makeIntent('safe_wait', null, 'boss contested cooldown', 'none', 0.95);
       }
-      // 1.5 instanceTravelClicksMap 模块:本次副本未开过大地图 → 强制 travel_boss
-      //     先开 M 大地图(让 overlay 抓坐标),再走 hold/engage。地图小/寻路快时
-      //     角色可能在 enter_instance 期间已到位,没有此守卫会直接 hold 跳过开地图。
-      if (module.instanceTravelClicksMap && !state.instanceMapOpened) {
+      // 1.5 instanceTravelClicksMap 模块且已在目标副本内:本次副本未开过大地图 →
+      //     强制 travel_boss 先开 M 大地图(让 overlay 抓坐标),再走 hold/engage。
+      //     必须限定 scene.mapName === module.mapName:不在副本内时下面 L2332 的
+      //     enter_instance 才应该接管,否则会在当前野外地图开 M 大地图找副本 BOSS 行,
+      //     右侧列表永远为空导致卡在开图重试。
+      if (module.instanceTravelClicksMap && !state.instanceMapOpened
+        && snapshot.scene && snapshot.scene.mapName === module.mapName) {
         return makeIntent('travel_boss', target.id, 'force open map for overlay scan', 'click_boss_target', 0.9);
       }
       // 2. 在视野内可攻击
@@ -2555,6 +2558,139 @@
       return chooseUnknownMapIntent(snapshot);
     }
 
+    // --- PREPARE 抢占(全模块)---
+    // 规则:任何 enabled 模块内出现 PREPARE BOSS(刷新时间 <= preWaitSeconds)时,
+    // 除非角色已在蹲守(hold)/正在打 BOSS(engage/observe_owner/战斗),或正在前往该目标,
+    // 否则立即放弃当前任务,清掉所有 ctx/导航/锁定状态,前往该 PREPARE 目标。
+    // 这是最高优先级,蹲守即将刷新的 BOSS 优于 farming / scan_map / check_rate /
+    // enter_instance / exit_instance / teleport_to_module / travel_farm / observe_owner。
+    function findHighestPriorityPrepareTarget(snapshot, now) {
+      const candidates = [];
+      for (const module of MAP_MODULES) {
+        if (!isModuleEnabled(module)) continue;
+        if (isMapRateLow(module.mapName)) continue;
+        for (const target of state.targets) {
+          if (target.moduleId !== module.id) continue;
+          if (!isBossEnabled(target)) continue;
+          if (isThiefSkipped(target.id, now)) continue;
+          if (isCooling(target, now)) continue;
+          if (target.status !== 'PREPARE') continue;
+          const refreshAt = validRefreshAt(target.refreshAt);
+          if (refreshAt === null) continue;
+          candidates.push({ target, module, refreshAt });
+        }
+      }
+      if (!candidates.length) return null;
+      candidates.sort((a, b) => a.refreshAt - b.refreshAt);
+      return candidates[0];
+    }
+
+    // 判断"当前是否正在前往/已就位于 prepareTarget":
+    // - hold/engage/observe_owner 锁定同 ID → 已在蹲守/战斗/观察同一目标,不重复打断
+    // - travel_boss 锁定同 ID → 正在前往该 BOSS
+    // - enter_instance ctx 且 moduleId === prepareTarget.moduleId → 正在进该副本。
+    //   不能只看 selectedBossId：该字段要到 select_boss 阶段才赋值，进场早期为 null，
+    //   只看 ID 会让 PREPARE 抢占每 tick abort/重启进场流程，直到倒计时结束才恢复。
+    // - teleport_to_module ctx 且目标模块 === prepareTarget.moduleId → 正在传送到该模块
+    function isHeadingTowardPrepareTarget(prepareTarget, snapshot) {
+      if (!prepareTarget) return false;
+      const intent = state.currentIntent;
+      if (intent && (intent.type === 'hold' || intent.type === 'engage' || intent.type === 'observe_owner')
+        && intent.targetId === prepareTarget.id) {
+        return true;
+      }
+      if (intent && intent.type === 'travel_boss' && intent.targetId === prepareTarget.id) {
+        return true;
+      }
+      // enter_instance/teleport 的 ctx 在 execute 内创建/清理，存在一个 tick 的空窗，
+      // 只认 ctx 会把“刚到达目标模块”误判成可抢占。
+      if (intent && intent.type === 'enter_instance' && state.currentModuleId === prepareTarget.moduleId) {
+        return true;
+      }
+      if (intent && intent.type === 'teleport_to_module' && state.currentModuleId === prepareTarget.moduleId) {
+        return true;
+      }
+      if (state.enterInstanceCtx && state.enterInstanceCtx.moduleId === prepareTarget.moduleId) {
+        return true;
+      }
+      if (state.teleportCtx && state.teleportCtx.moduleId === prepareTarget.moduleId) {
+        return true;
+      }
+      return false;
+    }
+
+    // 清掉所有 ctx / 导航 / 锁定状态,并关闭已打开的面板(若有)。
+    // 中途打断 enter/exit/teleport 时,面板可能仍打开 → 关掉避免残留。
+    function abortAllCtxForPrepare(snapshot, reason) {
+      appendLog('prepare_abort', { reason, hadEnterCtx: Boolean(state.enterInstanceCtx),
+        hadExitCtx: Boolean(state.exitInstanceCtx), hadTeleportCtx: Boolean(state.teleportCtx),
+        hadRateCheck: state.rateCheck.phase !== 'idle',
+        hadMapScan: Boolean(state.mapScanContext), hadNav: Boolean(state.navigationContext) });
+      if (state.enterInstanceCtx) state.enterInstanceCtx = null;
+      if (state.exitInstanceCtx) state.exitInstanceCtx = null;
+      if (state.teleportCtx) state.teleportCtx = null;
+      if (state.rateCheck.phase !== 'idle') {
+        state.rateCheck = { phase: 'idle', targetModuleId: '', startedAt: 0, lastActionAt: 0 };
+      }
+      if (state.mapScanContext) state.mapScanContext = null;
+      if (state.navigationContext) state.navigationContext = null;
+      resetOwnerObservation();
+      releaseLockedTarget();
+      // 关掉可能打开的面板(挑战 BOSS / 大地图)。失败不阻塞抢占,只记日志。
+      try {
+        closePanelIfExists('Instance_BossUI');
+        closePanelIfExists('MapDetialWnd');
+        closePanelIfExists('AlertWnd');
+      } catch (_) { /* 关闭失败不阻塞抢占 */ }
+    }
+
+    // 全局 PREPARE 抢占检查:返回应抢占的 intent,或 null 表示无抢占。
+    // 调用者:chooseIntent,在 ctx 类任务分发前调用。
+    function maybePreparePreempt(snapshot, now) {
+      const prepare = findHighestPriorityPrepareTarget(snapshot, now);
+      if (!prepare) return null;
+      const { target, module } = prepare;
+      // 已在前往该目标/已就位 → 不打断
+      if (isHeadingTowardPrepareTarget(target, snapshot)) return null;
+      // 需求例外:已在蹲守(hold)或正在打 BOSS。
+      // observe_owner 属于“在 BOSS 边上打有主 BOSS”的场景,同样视为战斗中,不抢占。
+      if (isInCombatWithOwnBoss(snapshot)) return null;
+      if (state.currentIntent
+        && (state.currentIntent.type === 'hold' || state.currentIntent.type === 'engage'
+          || state.currentIntent.type === 'observe_owner')
+        && state.currentIntent.targetId !== target.id) {
+        return null;
+      }
+      // 正在退出副本时不要抢占:退出是前往野外 PREPARE 目标的前置步骤。
+      // 同模块 PREPARE(还在本副本内)不拦截,允许取消退出并留在副本内。
+      if (state.exitInstanceCtx && prepareTarget.moduleId !== state.exitInstanceCtx.moduleId) {
+        return null;
+      }
+      // 抢占:清状态、关面板,生成前往该目标的新 intent
+      abortAllCtxForPrepare(snapshot, 'prepare preempt: ' + target.id
+        + ' (' + target.name + ' @' + module.mapName + ' refresh in '
+        + Math.max(0, Math.ceil((prepare.refreshAt - now) / 1000)) + 's)');
+      state.currentModuleId = module.id;
+      // 当前不在目标模块地图时的处理:
+      // - 副本模块:intentForTarget 内部 L2332 会返回 enter_instance(由 shouldEnterInstance 链路进副本)
+      // - 野外模块:intentForTarget 不会返回 teleport_to_module,需手动补,否则 executeTravel 开 M 大地图
+      //   点的是当前地图 BOSS 行而非目标模块 BOSS 行,会失败。
+      const sceneMap = (snapshot.scene || {}).mapName || '';
+      if (module.type === 'wild' && sceneMap !== module.mapName) {
+        // 副本里不能靠 M 大地图直接传送到野外,必须先退出副本。
+        // 用 MAP_MODULES 判断地图类型,不依赖 enabledMaps:wildOnly/临时关闭模块时
+        // 角色也可能还在副本里,此时同样必须先 exit_instance。
+        const currentInstance = MAP_MODULES.find((m) => m.mapName === sceneMap && m.type === 'instance');
+        if (currentInstance) {
+          return makeIntent('exit_instance', null,
+            'prepare preempt - exit instance first: ' + currentInstance.id, 'exit_instance', 0.95);
+        }
+        return makeIntent('teleport_to_module', null,
+          'prepare preempt - go to wild map: ' + module.id, 'teleport_wild', 0.95);
+      }
+      return intentForTarget(target, module, snapshot);
+    }
+
     function chooseIntent(snapshot) {
       clearOwnedThiefSkips(snapshot);
       let intent;
@@ -2567,30 +2703,39 @@
       } else if (!snapshot || !snapshot.fguiReady || !snapshot.overlay || !snapshot.overlay.available) {
         resetOwnerObservation();
         intent = makeIntent('sync', null, 'runtime unavailable', 'none', 0);
-      } else if (state.enterInstanceCtx) {
-        intent = makeIntent('enter_instance', state.enterInstanceCtx.selectedBossId || null,
-          'entering instance: ' + state.enterInstanceCtx.phase, 'enter_instance', 0.95);
-      } else if (state.exitInstanceCtx) {
-        intent = makeIntent('exit_instance', null,
-          'exiting instance: ' + state.exitInstanceCtx.phase, 'exit_instance', 0.95);
-      } else if (state.teleportCtx) {
-        intent = makeIntent('teleport_to_module', null,
-          'teleporting to module: ' + state.teleportCtx.phase, 'teleport_wild', 0.95);
-      } else if (needRateCheck(snapshot)) {
-        resetOwnerObservation();
-        intent = makeIntent('check_rate', null, 'boss rate check due', 'check_boss_rate', 0.96);
-      } else if (hasLockedValidTarget(snapshot)) {
-        intent = intentForLockedTarget(snapshot);
-        if (intent && (intent.type === 'hold' || intent.type === 'engage')) {
-          const skippedTargetId = state.currentTargetId;
-          intent = applyThiefDetection(intent, snapshot);
-          if (intent === null) {
-            appendLog('thief_reselect', { skippedTargetId });
-            intent = chooseFreshIntent(snapshot);
-          }
-        }
       } else {
-        intent = chooseFreshIntent(snapshot);
+        // PREPARE 抢占:在 ctx 类任务分发前,扫描所有模块找最早 PREPARE 的 BOSS。
+        // 除非正在 hold/engage/observe_owner(已在蹲守/战斗)或正在前往该 PREPARE 目标,
+        // 否则中断一切其他任务立即去蹲守。例外 1/2 覆盖在 maybePreparePreempt 内。
+        const now = Number(snapshot.at) || Date.now();
+        const prepareIntent = maybePreparePreempt(snapshot, now);
+        if (prepareIntent) {
+          intent = prepareIntent;
+        } else if (state.enterInstanceCtx) {
+          intent = makeIntent('enter_instance', state.enterInstanceCtx.selectedBossId || null,
+            'entering instance: ' + state.enterInstanceCtx.phase, 'enter_instance', 0.95);
+        } else if (state.exitInstanceCtx) {
+          intent = makeIntent('exit_instance', null,
+            'exiting instance: ' + state.exitInstanceCtx.phase, 'exit_instance', 0.95);
+        } else if (state.teleportCtx) {
+          intent = makeIntent('teleport_to_module', null,
+            'teleporting to module: ' + state.teleportCtx.phase, 'teleport_wild', 0.95);
+        } else if (needRateCheck(snapshot)) {
+          resetOwnerObservation();
+          intent = makeIntent('check_rate', null, 'boss rate check due', 'check_boss_rate', 0.96);
+        } else if (hasLockedValidTarget(snapshot)) {
+          intent = intentForLockedTarget(snapshot);
+          if (intent && (intent.type === 'hold' || intent.type === 'engage')) {
+            const skippedTargetId = state.currentTargetId;
+            intent = applyThiefDetection(intent, snapshot);
+            if (intent === null) {
+              appendLog('thief_reselect', { skippedTargetId });
+              intent = chooseFreshIntent(snapshot);
+            }
+          }
+        } else {
+          intent = chooseFreshIntent(snapshot);
+        }
       }
 
       // 爆率低优先级兜底
