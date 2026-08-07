@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.15.8
+// @version      0.15.9
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -25,6 +25,9 @@
     const STORAGE_KEY = 'mu_multi_map_boss_mvp_v1';
     const TICK_MS = 1000;
     const ARRIVAL_THRESHOLD = 3;
+    // 蹲守判定里"最近确认过站在 BOSS 点"的宽限期。大地图打开时坐标可能读不到，
+    // 但刚确认过坐标就不能把真实蹲守误判成离开。
+    const HOLD_COORD_GRACE_MS = 30 * 1000;
     // 连续多少个 tick 可靠读到"挂机关"后才允许发 Z 键补偿。
     // Z 是 toggle，假阴性会误关挂机；要求连续确认以过滤网络抖动造成的瞬态假阴性。
     const AUTO_OFF_CONFIRM_TICKS = 3;
@@ -195,6 +198,8 @@
       farmArrivedCoord: '',
       farmLastSeenFarmingAt: 0,
       holdStartedAt: 0,
+      lastHoldCoord: '',
+      lastHoldAt: 0,
       lastCheckedAt: {},
       lastMapScanAt: 0,
       mapScanContext: null,
@@ -1038,6 +1043,8 @@
       state.farmArrivedCoord = '';
       state.farmLastSeenFarmingAt = 0;
       state.holdStartedAt = 0;
+      state.lastHoldCoord = '';
+      state.lastHoldAt = 0;
       state.lastCheckedAt = {};
       state.lastMapScanAt = 0;
       state.mapScanContext = null;
@@ -1604,6 +1611,8 @@
       state.currentAction = null;
       state.currentIntent = null;
       state.lastOwnBossCombatAt = 0;
+      state.lastHoldCoord = '';
+      state.lastHoldAt = 0;
     }
 
     // --- Module helpers (Task 4) ---
@@ -1890,6 +1899,8 @@
       state.autoOffStreak = 0;
       state.lastZKeyReason = null;
       state.holdStartedAt = 0;
+      state.lastHoldCoord = '';
+      state.lastHoldAt = 0;
       }
       state.currentAction = next.action === 'none' ? null : next.action;
       state.phase = next.type.toUpperCase();
@@ -2588,20 +2599,13 @@
       return candidates[0];
     }
 
-    // 判断"当前是否正在前往/已就位于 prepareTarget":
-    // - hold/engage/observe_owner 锁定同 ID → 已在蹲守/战斗/观察同一目标,不重复打断
-    // - travel_boss 锁定同 ID → 正在前往该 BOSS
+    // 判断"当前是否正在前往 prepareTarget":
+    // 只有 travel_boss 算"正在前往"。hold/engage/observe_owner 是否真的在蹲守/战斗
+    // 由 isActuallyHoldingOrFighting 按真实坐标和 HUD 状态判断，不能用 stale 的 intent 挡住抢占。
     function isHeadingTowardPrepareTarget(prepareTarget, snapshot) {
       if (!prepareTarget) return false;
       const intent = state.currentIntent;
-      if (intent && (intent.type === 'hold' || intent.type === 'engage' || intent.type === 'observe_owner')
-        && intent.targetId === prepareTarget.id) {
-        return true;
-      }
-      if (intent && intent.type === 'travel_boss' && intent.targetId === prepareTarget.id) {
-        return true;
-      }
-      return false;
+      return Boolean(intent && intent.type === 'travel_boss' && intent.targetId === prepareTarget.id);
     }
 
     const PREPARE_ABORT_PANEL_CLOSE_WAIT_MS = 3000;
@@ -2696,7 +2700,18 @@
       if (!target) return false;
       if (intent.type === 'hold') {
         const now = Number(snapshot && snapshot.at) || Date.now();
-        return isLockTargetEligible(target, now) && isAtTarget(target, snapshot);
+        if (!isLockTargetEligible(target, now)) return false;
+        if (isAtTarget(target, snapshot)) return true;
+        // 没开面板时坐标可信，已经换图就不能再用旧坐标冒充蹲守。
+        const scene = snapshot && snapshot.scene;
+        const panelOpen = Boolean(snapshot && ((snapshot.mapPanel && snapshot.mapPanel.open)
+          || (snapshot.bossChallengePanel && snapshot.bossChallengePanel.open)));
+        if (!panelOpen && scene && scene.mapName && scene.mapName !== target.mapName) return false;
+        // 大地图/挑战面板打开时坐标可能被遮挡，最近确认过还在 BOSS 点就继续视为蹲守。
+        return Boolean(state.lastHoldCoord
+          && state.lastHoldAt
+          && now - state.lastHoldAt < HOLD_COORD_GRACE_MS
+          && chebyshevDistance(state.lastHoldCoord, target.coordinate) <= ARRIVAL_THRESHOLD);
       }
       if (intent.type === 'engage' || intent.type === 'observe_owner') {
         return isTargetInHud(target, snapshot)
@@ -3011,6 +3026,8 @@
       if (!isAtTarget(target, snapshot)) {
         return { ok: false, reason: 'not_at_coordinate' };
       }
+      state.lastHoldCoord = (snapshot.scene && snapshot.scene.coordinate) || state.lastHoldCoord;
+      state.lastHoldAt = Date.now();
       // 清理泄漏的 navigationContext:角色可能在 travel_boss 的 checkNavProgress
       // 运行前就到位(isAtTarget=true),此时 navContext 未被正常清理。hold 属于
       // locking intent,applyIntent 不会清它,这里兜底。
