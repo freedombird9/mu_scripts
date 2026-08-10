@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.14.13
+// @version      0.17.0
 // @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -24,6 +24,8 @@
 
     const STORAGE_KEY = 'mu_multi_map_boss_mvp_v1';
     const TICK_MS = 1000;
+    const LOW_HP_THRESHOLD_PERCENT = 15;
+    const LOW_HP_MISSING_CLOSE_MS = 120 * 1000;
     const ARRIVAL_THRESHOLD = 3;
     // 连续多少个 tick 可靠读到"挂机关"后才允许发 Z 键补偿。
     // Z 是 toggle，假阴性会误关挂机；要求连续确认以过滤网络抖动造成的瞬态假阴性。
@@ -48,7 +50,7 @@
       trialPriorityWindowMs: 60 * 1000,
      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','evil-magic-crystal','phantom-giant','furious-phantom-giant'],
+     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','rage-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','evil-magic-crystal','phantom-giant','furious-phantom-giant'],
      purgatoryMapChoice: '苦难炼狱2',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -79,6 +81,7 @@
         { id: 'hell-knight-1', name: '地狱骑士', coordinate: '170,164' },
         { id: 'hell-knight-2', name: '地狱骑士', coordinate: '179,90' },
         { id: 'furious-hell-knight-1', name: '愤怒地狱骑士', coordinate: '86,79' },
+        { id: 'rage-hell-knight-1', name: '狂暴地狱骑士', coordinate: '75,118' },
       ],
     });
 
@@ -698,6 +701,7 @@
       let errorCount = 0;
       let disabled = false;
       let lastError = '';
+      let lowHpEpisode = null;
 
       // ownerObserveSeconds 较大时,contested 可能晚于 left 关闭,stale 窗口需覆盖。
       function staleMs() {
@@ -901,6 +905,72 @@
         });
       }
 
+      function closeLowHpEpisode(now) {
+        if (!lowHpEpisode) return;
+        const ep = lowHpEpisode;
+        lowHpEpisode = null;
+        emit({
+          type: 'low_hp',
+          ts: ep.startedAt,
+          endTs: now,
+          durationMs: Math.max(0, now - ep.startedAt),
+          mapName: cleanText(ep.mapName),
+          minHpPercent: ep.minHpPercent,
+          hpPercent: ep.hpPercent,
+          names: ep.names,
+        });
+      }
+
+      function onPlayerHp(playerHp, visibleNames, mapName) {
+        guard(() => {
+          const now = Date.now();
+          const hpRaw = playerHp && playerHp.percent;
+          const hp = hpRaw === null || hpRaw === undefined || hpRaw === '' ? NaN : Number(hpRaw);
+          const ownName = cleanText(playerHp && playerHp.name) || cleanText(state.config && state.config.ownerName);
+          const names = [];
+          const seen = {};
+          if (Array.isArray(visibleNames)) {
+            for (const raw of visibleNames) {
+              const name = cleanText(raw);
+              if (!name || name === ownName || seen[name]) continue;
+              seen[name] = true;
+              names.push(name);
+            }
+          }
+          if (Number.isFinite(hp)) {
+            if (hp < LOW_HP_THRESHOLD_PERCENT) {
+              if (!lowHpEpisode) {
+                lowHpEpisode = {
+                  startedAt: now,
+                  lastAt: now,
+                  minHpPercent: hp,
+                  hpPercent: hp,
+                  names: [],
+                  missingTicks: 0,
+                  mapName: cleanText(mapName),
+                };
+              }
+              lowHpEpisode.mapName = cleanText(mapName);
+              lowHpEpisode.lastAt = now;
+              lowHpEpisode.minHpPercent = Math.min(lowHpEpisode.minHpPercent, hp);
+              lowHpEpisode.hpPercent = hp;
+              lowHpEpisode.missingTicks = 0;
+              for (const name of names) {
+                if (!lowHpEpisode.names.includes(name)) lowHpEpisode.names.push(name);
+              }
+              return;
+            }
+          } else if (lowHpEpisode) {
+            // 死亡后 UI 可能短暂隐藏/读不到, 不能因为 3 tick 缺失就把同一段 0% 拆成多个事件。
+            // 只有血量恢复, 或低血段缺失超过 120s 才收口。
+            lowHpEpisode.missingTicks += 1;
+            if (now - lowHpEpisode.lastAt > LOW_HP_MISSING_CLOSE_MS) closeLowHpEpisode(now);
+            return;
+          }
+          if (lowHpEpisode) closeLowHpEpisode(now);
+        });
+      }
+
       function onContested(target, ownerName) {
         guard(() => {
           if (!target || !target.id) return;
@@ -956,6 +1026,7 @@
       function flushOnUnload() {
         guard(() => {
           if (activeAttempt) closeAttempt('unknown', '', Date.now());
+          if (lowHpEpisode) closeLowHpEpisode(Date.now());
         });
       }
 
@@ -981,6 +1052,7 @@
           sessionId,
           activeAttempt: activeAttempt ? clone(activeAttempt) : null,
           presence: clone(presence),
+          lowHp: lowHpEpisode ? clone(lowHpEpisode) : null,
         };
       }
 
@@ -988,7 +1060,7 @@
         window.addEventListener('pagehide', flushOnUnload);
       } catch (_) {}
 
-      return { onTick, onContested, flushOnUnload, closeActive, status };
+      return { onTick, onPlayerHp, onContested, flushOnUnload, closeActive, status };
     })();
 
     // --- Status & context reset (Task 2) ---
@@ -1327,6 +1399,49 @@
       };
     }
 
+    function scanPlayerHp(nodes) {
+      try {
+        const wnd = findMainWnd();
+        const vm = wnd && wnd.mMainBottom && wnd.mMainBottom.vm;
+        const fraction = Number(vm && vm._bloodBright);
+        const percent = Number.isFinite(fraction)
+          ? Math.max(0, Math.min(100, fraction * 100))
+          : null;
+        return {
+          percent,
+          // 自己名字以 state.config.ownerName 为准(也是 BOSS 归属判断用的同一字段)。
+          name: cleanText(state.config && state.config.ownerName),
+        };
+      } catch (_) {
+        // 血量读取失败绝不能影响 readSnapshot / 状态机。
+        return { percent: null, name: cleanText(state.config && state.config.ownerName) };
+      }
+    }
+
+    function findMainWnd() {
+      const gRoot = root();
+      if (!gRoot) return null;
+      let found = null;
+      function search(node, depth) {
+        if (found || !node || depth > 12) return;
+        if (node.mMainBottom && node.mMainBottom.vm) {
+          found = node;
+          return;
+        }
+        const count = Number(node.numChildren) || 0;
+        for (let i = 0; i < count; i += 1) {
+          try {
+            const child = node.getChildAt(i);
+            if (child) search(child, depth + 1);
+          } catch (_) {
+            // 单节点异常不影响查找。
+          }
+        }
+      }
+      search(gRoot, 0);
+      return found;
+    }
+
     function scanAutoBattle(nodes) {
       // CDP verified 2026-07-14: AutoStatusItem count is unreliable (stays 0
       // even when auto-battle is on). Use autoFightState controller selectedIndex
@@ -1469,6 +1584,7 @@
         scene: scanScene(nodes),
         mapPanel: scanMapPanel(nodes),
         combat: scanCombat(nodes),
+        playerHp: scanPlayerHp(nodes),
         bossChallengePanel: scanBossChallengePanel(nodes),
         autoBattle: scanAutoBattle(nodes),
         fguiReady: Boolean(gRoot),
@@ -1704,11 +1820,15 @@
       getVisibleNames() {
         return getVisibleEntityNames();
       },
+      getVisiblePlayerNames() {
+        return getVisiblePlayerNames();
+      },
       getThiefNames() {
         return getThiefNames();
       },
       statsTest: {
         onTick: statsEmitter.onTick,
+        onPlayerHp: statsEmitter.onPlayerHp,
         onContested: statsEmitter.onContested,
         flushOnUnload: statsEmitter.flushOnUnload,
         closeActive: statsEmitter.closeActive,
@@ -2219,6 +2339,114 @@
       return names;
     }
 
+    function findMainCamera() {
+      const stage = Laya && Laya.stage;
+      if (!stage) return null;
+      let found = null;
+      function search(node, depth) {
+        if (found || !node || depth > 14) return;
+        if (node._orthographic === false
+          && typeof node.worldToViewportPoint === 'function'
+          && node._viewport && Number(node._viewport.width) > 1000) {
+          found = node;
+          return;
+        }
+        const children = node._children || [];
+        for (let i = 0; i < children.length; i += 1) search(children[i], depth + 1);
+      }
+      search(stage, 0);
+      return found;
+    }
+
+    function collectPlayerActors() {
+      const stage = Laya && Laya.stage;
+      if (!stage) return [];
+      const actors = [];
+      function search(node, depth) {
+        if (!node || depth > 14) return;
+        if (node.entity && node.constructor && typeof node.constructor.createPlayer === 'function') {
+          actors.push(node);
+        }
+        const children = node._children || [];
+        for (let i = 0; i < children.length; i += 1) search(children[i], depth + 1);
+      }
+      search(stage, 0);
+      return actors;
+    }
+
+    function projectWorldToViewportPoint(camera, worldPos, out) {
+      if (!camera || !worldPos || !out || !Laya || !Laya.Matrix4x4 || !camera._viewport
+        || typeof camera._viewport.project !== 'function'
+        || !camera._projectionMatrix || !camera._viewMatrix) {
+        return false;
+      }
+      try {
+        const pv = new Laya.Matrix4x4();
+        Laya.Matrix4x4.multiply(camera._projectionMatrix, camera._viewMatrix, pv);
+        const raw = { x: 0, y: 0, z: 0 };
+        camera._viewport.project(worldPos, pv, raw);
+        const scaleX = (Laya.stage && Laya.stage.clientScaleX) || 1;
+        const scaleY = (Laya.stage && Laya.stage.clientScaleY) || 1;
+        const vx = camera._viewport.x || 0;
+        const vy = camera._viewport.y || 0;
+        out.x = Math.floor((raw.x - vx) / scaleX + vx);
+        out.y = Math.floor((raw.y - vy) / scaleY + vy);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function getVisiblePlayerNames(ownNameOverride) {
+      const layer = findNameLayer();
+      if (!layer) return null;
+      if (!isEffectivelyVisible(layer)) return [];
+      const camera = findMainCamera();
+      const actors = collectPlayerActors();
+      if (!camera || !actors.length) return [];
+      const labels = [];
+      try {
+        const children = layer._children || [];
+        for (let i = 0; i < children.length; i += 1) {
+          const node = children[i];
+          if (!node || node.visible === false || !node.text) continue;
+          const name = cleanText(node.text);
+          if (name && name.length < 30 && !/^\d{1,2}:\d{2}$/.test(name)) {
+            labels.push({ text: name, x: node.x || 0, y: node.y || 0, used: false });
+          }
+        }
+      } catch (_) {
+        return null;
+      }
+      const ownName = cleanText(ownNameOverride) || cleanText(state.config && state.config.ownerName);
+      const matches = [];
+      for (const actor of actors) {
+        const pos = actor._transform && actor._transform.position;
+        if (!pos) continue;
+        const screen = { x: 0, y: 0, z: 0 };
+        if (!projectWorldToViewportPoint(camera, pos, screen)) continue;
+        if (!Number.isFinite(screen.x) || !Number.isFinite(screen.y)) continue;
+        for (const label of labels) {
+          if (label.used) continue;
+          const dx = label.x - screen.x;
+          const dy = label.y - (screen.y - 100);
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 160 && dy > -80 && dy < 80) matches.push({ actor, label, dist });
+        }
+      }
+      matches.sort((a, b) => a.dist - b.dist);
+      const names = [];
+      const usedActors = new Set();
+      for (const match of matches) {
+        if (match.label.used || usedActors.has(match.actor)) continue;
+        match.label.used = true;
+        usedActors.add(match.actor);
+        if (match.label.text === ownName) continue;
+        names.push(match.label.text);
+      }
+      return Array.from(new Set(names));
+    }
+
     function isThiefSkipped(targetId, now) {
       return Boolean(targetId && Number(state.thiefSkipUntil[targetId]) > now);
     }
@@ -2626,6 +2854,13 @@
        reconcileTargets(snapshot);
        const intent = chooseIntent(snapshot);
        try { statsEmitter.onTick(snapshot, intent); } catch (_) { /* 统计降级,绝不影响主流程 */ }
+       try {
+         statsEmitter.onPlayerHp(
+           snapshot.playerHp,
+           getVisiblePlayerNames(snapshot.playerHp && snapshot.playerHp.name),
+           snapshot.scene && snapshot.scene.mapName
+         );
+       } catch (_) { /* 统计降级,绝不影响主流程 */ }
        if (state.enabled && !state.dryRun && !state.paused) {
           return executeIntent(intent, snapshot);
         }

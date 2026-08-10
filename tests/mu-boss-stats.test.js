@@ -61,6 +61,8 @@ const mockEvents = [
   { type: 'attempt', attemptId: 'a4', ts: now - 1 * HOUR, endTs: now - 1 * HOUR + 300000, bossId: 'b3', bossName: '魔晶菲尼斯', mapId: 'purgatory2', mapName: '苦难炼狱2', outcome: 'left', ownerName: '' },
   { type: 'attempt_update', attemptId: 'a4', ts: now - 30 * 60 * 1000, outcome: 'stolen', ownerName: '抢人丙' },
   { type: 'skipped_owned', ts: now - 20 * 60 * 1000, bossId: 'b1', bossName: '地狱骑士', mapId: 'corrosion', mapName: '腐蚀之地', ownerName: '抢人丁' },
+  { type: 'low_hp', ts: now - 2 * HOUR, endTs: now - 2 * HOUR + 45000, mapName: '腐蚀之地', minHpPercent: 9, names: ['玩家甲', '玩家乙'] },
+  { type: 'low_hp', ts: now - 30 * 60 * 1000, endTs: now - 30 * 60 * 1000 + 12000, mapName: '试炼之地2', minHpPercent: 12, names: ['玩家甲', '玩家丙'] },
 ];
 
 function inWindow6(events) {
@@ -111,6 +113,21 @@ function testAggregation() {
   assert.strictEqual(skipped6.length, 1, 'one skipped row');
   assert.strictEqual(skipped6[0].bossName, '地狱骑士', 'skipped boss');
   assert.strictEqual(skipped6[0].count, 1, 'skipped count 1');
+
+  // 低血嫌疑榜: 玩家甲 2 次, 玩家乙/丙各 1 次
+  const lowSuspects = stats._testAggregateLowHpSuspects(w6);
+  const lowJia = lowSuspects.find(s => s.player === '玩家甲');
+  assert(lowJia && lowJia.count === 2, '玩家甲 should appear twice');
+  assert(lowSuspects.find(s => s.player === '玩家乙' && s.count === 1), '玩家乙 once');
+  assert(lowSuspects.find(s => s.player === '玩家丙' && s.count === 1), '玩家丙 once');
+  assert.strictEqual(lowSuspects[0].player, '玩家甲', 'highest count first');
+
+  // 低血记录按时间倒序
+  const lowRecords = stats._testAggregateLowHpRecords(w6);
+  assert.strictEqual(lowRecords.length, 2, 'two low_hp records');
+  assert.strictEqual(lowRecords[0].minHpPercent, 12, 'newest record first');
+  assert.strictEqual(lowRecords[0].mapName, '试炼之地2', 'newest record keeps mapName');
+  assert(lowRecords[1].players.includes('玩家乙'), 'older record keeps players');
 
   // 24h 窗口包含 a0(kill_mine 25h 前应被排除)
   const boss24 = stats._testAggregateBoss(mockEvents.filter(e => Number(e.ts || e.endTs || 0) >= now - 24 * HOUR));
@@ -173,6 +190,100 @@ function testEmitterJournalAccess() {
   assert.strictEqual(st.stats.journalSize, 0, 'journal empty initially');
 
   console.log('  testEmitterJournalAccess: PASS');
+}
+
+function testLowHpRecorder() {
+  const sandbox = makeMainSandbox();
+  loadMainScript(sandbox);
+  const api = sandbox.window.__muMultiMapBossMvp;
+
+  api.statsTest.onPlayerHp(
+    { percent: 14, name: '普尔赫达' },
+    ['普尔赫达', '抢人甲'],
+    '腐蚀之地'
+  );
+  api.statsTest.onPlayerHp(
+    { percent: 0, name: '普尔赫达' },
+    ['抢人乙'],
+    '腐蚀之地'
+  );
+  assert(api.status().stats.lowHp, 'lowHp episode should be active');
+  assert.strictEqual(api.status().stats.lowHp.minHpPercent, 0, 'death hp 0 should be tracked');
+  assert.strictEqual(api.status().stats.lowHp.mapName, '腐蚀之地', 'mapName tracked while low');
+
+  // 死亡期间血条可能短暂消失, 不能因此拆成多个事件。
+  for (let i = 0; i < 5; i += 1) {
+    api.statsTest.onPlayerHp({ percent: null, name: '普尔赫达' }, []);
+  }
+  assert(api.status().stats.lowHp, 'missing HP should keep the same death episode open');
+
+  api.statsTest.onPlayerHp({ percent: 90, name: '普尔赫达' }, []);
+  const events = readJournal(sandbox);
+  const ev = events.find((e) => e.type === 'low_hp');
+  assert(ev, 'low_hp event should be emitted on recovery');
+  assert.strictEqual(events.filter((e) => e.type === 'low_hp').length, 1, 'one death episode should produce one event');
+  assert.strictEqual(ev.minHpPercent, 0, 'low_hp minHpPercent');
+  assert.strictEqual(ev.mapName, '腐蚀之地', 'low_hp mapName');
+  assert(ev.names.includes('抢人甲'), 'names collected while low');
+  assert(ev.names.includes('抢人乙'), 'names collected while low');
+  assert(!ev.names.includes('普尔赫达'), 'self excluded');
+  assert(!api.status().stats.lowHp, 'episode closed after recovery');
+
+  console.log('  testLowHpRecorder: PASS');
+}
+
+function testVisiblePlayerFilter() {
+  const sandbox = makeMainSandbox();
+  loadMainScript(sandbox);
+  const api = sandbox.window.__muMultiMapBossMvp;
+  const layer = {
+    visible: true,
+    _parent: null,
+    _children: [
+      { text: '普尔赫达', visible: true, x: 100, y: 200 },
+      { text: '玩家乙', visible: true, x: 500, y: 200 },
+      { text: '侦察兵', visible: true, x: 900, y: 200 },
+    ],
+  };
+  // 投影后名字标签固定在实体上方 100px: y=200, 实体投影 y=300。
+  const actorCtor = { createPlayer() {} };
+  const camera = {
+    _orthographic: false,
+    _viewport: { width: 1268, height: 750 },
+    projections: { 0: { x: 100, y: 300 }, 1: { x: 500, y: 300 } },
+    worldToViewportPoint() {},
+    _projectionMatrix: {},
+    _viewMatrix: {},
+    project(pos, out) {
+      const p = this.projections[pos.x];
+      out.x = p.x;
+      out.y = p.y;
+    },
+    _children: [],
+  };
+  camera._viewport.project = (pos, pv, out) => {
+    const p = pos.x === 0 ? { x: 100, y: 300 } : { x: 500, y: 300 };
+    out.x = p.x;
+    out.y = p.y;
+  };
+  const actors = [
+    { entity: {}, constructor: actorCtor, _transform: { position: { x: 0, y: 0, z: 0 } }, _children: [] },
+    { entity: {}, constructor: actorCtor, _transform: { position: { x: 1, y: 0, z: 0 } }, _children: [] },
+  ];
+  function Matrix4x4() {}
+  Matrix4x4.multiply = () => {};
+  sandbox.Laya = {
+    Matrix4x4,
+    stage: { clientScaleX: 1, clientScaleY: 1, _children: [{ nameLayer: layer, _children: [] }, camera].concat(actors) },
+  };
+
+  const names = api.getVisiblePlayerNames();
+  assert(Array.isArray(names), 'visible player names should be array');
+  assert(names.includes('玩家乙'), 'player without guild should be detected by 3D actor projection');
+  assert(!names.includes('普尔赫达'), 'own player excluded');
+  assert(!names.includes('侦察兵'), 'monster without guild should be excluded');
+
+  console.log('  testVisiblePlayerFilter: PASS');
 }
 
 function readJournal(sandbox) {
@@ -388,6 +499,8 @@ console.log('mu-boss-stats tests:');
 testAggregation();
 testEmitterBasic();
 testEmitterJournalAccess();
+testLowHpRecorder();
+testVisiblePlayerFilter();
 testLateArrivalContestedIsSkipped();
 testFromStartContestedIsStolen();
 testLateArrivalSelfKillIsKillMine();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - BOSS 统计面板
 // @namespace    codex.mu.boss-stats
-// @version      1.2.0
+// @version      1.4.0
 // @description  读取统计事件 journal,按时间窗口聚合打 BOSS 指标,浮层(Ctrl+i 切换)与 console 双呈现。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -35,6 +35,7 @@
     const REFRESH_MS = 1500;
     const TABS = [
       { id: 'summary', label: 'BOSS汇总' },
+      { id: 'lowhp', label: '低血记录' },
       { id: 'stolen', label: '被抢榜' },
       { id: 'skipped', label: '跳过' },
       { id: 'hourly', label: '小时繁忙' },
@@ -74,6 +75,14 @@
       const d = new Date(Number(ts));
       const pad = (n) => String(n).padStart(2, '0');
       return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function fmtDuration(ms) {
+      const total = Math.max(0, Math.round(Number(ms) || 0) / 1000);
+      if (total < 60) return total + 's';
+      const m = Math.floor(total / 60);
+      const s = Math.round(total % 60);
+      return s ? m + 'm' + s + 's' : m + 'm';
     }
 
     function hourLabel(ts) {
@@ -176,6 +185,44 @@
         if (e.outcome === 'stolen') row.stolen += 1;
       }
       return Array.from(buckets.values()).sort((a, b) => a.time.localeCompare(b.time));
+    }
+
+    function aggregateLowHpSuspects(events) {
+      const counts = new Map();
+      const lastAt = new Map();
+      for (const e of events) {
+        if (!e || e.type !== 'low_hp') continue;
+        const names = Array.isArray(e.names) ? e.names : [];
+        for (const raw of names) {
+          const player = String(raw || '').trim();
+          if (!player) continue;
+          counts.set(player, (counts.get(player) || 0) + 1);
+          const ts = Number(e.endTs || e.ts || 0);
+          if (ts > (lastAt.get(player) || 0)) lastAt.set(player, ts);
+        }
+      }
+      return Array.from(counts.entries())
+        .map(([player, count]) => ({
+          player,
+          count,
+          lastAt: lastAt.get(player) || 0,
+          lastTime: fmtTs(lastAt.get(player) || 0),
+        }))
+        .sort((a, b) => b.count - a.count || b.lastAt - a.lastAt);
+    }
+
+    function aggregateLowHpRecords(events) {
+      return events
+        .filter((e) => e && e.type === 'low_hp')
+        .map((e) => ({
+          ts: Number(e.ts || e.endTs || 0),
+          time: fmtTs(e.ts || e.endTs || 0),
+          mapName: String(e.mapName || '').trim(),
+          minHpPercent: Number(e.minHpPercent),
+          duration: fmtDuration(e.durationMs || Math.max(0, Number(e.endTs || 0) - Number(e.ts || 0))),
+          players: Array.isArray(e.names) ? e.names.filter(Boolean).join('、') : '',
+        }))
+        .sort((a, b) => b.ts - a.ts);
     }
 
     // ---------- console 报告 ----------
@@ -542,6 +589,7 @@
       clearElement(ui.contentEl);
       let table;
       switch (ui.activeTab) {
+        case 'lowhp': table = buildLowHpTable(windowed); break;
         case 'stolen': table = buildStolenTable(windowed); break;
         case 'skipped': table = buildSkippedTable(windowed); break;
         case 'hourly': table = buildHourlyTable(all); break;
@@ -557,6 +605,40 @@
         const hourlyNote = ui.activeTab === 'hourly' ? '(全天)' : '';
         ui.statusEl.textContent = `事件 ${all.length} 条 | 窗口:${label}${hourlyNote} | ${ts}`;
       }
+    }
+
+    function buildLowHpTable(events) {
+      const wrap = document.createElement('div');
+      const suspects = aggregateLowHpSuspects(events);
+      const records = aggregateLowHpRecords(events);
+      const title = (text) => {
+        const div = document.createElement('div');
+        div.textContent = text;
+        div.style.cssText = 'font-weight:700;color:#9fe6ff;padding:6px 0 3px;font-size:var(--mu-stats-font,13px);';
+        return div;
+      };
+      wrap.appendChild(title('低血嫌疑榜'));
+      wrap.appendChild(renderTable(
+        [
+          { label: '#', key: 'rank', align: 'right' },
+          { label: '玩家', key: 'player' },
+          { label: '次数', key: 'count', align: 'right' },
+          { label: '最近', key: 'lastTime' },
+        ],
+        suspects.map((r, i) => ({ rank: i + 1, player: r.player, count: r.count, lastTime: r.lastTime }))
+      ));
+      wrap.appendChild(title('低血记录'));
+      wrap.appendChild(renderTable(
+        [
+          { label: '地图', key: 'mapName' },
+          { label: '时间', key: 'time' },
+          { label: '最低血量', key: 'minHpPercent', align: 'right' },
+          { label: '持续', key: 'duration', align: 'right' },
+          { label: '画面玩家', key: 'players' },
+        ],
+        records
+      ));
+      return wrap;
     }
 
     function buildSummaryTable(events) {
@@ -902,6 +984,8 @@
       _testAggregateBoss: aggregateBoss, _testAggregateStolen: aggregateStolenByPlayer,
       _testAggregateSkipped: aggregateSkipped, _testAggregateHourly: aggregateHourly,
       _testAggregateTimeline: aggregateTimeline, _testInWindow: inWindow,
+      _testAggregateLowHpSuspects: aggregateLowHpSuspects,
+      _testAggregateLowHpRecords: aggregateLowHpRecords,
     };
 
     try {
