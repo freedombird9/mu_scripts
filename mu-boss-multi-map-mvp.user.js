@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.17.0
-// @description  腐蚀之地 + 试炼之地2 + 苦难炼狱2 模块化自动打 BOSS。地图可插拔扩展。
+// @version      0.19.0
+// @description  腐蚀之地 + 试炼之地2 + 苦难炼狱3 + 幻术秘境5 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -35,7 +35,7 @@
     const FARM_Z_KEY_WAIT_MS = 3000;
     const Z_KEY_WAIT_MS = 1500;
     const MAX_LOGS = 500;
-    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱2', '勇者大陆', '幻术秘境4'];
+    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱3', '勇者大陆', '幻术秘境5'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -50,8 +50,8 @@
       trialPriorityWindowMs: 60 * 1000,
      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','rage-hell-knight-1','totem-1','totem-2','totem-3','magic-crystal','brutal-magic-crystal','evil-magic-crystal','phantom-giant','furious-phantom-giant'],
-     purgatoryMapChoice: '苦难炼狱2',
+     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','rage-hell-knight-1','totem-1','totem-2','totem-3','nales','crystal-deer'],
+     purgatoryMapChoice: '苦难炼狱3',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
       scheduledMinute: 30,
@@ -77,6 +77,8 @@
       enterButtonTog: null,
       enterButtonTextRegex: null,
       hasTaskbar: false,
+      // 野外地图:爆率从 high 降到 medium 即停打,只 high 状态可打。
+      stopRate: 'medium',
       bosses: [
         { id: 'hell-knight-1', name: '地狱骑士', coordinate: '170,164' },
         { id: 'hell-knight-2', name: '地狱骑士', coordinate: '179,90' },
@@ -104,6 +106,8 @@
       // 第一只 BOSS,打完后切下一只时角色原地不动 → "稳定但远" 分支永不超时 →
       // 卡在 TRAVEL_BOSS 发呆。统一为大地图点击路径,与其它副本一致。
       instanceTravelClicksMap: true,
+      // 试炼之地:爆率打到 low 才停打,medium/high 都可打。
+      stopRate: 'low',
       bosses: [
         // CDP 探查(2026-07-24):用户在大地图悬停 BOSS 图标读得坐标。
         { id: 'totem-1', name: '图腾树人',       coordinate: '68,94',   layer: 1 },
@@ -114,7 +118,7 @@
 
     const purgatoryModule = Object.freeze({
       id: 'purgatory',
-      mapName: '苦难炼狱2',
+      mapName: '苦难炼狱3',
       type: 'instance',
       priority: 30,
       enabled: true,
@@ -122,24 +126,22 @@
       bossRowTab: '苦难炼狱',
       bossRowScroll: 'wildlevelScroll',
       enterButtonTog: 'wildtog_mapName',
-      enterButtonTextRegex: /^苦难炼狱2/,
+      enterButtonTextRegex: /^苦难炼狱3/,
       hasTaskbar: false,
       // 与 accessory 一致:进副本后走 M 大地图点击导航,既能让 mu-boss-respawn-overlay
       // 抓取 BOSS 名-坐标信息,又统一两种副本逻辑便于复用。
       instanceTravelClicksMap: true,
+      // 苦难炼狱:爆率从 high 降到 medium 即停打,只 high 状态可打。
+      stopRate: 'medium',
       bosses: [
-        // Task 0 项 2 探查:角色站墓碑旁亲自验证为 '149,101'(按钮上的 (126,95) 是按钮坐标,非 BOSS 坐标)
-        { id: 'magic-crystal', name: '魔晶菲尼斯', coordinate: '149,101' },
-        // 用户实测(2026-07-22):蛮横魔晶菲尼斯 BOSS 坐标 138,147
-        { id: 'brutal-magic-crystal', name: '蛮横魔晶菲尼斯', coordinate: '138,147' },
-        // 用户提供(2026-08-06):邪恶魔晶菲尼斯 BOSS 坐标 108,150
-        { id: 'evil-magic-crystal', name: '邪恶魔晶菲尼斯', coordinate: '108,150' },
+        // 用户提供(2026-08-24):纳尔斯 BOSS 坐标 150,101(CDP 未验证)
+        { id: 'nales', name: '纳尔斯', coordinate: '150,101' },
       ],
     });
 
     const accessoryModule = Object.freeze({
       id: 'accessory',
-      mapName: '幻术秘境4',
+      mapName: '幻术秘境5',
       type: 'instance',
       priority: 40,
       enabled: true,
@@ -148,20 +150,20 @@
       // TODO CDP 验证:首饰BOSS tab 下 BOSS 行 scroll 容器名(占位与 purgatory 一致)
       bossRowScroll: 'wildlevelScroll',
       enterButtonTog: 'wildtog_mapName',
-      enterButtonTextRegex: /^幻术秘境4/,
+      enterButtonTextRegex: /^幻术秘境5/,
       hasTaskbar: false,
       hasIntermediatePopup: true,
       intermediatePopupTitle: '卓越之境',         // TODO CDP 验证弹窗标题
       intermediatePopupButtonText: '进入',       // TODO CDP 验证按钮文字
-      // 副本内 BOSS 导航:与 purgatory/trial_land 不同,幻术秘境4 需要点大地图右栏 BOSS 行
+      // 副本内 BOSS 导航:与 purgatory/trial_land 不同,幻术秘境5 需要点大地图右栏 BOSS 行
       // 触发游戏自动寻路(spec 原描述"完全与 purgatory 一致"不准确;CDP 探查发现该副本
       // 进副本后角色停在入口 126,118 不自动寻路,需手动点大地图)。
       instanceTravelClicksMap: true,
+      // 首饰地图(幻术秘境5):爆率打到 low 才停打,medium/high 都可打。
+      stopRate: 'low',
       bosses: [
-        // CDP 探查(2026-07-17):幽灵巨人 BOSS 坐标 197,151(用户站在 BOSS 旁实测)
-        { id: 'phantom-giant', name: '幽灵巨人', coordinate: '197,151' },
-        // CDP 探查(2026-07-29):愤怒幽灵巨人 BOSS 坐标 85,54(用户站在 BOSS 旁实测)
-        { id: 'furious-phantom-giant', name: '愤怒幽灵巨人', coordinate: '85,54' },
+        // 用户提供(2026-08-24):水晶鹿 BOSS 坐标 197,151(CDP 未验证)
+        { id: 'crystal-deer', name: '水晶鹿', coordinate: '197,151' },
       ],
     });
 
@@ -235,6 +237,26 @@
       'txt_blz': 'medium',
       'txt_blg': 'high',
     };
+
+    // 爆率等级排序:rank 越大爆率越高。
+    // shouldStopForRate(module, rate):当前爆率 <= module.stopRate 即停打。
+    //   stopRate='medium' → low/medium 停,high 不停(野外/苦难炼狱)
+    //   stopRate='low'    → 只 low 停,medium/high 不停(试炼之地/首饰地图)
+    //   rate='unknown'   → 永不停(降级为可打,15min 后重检)
+    const RATE_RANK = { low: 0, medium: 1, high: 2 };
+
+    function rateRank(rate) {
+      return RATE_RANK[rate] !== undefined ? RATE_RANK[rate] : -1;
+    }
+
+    function shouldStopForRate(module, rate) {
+      if (!module || !module.stopRate) return false;
+      if (rate === 'unknown' || rate == null) return false;
+      const current = rateRank(rate);
+      const stop = rateRank(module.stopRate);
+      if (current < 0 || stop < 0) return false;
+      return current <= stop;
+    }
 
     // Task 0 项 5 探查结论:BaolvIcon0 反映当前选中 BOSS 爆率(魔晶菲尼斯=txt_blg=high,地狱骑士=txt_bld=low)
     // → PURGATORY_RATE_CHECK_ENABLED = true,苦难炼狱纳入爆率检查
@@ -1887,7 +1909,10 @@
       const r = state.rateResults[mapName];
       if (!r) return null;
       const now = Date.now();
-      if (r.result === 'low') {
+      // 停打状态(rate <= module.stopRate)用 skipUntil(次日 UTC+8 8am 重置);
+      // 非停打状态用 nextCheckAt(rateRecheckIntervalMs 后重检)。
+      // 8am 重置后 skipUntil/nextCheckAt 过期 → 返回 null → needRateCheck 触发重新开检查。
+      if (r.stopped) {
         if (r.skipUntil && now < r.skipUntil) return r;
         return null;
       }
@@ -1895,9 +1920,11 @@
       return null;
     }
 
-    function isMapRateLow(mapName) {
+    // 地图爆率停打判定:rateResults[mapName].stopped 由 markRateCheckDone 根据
+    // module.stopRate 与检测结果写入。stopped=true 时该地图 BOSS 不可打,转 farming。
+    function isMapRateStopped(mapName) {
       const r = getRateResult(mapName);
-      return r && r.result === 'low' ? true : false;
+      return r && r.stopped ? true : false;
     }
 
     function needRateCheck(snapshot) {
@@ -1921,21 +1948,29 @@
       state.rateCheck.phase = 'idle';
       state.rateCheck.targetModuleId = '';
       let nextCheckAt = 0;
+      let stopped = false;
       if (mapName) {
-        nextCheckAt = result === 'low' ? nextRateResetTimestamp() : now + state.config.rateRecheckIntervalMs;
+        const module = MAP_MODULES.find((m) => m.mapName === mapName) || null;
+        stopped = shouldStopForRate(module, result);
+        // 停打:skipUntil = 次日 UTC+8 8am(爆率重置时刻);非停打:nextCheckAt = 15min 后重检。
+        // 8am 重置后 getRateResult 返回 null → needRateCheck 重新触发开面板检查。
+        nextCheckAt = stopped ? nextRateResetTimestamp() : now + state.config.rateRecheckIntervalMs;
         state.rateResults[mapName] = {
           result: result,
+          stopped: stopped,
+          stopRate: module ? module.stopRate : null,
           checkedAt: now,
-          skipUntil: result === 'low' ? nextCheckAt : 0,
+          skipUntil: stopped ? nextCheckAt : 0,
           nextCheckAt: nextCheckAt,
         };
       }
-      if (result !== 'low') {
+      // 从停打恢复为可打时,清掉 farming 状态,让状态机重新走 navigate → farm 流程。
+      if (!stopped) {
         state.farmArrivedAt = 0;
         state.farmArrivedCoord = '';
         state.farmLastSeenFarmingAt = 0;
       }
-      appendLog('rate_check_done', { result, mapName, nextCheckAt });
+      appendLog('rate_check_done', { result, stopped, mapName, nextCheckAt });
     }
 
     const MAP_SCAN_COOLDOWN_MS = 60 * 1000;
@@ -1956,7 +1991,7 @@
         && isBossEnabled(target)
         && !isThiefSkipped(target.id, now)
         && !isCooling(target, now)
-        && !isMapRateLow(module.mapName));
+        && !isMapRateStopped(module.mapName));
       if (!eligible.length) return false;
       const allUnknown = eligible.every((target) => validRefreshAt(target.refreshAt) === null);
       if (!allUnknown) return false;
@@ -2592,7 +2627,7 @@
       const attackable = getAttackableTargets(module, now);
       if (!attackable.length) return false;
       // 爆率非 low(若该模块纳入爆率检查)
-      if (RATE_CHECK_MAPS[module.mapName] && isMapRateLow(module.mapName)) return false;
+      if (RATE_CHECK_MAPS[module.mapName] && isMapRateStopped(module.mapName)) return false;
       // 不在另一个 instance ctx 内
       if (state.enterInstanceCtx || state.exitInstanceCtx) return false;
       // 守卫:正在打自己/无主的 BOSS → 不进副本。
@@ -2615,7 +2650,7 @@
 
     function getAttackableTargets(module, now) {
       if (!module) return [];
-      if (isMapRateLow(module.mapName)) return [];
+      if (isMapRateStopped(module.mapName)) return [];
       if (!isModuleEnabled(module)) return [];
       return state.targets.filter((t) => {
         if (t.moduleId !== module.id) return false;
@@ -2651,7 +2686,7 @@
         && isBossEnabled(target)
         && !isThiefSkipped(target.id, now)
         && !isCooling(target, now)
-        && !isMapRateLow(module.mapName));
+        && !isMapRateStopped(module.mapName));
       const visible = eligible.filter((target) => isVisibleAndAttackable(target, snapshot));
       if (visible.length) return visible[0];
       const soonToRefresh = eligible
@@ -2721,7 +2756,7 @@
         }
       }
       // 本野外地图 BOSS
-      if (!isMapRateLow(module.mapName)) {
+      if (!isMapRateStopped(module.mapName)) {
         const candidate = selectHighestPriorityTarget(snapshot, module);
         if (candidate) return intentForTarget(candidate, module, snapshot);
       }
@@ -2762,7 +2797,7 @@
         .sort((a, b) => effectiveModulePriority(b) - effectiveModulePriority(a));
       // 优先选有可打 BOSS 的野外图
       for (const m of wilds) {
-        if (!isMapRateLow(m.mapName)) {
+        if (!isMapRateStopped(m.mapName)) {
           const attackable = getAttackableTargets(m, now);
           if (attackable.length) return m;
         }
@@ -2821,17 +2856,17 @@
         intent = chooseFreshIntent(snapshot);
       }
 
-      // 爆率低优先级兜底
+      // 爆率停打优先级兜底
       if (!intent || intent.type === 'safe_wait' || intent.type === 'disabled' || intent.type === 'sync') {
         const currentMapName = (snapshot && snapshot.scene || {}).mapName || '';
         const currentModule = moduleByMapName(currentMapName);
-        if (currentModule && isMapRateLow(currentModule.mapName)) {
+        if (currentModule && isMapRateStopped(currentModule.mapName)) {
           resetOwnerObservation();
           releaseLockedTarget();
           if (isAlreadyFarming(snapshot)) {
-            intent = makeIntent('safe_wait', null, 'boss rate low - already farming', 'ensure_farm_autobattle', 0.5);
+            intent = makeIntent('safe_wait', null, 'boss rate stopped - already farming', 'ensure_farm_autobattle', 0.5);
           } else {
-            intent = makeIntent('travel_farm', null, 'boss rate low - farming only', 'click_farm_target', 0.5);
+            intent = makeIntent('travel_farm', null, 'boss rate stopped - farming only', 'click_farm_target', 0.5);
           }
         }
       }
@@ -3805,16 +3840,16 @@
           }
           appendLog('enter_instance_rate_detected', { rate, url: rateUrl, moduleId: currentModule.id });
           markRateCheckDone(rate, currentModule.mapName);
-          if (rate === 'low') {
-            // 爆率低:跳过该模块,关面板释放锁定,下一 tick 选下一个 intent
-            appendLog('enter_instance_rate_low_skip', { moduleId: currentModule.id, mapName: currentModule.mapName });
+          if (shouldStopForRate(currentModule, rate)) {
+            // 爆率 <= module.stopRate:跳过该模块,关面板释放锁定,下一 tick 选下一个 intent
+            appendLog('enter_instance_rate_stop_skip', { moduleId: currentModule.id, mapName: currentModule.mapName, rate, stopRate: currentModule.stopRate });
             closePanelIfExists('Instance_BossUI');
             closePanelIfExists('MapDetialWnd');
             state.enterInstanceCtx = null;
             releaseLockedTarget();
-            return { ok: false, reason: 'rate_low_skip' };
+            return { ok: false, reason: 'rate_stop_skip:' + rate };
           }
-          // 非 low:rateResults 已写入,getRateResult !== null → needRateCheck 返回 false,
+          // 非停打:rateResults 已写入,getRateResult !== null → needRateCheck 返回 false,
           // 进副本后不会触发 check_rate,直接走 boss 导航
           ctx.phase = 'click_enter';
           ctx.lastActionAt = now;
