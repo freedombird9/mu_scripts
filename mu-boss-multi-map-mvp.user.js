@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.19.0
-// @description  腐蚀之地 + 试炼之地2 + 苦难炼狱3 + 幻术秘境5 模块化自动打 BOSS。地图可插拔扩展。
+// @version      0.20.1
+// @description  魔化之地 + 试炼之地2 + 苦难炼狱3 + 幻术秘境5 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
 // @match        https://client.qj2h5.jiuxiaokj.cn/mu2h5/*
@@ -35,7 +35,7 @@
     const FARM_Z_KEY_WAIT_MS = 3000;
     const Z_KEY_WAIT_MS = 1500;
     const MAX_LOGS = 500;
-    const KNOWN_MAP_NAMES = ['腐蚀之地', '试炼之地2', '苦难炼狱3', '勇者大陆', '幻术秘境5'];
+    const KNOWN_MAP_NAMES = ['魔化之地', '试炼之地2', '苦难炼狱3', '勇者大陆', '幻术秘境5'];
     const CONFIG_DEFAULTS = Object.freeze({
       enabled: false,
       dryRun: true,
@@ -45,12 +45,12 @@
       contestedCooldownMs: 5 * 60 * 1000,
       arrivalStallMs: 15 * 1000,
       travelTimeoutMs: 180 * 1000,
-      farmTargetName: '1650级怪物',
+      farmTargetName: '2000级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
      enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
      mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-knight-1','hell-knight-2','furious-hell-knight-1','rage-hell-knight-1','totem-1','totem-2','totem-3','nales','crystal-deer'],
+     enabledBosses: ['hell-demon-horn-1','hell-demon-horn-2','totem-1','totem-2','totem-3','nales','crystal-deer'],
      purgatoryMapChoice: '苦难炼狱3',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -67,11 +67,11 @@
 
     const corrosionModule = Object.freeze({
       id: 'corrosion',
-      mapName: '腐蚀之地',
+      mapName: '魔化之地',
       type: 'wild',
       priority: 10,
       enabled: true,
-      farmTarget: { name: '1650级怪物' },
+      farmTarget: { name: '2000级怪物' },
       bossRowTab: '野外BOSS',
       bossRowScroll: null,
       enterButtonTog: null,
@@ -80,10 +80,9 @@
       // 野外地图:爆率从 high 降到 medium 即停打,只 high 状态可打。
       stopRate: 'medium',
       bosses: [
-        { id: 'hell-knight-1', name: '地狱骑士', coordinate: '170,164' },
-        { id: 'hell-knight-2', name: '地狱骑士', coordinate: '179,90' },
-        { id: 'furious-hell-knight-1', name: '愤怒地狱骑士', coordinate: '86,79' },
-        { id: 'rage-hell-knight-1', name: '狂暴地狱骑士', coordinate: '75,118' },
+        // 用户提供(2026-08-26):地狱角魔 BOSS 坐标,CDP 未验证。
+        { id: 'hell-demon-horn-1', name: '地狱角魔', coordinate: '119,131' },
+        { id: 'hell-demon-horn-2', name: '地狱角魔', coordinate: '165,226' },
       ],
     });
 
@@ -657,7 +656,10 @@
         contestedCooldownMs: clampNumber(source.contestedCooldownMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.contestedCooldownMs),
         arrivalStallMs: clampNumber(source.arrivalStallMs, 0, 60 * 60 * 1000, CONFIG_DEFAULTS.arrivalStallMs),
         travelTimeoutMs: clampNumber(source.travelTimeoutMs, 0, 24 * 60 * 60 * 1000, CONFIG_DEFAULTS.travelTimeoutMs),
-        farmTargetName: cleanText(source.farmTargetName) || CONFIG_DEFAULTS.farmTargetName,
+        // 迁移旧的腐蚀之地默认 farming 目标:老 localStorage 存了 1650级怪物 时跟随新地图默认值。
+        farmTargetName: (cleanText(source.farmTargetName) === '1650级怪物'
+          ? CONFIG_DEFAULTS.farmTargetName
+          : cleanText(source.farmTargetName)) || CONFIG_DEFAULTS.farmTargetName,
         rateRecheckIntervalMs: clampNumber(source.rateRecheckIntervalMs, 60 * 1000, 60 * 60 * 1000, CONFIG_DEFAULTS.rateRecheckIntervalMs),
         trialPriorityWindowMs: clampNumber(source.trialPriorityWindowMs, 0, 10 * 60 * 1000, CONFIG_DEFAULTS.trialPriorityWindowMs),
         enabledMaps: mergeWithDefaults(source.enabledMaps, CONFIG_DEFAULTS.enabledMaps),
@@ -1360,8 +1362,8 @@
         : [];
       const mapEntries = leftRows.map((row) => {
         const children = descendantsOf(panelNodes, row).filter((item) => item.path !== row.path);
-      // 'bigBtn' > 'title' contains the map name (e.g. '腐蚀之地（4转）')
-      // 'bigBtn' > 'title' contains the map name (e.g. '腐蚀之地（4转）')
+      // 'bigBtn' > 'title' contains the map name (e.g. '魔化之地（4转）')
+      // 'bigBtn' > 'title' contains the map name (e.g. '魔化之地（4转）')
       const nameNode = children.find((item) => item.name === 'title' && item.contentText)
           || children.find((item) => item.contentText);
         return {
@@ -2107,7 +2109,7 @@
     }
 
     function findVisibleAttackableTarget(snapshot, excludedTargetId) {
-      // 同名 BOSS(如 hell-knight-1/hell-knight-2 都叫"地狱骑士")在 HUD 上 targetName 不能区分,
+      // 同名 BOSS(如 hell-demon-horn-1/hell-demon-horn-2 都叫"地狱角魔")在 HUD 上 targetName 不能区分,
       // 排除 lockedTarget 同名的其他 BOSS,避免 hold 期间被同名 BOSS 误判为可见可攻击
       // 而释放锁。不同名 BOSS 不受影响,仍能正常转火。
       const excludedTarget = state.targets.find((t) => t.id === excludedTargetId);
@@ -2127,7 +2129,7 @@
         .some((b) => b.id !== target.id && cleanText(b.name) === cleanText(target.name));
     }
 
-    // 同名 BOSS(如两只地狱骑士)在 HUD 上无法区分,只有角色在该 BOSS 坐标附近时,
+    // 同名 BOSS(如两只地狱角魔)在 HUD 上无法区分,只有角色在该 BOSS 坐标附近时,
     // 才允许把 HUD 上的同名目标归属给这个 ID,避免同一只 BOSS 被不同 ID 重复处理。
     function hudMatchesTarget(target, snapshot) {
       if (!target || !target.id) return false;
@@ -2180,7 +2182,7 @@
 
     function isAlreadyFarming(snapshot) {
       // 副本地图无 farming 点(只有 BOSS),直接返回 false。
-      // 用 farmTarget != null 判定野外地图:当前只有腐蚀之地有 farmTarget,
+      // 用 farmTarget != null 判定野外地图:当前只有魔化之地有 farmTarget,
       // 未来新增野外模块自动适配。
       const mapName = snapshot && snapshot.scene && snapshot.scene.mapName;
       if (mapName) {
@@ -2784,7 +2786,7 @@
         state.currentModuleId = wildModule.id;
         return makeIntent('teleport_to_module', null, 'go to wild map: ' + wildModule.id, 'teleport_wild', 0.85);
       }
-      // 兜底:传送腐蚀之地(默认)
+      // 兜底:传送魔化之地(默认)
       const fw = moduleById('corrosion');
       state.currentModuleId = fw ? fw.id : 'corrosion';
       return makeIntent('teleport_to_module', null, 'fallback to corrosion', 'teleport_wild', 0.8);
@@ -2802,7 +2804,7 @@
           if (attackable.length) return m;
         }
       }
-      // 否则默认腐蚀之地
+      // 否则默认魔化之地
       return wilds.find((m) => m.id === 'corrosion') || wilds[0] || null;
     }
 
