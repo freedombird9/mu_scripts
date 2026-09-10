@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         全民红月 - 多地图 BOSS 自动化 MVP
 // @namespace    codex.mu.multi-map-boss-mvp
-// @version      0.20.1
+// @version      0.21.0
 // @description  魔化之地 + 试炼之地2 + 苦难炼狱3 + 幻术秘境5 模块化自动打 BOSS。地图可插拔扩展。
 // @author       Codex
 // @match        https://www.602.com/game/show/*
@@ -48,9 +48,9 @@
       farmTargetName: '2000级怪物',
       rateRecheckIntervalMs: 15 * 60 * 1000,
       trialPriorityWindowMs: 60 * 1000,
-     enabledMaps: ['corrosion', 'trial_land', 'purgatory', 'accessory'],
-     mapPriorities: { corrosion: 10, trial_land: 20, purgatory: 30, accessory: 40 },
-     enabledBosses: ['hell-demon-horn-1','hell-demon-horn-2','totem-1','totem-2','totem-3','nales','crystal-deer'],
+     enabledMaps: ['corrosion', /* 'trial_land', */ 'purgatory', 'accessory'],
+     mapPriorities: { corrosion: 10, /* trial_land: 20, */ purgatory: 30, accessory: 40 },
+     enabledBosses: ['hell-demon-horn-1','hell-demon-horn-2', /* 'totem-1','totem-2','totem-3', */ 'nales','crystal-deer'],
      purgatoryMapChoice: '苦难炼狱3',
      instanceEmptyCooldownMs: 15 * 60 * 1000,
       scheduledHour: 0,
@@ -86,6 +86,8 @@
       ],
     });
 
+    // 试炼之地地图与 BOSS 临时停用(2026-09-07)。恢复时取消下方块注释与 MAP_MODULES 数组中的引用。
+    /*
     const trialLandModule = Object.freeze({
       id: 'trial_land',
       mapName: '试炼之地2',
@@ -114,6 +116,7 @@
         { id: 'totem-3', name: '咆哮图腾树人',   coordinate: '204,149', layer: 1 },
       ],
     });
+    */
 
     const purgatoryModule = Object.freeze({
       id: 'purgatory',
@@ -166,7 +169,7 @@
       ],
     });
 
-    const MAP_MODULES = [corrosionModule, trialLandModule, purgatoryModule, accessoryModule];
+    const MAP_MODULES = [corrosionModule, /* trialLandModule, */ purgatoryModule, accessoryModule];
 
     // Derived from MAP_MODULES; needed by scanMapPanel and scanCombat to filter BOSS rows
     // by known names. (Equivalent to reference script L50 `const TARGET_TABLE = TARGETS;`.)
